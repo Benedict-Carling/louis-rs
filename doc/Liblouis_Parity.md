@@ -124,10 +124,9 @@ a few hundred either way on the million-assertion files.
 
 | Area                                                | Failing | Root cause                                                                                                                                                                       | Size |
 |-----------------------------------------------------|--------:|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------|
-| `en-ueb-g2-dictionary_harness`, `afr-za-g2` forward |  ≈4 500 | Match-rule candidate selection. See ADR about "Match-rule candidate selection" and ADR Rule selection does not depend on table order. | L    |
-| `afr-za-g2` backward                                |  ≈2 500 | Afrikaans's lower-sign contractions share dot patterns with punctuation, and backward boundary checks classify a cell by its dots.                                               | M    |
+| `en-ueb-g2-dictionary_harness`, `afr-za-g2` forward |    ≈300 | Match-rule candidate selection. See ADR about "Match-rule candidate selection" and ADR Rule selection does not depend on table order. | L    |
 | `ml`, `pa`, `hi`, `ta`, `fa`, `th`, `bn`            |  ≈2 600 | Complex scripts: conjunct and reph forms, and stacked combining marks firing an indicator each instead of once per grapheme cluster.                                             | L    |
-| `da-dk-g28-dictionary_harness`                      |  ≈1 200 | Backward: `letsign` (⠰) is also the second cell of two-cell contractions. Consuming the indicator and suppressing the word rules in its scope does not settle this one — the ambiguity is which reading the cell has in the first place. | M    |
+| `da-dk-g28-dictionary_harness`                      |      15 | Forward: an all-caps word takes a word contraction instead of being spelled out, and a letter sign is missing before two-letter words (`ii`, `ik`). Backward: a capital after a letter sign in a two-cell letter. | S    |
 | `en-ueb-computer-code`                              |       3 | Two rules for `dis` after an opening quote tie on rank (`match %[^_~]%<* dis …` and `match !%[^_~a] dis …`, `en-ueb-g2.ctb:887`/`:890`); liblouis takes the one defined first. See ADR Rule selection does not depend on table order. The rest of the file was standing-alone sequences, `match` pre patterns starting inside a consumed contraction, and the uncontracted rest of a word after a number, now fixed. | — |
 | `hu-hu-g1_dictionary_special_consonants`            |  ≈1 100 | `nocross` asks "can this hyphenate anywhere?" instead of liblouis's positional `syllableBreak()`.                                                                                | L    |
 | `sw-ke-dictionary`, `sw-ke`                         |    ≈850 | Backward lookup splices in unrelated dictionary words ("wote" → "wizaraote"); single-letter words pick up a spurious letter sign.                                                | M    |
@@ -138,29 +137,15 @@ a few hundred either way on the million-assertion files.
 
 Two cross-cutting items have no single file behind them:
 
-- **Backward direction, generally.** The boundary predicates (`word_start` and
-  friends) only work forward, and caps passages and emphasis have no backward path at
-  all.
-
-  Underneath that sits one specific divergence worth fixing properly, because it has
-  now been patched three times for three different opcode families. We evaluate *both*
-  sides of a backward boundary check against the braille input, using a class table
-  (`dots_classes`) populated from character definitions plus whichever contraction
-  opcodes have been added to it so far — so whenever a check meets a family nobody
-  added yet, it sees no letter and the rule silently never fires. liblouis is
-  asymmetric instead (`lou_backTranslateString.c`):
-
-  - the **before** side reads the last character of the *output produced so far* and
-    classifies it with the text classes (`back_setBefore`, `isBegWord` — "look at what
-    has already been translated")
-  - the **after** side reads the next *braille cell* and classifies it with the dots
-    classes, but when that cell isn't a letter by attribute it walks the rules attached
-    to the cell and treats any multi-character contraction as word-continuation
-    (`isEndWord`, excluding `begword`/`midword` per liblouis#360)
-
-  So liblouis never needs contraction dots in its letter class; our class-table
-  patching is an approximation of that rule walk. Matching the real structure removes
-  the whole recurring bug family. *(L)*
+- **Backward direction, generally.** Caps passages and emphasis have no backward
+  path at all. Backward boundary checks follow liblouis's asymmetry
+  (`lou_backTranslateString.c`): the before side classifies the last character of the
+  output produced so far with the text classes (`back_setBefore`, `isBegWord`), and
+  the word-family rules, `postpunc` and `prepunc` check the after side by scanning on
+  through the rest of the word (`isEndWord`). What is left is rule *order*: liblouis
+  takes the first valid rule of a cell in definition order, and we rank by weight, so
+  two rules on the same cells that liblouis tells apart only by order (e.g. `punctuation
+  ’ 6-356` and `postpunc ‛ 6-356` in German) can come out the other way.
 - **Engine debt.** Regexp negation of concatenation and alternation is wrong
   (`!(e1e2)` ≠ `(!e1!e2)`); `Attribute::ByOrder` and `Any` are no-ops in
   `match_pattern.rs` and all three are no-ops in `context_pattern.rs`; the

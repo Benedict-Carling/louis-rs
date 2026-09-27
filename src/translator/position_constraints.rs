@@ -55,13 +55,12 @@ pub enum Constraint {
     /// class) that the word's hyphenation dictionary marks as a valid break point.
     /// Consulted to decide whether a `nocross` rule may cross this gap.
     HyphenationBreak,
-    /// Suppress the word-family rules at this position, in backward translation.
+    /// The word does not end right before this position, in backward translation.
     ///
-    /// Set for the run of letter cells following a `letsign`/`nocontractsign`/
-    /// `nonumsign` indicator. Those indicators exist precisely to say "read the
-    /// following cells as letters, not as a contraction", so the `word`, `sufword`,
-    /// `prfword` and `begword` rules must not fire inside their scope.
-    NoContract,
+    /// liblouis's `isEndWord`: scanning on from here, a letter cell comes before any space
+    /// cell, or a cell carrying a multi-character contraction does (see
+    /// [`BackwardWordEndConstrainer`]).
+    NotEndWord,
     /// A `prepunc` rule may fire on the punctuation character at this position, in
     /// forward translation.
     PrepuncOk,
@@ -86,10 +85,12 @@ impl PositionConstraints {
             .is_some_and(|f| f.contains(Constraint::DontContract))
     }
 
-    pub fn no_contract_at(&self, pos: usize) -> bool {
-        self.0
+    /// Whether the word ends right before `pos`; true at and past the end of input.
+    pub fn end_word_at(&self, pos: usize) -> bool {
+        !self
+            .0
             .get(pos)
-            .is_some_and(|f| f.contains(Constraint::NoContract))
+            .is_some_and(|f| f.contains(Constraint::NotEndWord))
     }
 
     pub fn use_comp6_at(&self, pos: usize) -> bool {
@@ -420,72 +421,44 @@ impl BackwardNumericConstrainer {
     }
 }
 
-/// Detects `letsign`/`nocontractsign`/`nonumsign` indicator dots in backward
-/// (braille -> text) input and sets [`Constraint::NoContract`] on the run of letter
-/// cells that follows, so the word-family rules cannot claim cells the indicator has
-/// declared to be plain letters.
-#[derive(Debug, Clone)]
-pub struct BackwardNoContractConstrainer {
-    indicator_dots: Vec<String>,
-    letter_cells: HashSet<char>,
+/// Sets [`Constraint::NotEndWord`] where liblouis's backward `isEndWord` would say the
+/// word goes on. The cells are classified by what the table defines for them on their own,
+/// as liblouis classifies them by the rules attached to a single cell.
+#[derive(Debug, Clone, Default)]
+pub struct BackwardWordEndConstrainer {
+    /// Cells defined as a letter.
+    pub letter_cells: HashSet<char>,
+    /// Cells defined as a space.
+    pub space_cells: HashSet<char>,
+    /// Cells a multi-character backward rule other than `begword`/`midword` translates on
+    /// their own.
+    pub contraction_cells: HashSet<char>,
+    /// Cells of a `postpunc` rule, which do not count as a contraction.
+    pub postpunc_cells: HashSet<char>,
+    /// Cells of a `hyphen` rule, which always end the word.
+    pub hyphen_cells: HashSet<char>,
 }
 
-impl BackwardNoContractConstrainer {
+impl BackwardWordEndConstrainer {
     fn compute(&self, input: &str) -> Vec<Constraints> {
         let chars: Vec<char> = input.chars().collect();
-        let n = chars.len();
-        let mut constraints: Vec<Constraints> = vec![Constraints::empty(); n];
-        let mut pos = 0;
-        while pos < n {
-            // Longest first: one indicator's dots are often a prefix of another's.
-            if let Some(dots) = self
-                .indicator_dots
-                .iter()
-                .filter(|d| matches_at(&chars, pos, d))
-                .max_by_key(|d| d.chars().count())
-            {
-                pos += dots.chars().count();
-                while pos < n && self.letter_cells.contains(&chars[pos]) {
-                    constraints[pos].insert(Constraint::NoContract);
-                    pos += 1;
-                }
-                continue;
+        let mut constraints: Vec<Constraints> = vec![Constraints::empty(); chars.len()];
+        let mut end_word = true;
+        for (pos, c) in chars.iter().enumerate().rev() {
+            if self.space_cells.contains(c) {
+                end_word = true;
+            } else if self.letter_cells.contains(c) {
+                end_word = false;
+            } else if self.hyphen_cells.contains(c) {
+                end_word = true;
+            } else if self.contraction_cells.contains(c) && !self.postpunc_cells.contains(c) {
+                end_word = false;
             }
-            pos += 1;
+            if !end_word {
+                constraints[pos].insert(Constraint::NotEndWord);
+            }
         }
         constraints
-    }
-}
-
-/// A builder for [`Constrainer::BackwardNoContract`].
-#[derive(Debug, Default)]
-pub struct BackwardNoContractConstrainerBuilder {
-    indicator_dots: Vec<String>,
-    letter_cells: HashSet<char>,
-}
-
-impl BackwardNoContractConstrainerBuilder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn indicator(&mut self, dots: &str) {
-        self.indicator_dots.push(dots.to_string());
-    }
-
-    pub fn letter_cells(&mut self, cells: HashSet<char>) {
-        self.letter_cells = cells;
-    }
-
-    pub fn build(self) -> Option<BackwardNoContractConstrainer> {
-        if self.indicator_dots.is_empty() {
-            None
-        } else {
-            Some(BackwardNoContractConstrainer {
-                indicator_dots: self.indicator_dots,
-                letter_cells: self.letter_cells,
-            })
-        }
     }
 }
 
@@ -501,9 +474,8 @@ pub enum Constrainer {
     BackwardCaps(BackwardCapsConstrainer),
     /// Detects backward `numsign`/`nonumsign` dots and sets [`Constraint::PreferDigit`].
     BackwardNumeric(BackwardNumericConstrainer),
-    /// Detects backward `letsign`/`nocontractsign`/`nonumsign` dots and sets
-    /// [`Constraint::NoContract`].
-    BackwardNoContract(BackwardNoContractConstrainer),
+    /// Sets [`Constraint::NotEndWord`] where a word goes on, in backward translation.
+    BackwardWordEnd(BackwardWordEndConstrainer),
     /// Detects hyphenation-dictionary breaks and sets [`Constraint::HyphenationBreak`].
     Hyphenation(HyphenationConstrainer),
     /// Detects `prepunc`/`postpunc` scan eligibility and sets
@@ -517,7 +489,7 @@ impl Constrainer {
             Constrainer::Numeric(c) => c.compute(input),
             Constrainer::ComputerBraille(c) => c.compute(input, spans),
             Constrainer::BackwardCaps(c) => c.compute(input),
-            Constrainer::BackwardNoContract(c) => c.compute(input),
+            Constrainer::BackwardWordEnd(c) => c.compute(input),
             Constrainer::BackwardNumeric(c) => c.compute(input),
             Constrainer::Hyphenation(c) => c.compute(input),
             Constrainer::Punctuation(c) => c.compute(input),
@@ -885,44 +857,6 @@ mod tests {
         Constrainers::new(vec![Constrainer::BackwardNumeric(builder.build().unwrap())])
     }
 
-    fn no_contract(c: &PositionConstraints) -> Vec<bool> {
-        c.0.iter()
-            .map(|f| f.contains(Constraint::NoContract))
-            .collect()
-    }
-
-    fn backward_nocontract_constrainers(
-        builder: BackwardNoContractConstrainerBuilder,
-    ) -> Constrainers {
-        Constrainers::new(vec![Constrainer::BackwardNoContract(
-            builder.build().unwrap(),
-        )])
-    }
-
-    #[test]
-    fn letsign_marks_letters_until_non_letter_cell() {
-        let mut builder = BackwardNoContractConstrainerBuilder::new();
-        builder.indicator("L");
-        builder.letter_cells(HashSet::from(['a', 'b', 'c']));
-        let c = backward_nocontract_constrainers(builder).precompute("Lab cLc", &[]);
-        assert_eq!(
-            no_contract(&c),
-            vec![false, true, true, false, false, false, true]
-        );
-    }
-
-    #[test]
-    fn longest_indicator_wins() {
-        // `nonumsign 56` and `nocontractsign 56-56` in one table: the two-cell
-        // indicator must not be read as the one-cell one followed by a letter cell.
-        let mut builder = BackwardNoContractConstrainerBuilder::new();
-        builder.indicator("N");
-        builder.indicator("NN");
-        builder.letter_cells(HashSet::from(['a', 'N']));
-        let c = backward_nocontract_constrainers(builder).precompute("NNa", &[]);
-        assert_eq!(no_contract(&c), vec![false, false, true]);
-    }
-
     #[test]
     fn capsletter_marks_next_cell_titlecase() {
         let mut builder = BackwardCapsConstrainerBuilder::new();
@@ -994,5 +928,26 @@ mod tests {
         builder.letter_cells(HashSet::from(['x']));
         let c = backward_numeric_constrainers(builder).precompute("xN12", &[]);
         assert_eq!(prefer_digit(&c), vec![false, false, false, false]);
+    }
+
+    #[test]
+    fn word_end_scans_to_the_next_letter_or_space() {
+        let constrainer = BackwardWordEndConstrainer {
+            letter_cells: HashSet::from(['a']),
+            space_cells: HashSet::from([' ']),
+            contraction_cells: HashSet::from(['c', 'p']),
+            postpunc_cells: HashSet::from(['p']),
+            hyphen_cells: HashSet::from(['-']),
+        };
+        let c = Constrainers::new(vec![Constrainer::BackwardWordEnd(constrainer)])
+            .precompute("a,a a, c p, -a", &[]);
+        let ends: Vec<bool> = (0..=14).map(|pos| c.end_word_at(pos)).collect();
+        assert_eq!(
+            ends,
+            vec![
+                false, false, false, true, false, true, true, false, true, true, true, true, true,
+                false, true
+            ]
+        );
     }
 }
