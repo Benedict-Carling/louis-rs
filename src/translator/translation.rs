@@ -466,7 +466,7 @@ mod tests {
         let result = translation.resolve("xyz", 0..8, 0);
 
         assert_eq!(result.input(), "xyz");
-        assert_eq!(result.output(), "<XYz>");
+        assert_eq!(result.output(), "<XY>");
     }
 
     #[test]

@@ -537,6 +537,8 @@ impl YAMLParser<'_> {
                         Ok(test_results) => results.extend(test_results),
                         Err(error) => results.push(TestResult::Error(error.to_string())),
                     }
+                    // flags apply only to the tests that immediately follow them
+                    test_mode = TestMode::Forward;
                     previous_event_was_table = false;
                 }
                 _ => {
@@ -644,6 +646,15 @@ mod tests {
         let results = run("both_directions", yaml).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.is_success()));
+    }
+
+    #[test]
+    fn tests_without_flags_run_forward() {
+        let yaml = "table: |\n  letter a 1\nflags: {testmode: backward}\ntests:\n  - - a\n    - ⠁\ntable: |\n  letter a 1\ntests:\n  - - a\n    - ⠁\n";
+        let results = run("tests_without_flags", yaml).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_translation_failure());
+        assert!(results[1].is_success());
     }
 
     #[test]

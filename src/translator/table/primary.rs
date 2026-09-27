@@ -114,6 +114,9 @@ impl CharacterTranslation {
 #[derive(Debug)]
 pub struct PrimaryTable {
     undefined: Option<String>,
+    /// The text classes `joinnum` looks at
+    space_chars: HashSet<char>,
+    digit_chars: HashSet<char>,
     /// Fallback character definitions that are used as a last resort to translate unknown
     /// characters to their hex representation
     fallback_definitions: CharacterDefinition,
@@ -319,8 +322,11 @@ impl PrimaryTableBuilder {
         .into_iter()
         .flatten()
         .collect();
+        let class = |class| ctx.character_classes().get(&class).unwrap_or_default();
         PrimaryTable {
             undefined: self.undefined,
+            space_chars: class(CharacterClass::Space),
+            digit_chars: class(CharacterClass::Digit),
             character_translations: self.character_translations,
             direction,
             fallback_definitions: ctx.character_definitions().clone(),
@@ -477,6 +483,22 @@ impl PrimaryTable {
             HashSet::new()
         };
 
+        let defined_chars: HashSet<char> = rules
+            .iter()
+            .filter_map(|rule| match &rule.rule {
+                Rule::Space { character, .. }
+                | Rule::Punctuation { character, .. }
+                | Rule::Digit { character, .. }
+                | Rule::Litdigit { character, .. }
+                | Rule::Letter { character, .. }
+                | Rule::Lowercase { character, .. }
+                | Rule::Uppercase { character, .. }
+                | Rule::Sign { character, .. }
+                | Rule::Math { character, .. } => Some(*character),
+                _ => None,
+            })
+            .collect();
+
         // decpoint and hyphen take precedence over other character definition rules, so insert
         // them first
         for rule in rules {
@@ -594,7 +616,8 @@ impl PrimaryTable {
                     builder.numeric_indicator.numericnocontchars(chars);
                     builder.numeric_constrainer.uses_numeric_mode();
                 }
-                Rule::Midendnumericmodechars { .. } => {
+                Rule::Midendnumericmodechars { chars } => {
+                    builder.numeric_indicator.midendnumericmodechars(chars);
                     builder.numeric_constrainer.uses_numeric_mode();
                 }
                 Rule::Numericmodechars { chars } => {
@@ -840,6 +863,8 @@ impl PrimaryTable {
                 }
                 // liblouis defines no back-translation rule for a base character
                 Rule::Base { .. } if direction == Direction::Backward => {}
+                // like liblouis, a character's own definition wins over its base
+                Rule::Base { derived, .. } if defined_chars.contains(derived) => {}
                 Rule::Base { derived, base, .. } => {
                     if let Some(translation) = ctx.character_definitions().get(base).cloned() {
                         builder.insert_character(*derived, &translation, direction, rule);
@@ -914,6 +939,26 @@ impl PrimaryTable {
                         TranslationStage::Main,
                         rule,
                     );
+                }
+                // liblouis never selects a `replace` rule when back-translating
+                Rule::Replace { chars, replacement } if direction == Direction::Forward => {
+                    let replacement = replacement.as_deref().unwrap_or_default();
+                    if let Ok(dots) = ctx
+                        .character_definitions()
+                        .resolve_implicit_dots(replacement)
+                    {
+                        builder.get_trie_mut(rule).insert(
+                            chars,
+                            &dots,
+                            None,
+                            None,
+                            direction,
+                            rule.precedence(),
+                            vec![],
+                            TranslationStage::Main,
+                            rule,
+                        );
+                    }
                 }
                 Rule::Begcomp { dots, .. } => {
                     builder
@@ -1260,6 +1305,22 @@ impl PrimaryTable {
                     TranslationStage::Main,
                     rule,
                 ),
+                Rule::Joinnum { chars, dots, .. } if direction == Direction::Forward => {
+                    builder.get_trie_mut(rule).insert(
+                        chars,
+                        &dots.to_string(),
+                        Some(Transition::Start(vec![
+                            CharacterClass::Space,
+                            CharacterClass::Punctuation,
+                        ])),
+                        Some(Transition::End(vec![CharacterClass::Space])),
+                        direction,
+                        rule.precedence(),
+                        vec![],
+                        TranslationStage::Main,
+                        rule,
+                    )
+                }
                 Rule::Midnum { chars, dots, .. } => {
                     builder.numeric_indicator.midnum(chars);
                     builder.numeric_constrainer.midnum(chars);
@@ -1294,7 +1355,7 @@ impl PrimaryTable {
                 Rule::Prepunc { chars, dots, .. } => {
                     // are all the characters punctuation?
                     if chars.chars().all(|c| {
-                        ctx.character_classes
+                        ctx.direction_character_classes()
                             .get(&CharacterClass::Punctuation)
                             .is_some_and(|class| class.contains(&c))
                     }) {
@@ -1318,7 +1379,7 @@ impl PrimaryTable {
                 Rule::Postpunc { chars, dots, .. } => {
                     // are all the characters punctuation?
                     if chars.chars().all(|c| {
-                        ctx.character_classes
+                        ctx.direction_character_classes()
                             .get(&CharacterClass::Punctuation)
                             .is_some_and(|class| class.contains(&c))
                     }) {
@@ -1371,10 +1432,10 @@ impl PrimaryTable {
                 _ => (),
             }
         }
-        let numeric_chars = ctx
-            .character_classes()
-            .get(&CharacterClass::Litdigit)
-            .unwrap_or_default();
+        let numeric_chars: HashSet<char> = [CharacterClass::Digit, CharacterClass::Litdigit]
+            .iter()
+            .flat_map(|class| ctx.character_classes().get(class).unwrap_or_default())
+            .collect();
         builder
             .numeric_indicator
             .numeric_characters(numeric_chars.clone());
@@ -1420,7 +1481,7 @@ impl PrimaryTable {
         );
         if direction == Direction::Backward {
             let mut letter_cells = ctx
-                .dots_classes()
+                .direction_dots_classes()
                 .get(&CharacterClass::Letter)
                 .unwrap_or_default();
             // Contractions spelling letters (e.g. Hungarian "sz"/"cs" digraphs) define
@@ -1710,6 +1771,9 @@ impl PrimaryTable {
             candidates.retain(|t| match t.rule() {
                 _ if self.backward.is_some() => true,
                 _ if spans_change(t, char_pos) => false,
+                Some(Rule::Joinnum { .. }) => {
+                    self.number_follows(&chars.as_str()[t.input().len()..])
+                }
                 Some(Rule::Prepunc { .. }) => constraints.prepunc_ok_at(char_pos),
                 Some(Rule::Postpunc { .. }) => constraints.postpunc_ok_at(char_pos),
                 _ => stands_alone(t, char_pos),
@@ -1717,7 +1781,9 @@ impl PrimaryTable {
 
             // inside a numeric run, suppress multi-character contractions
             if self.direction == Direction::Forward && constraints.dont_contract_at(char_pos) {
-                candidates.retain(|t| t.length() <= 1);
+                // liblouis' `dontContract` leaves the context rules alone
+                candidates
+                    .retain(|t| t.length() <= 1 || matches!(t.rule(), Some(Rule::Context { .. })));
             }
 
             // In computer braille mode, discard normal candidates and use comp6 rules only.
@@ -1823,6 +1889,23 @@ impl PrimaryTable {
                 translations.push(translation);
                 delayed_translations = self.update_offsets(delayed_translations, t.length());
                 delayed_translations.extend(self.match_candidates_within(consumed, t.length()));
+                // liblouis' joinnum swallows the spaces between it and the number
+                if matches!(t.rule(), Some(Rule::Joinnum { .. })) {
+                    while let Some(c) = chars.clone().next()
+                        && self.space_chars.contains(&c)
+                    {
+                        chars.next();
+                        char_pos += 1;
+                        translations.push(ResolvedTranslation::new(
+                            &c.to_string(),
+                            "",
+                            1,
+                            TranslationStage::Main,
+                            t.origin(),
+                        ));
+                        delayed_translations = self.update_offsets(delayed_translations, 1);
+                    }
+                }
 
                 // update the environment if needed
                 if !t.effects().is_empty() {
@@ -1868,6 +1951,13 @@ impl PrimaryTable {
             }
         }
         translations
+    }
+
+    /// Whether the first character after the spaces at the start of `rest` is a digit
+    fn number_follows(&self, rest: &str) -> bool {
+        rest.chars()
+            .find(|c| !self.space_chars.contains(c))
+            .is_some_and(|c| self.digit_chars.contains(&c))
     }
 
     fn handle_undefined_char(&self, ch: char) -> String {
@@ -2921,6 +3011,94 @@ mod tests {
         assert_eq!(table.translate("aa"), "⠁⠁");
         assert_eq!(table.translate("aa;aa"), "⠁⠁⠸⠁⠁");
         assert_eq!(table.translate("aa:aa;aa"), "⠁⠁⠇⠄⠄⠸⠁⠁");
+    }
+
+    #[test]
+    fn numsign_before_a_digit() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("digit 1 1"),
+            parse_rule("numsign 3456"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("1a1"), "⠼⠁⠁⠼⠁");
+    }
+
+    #[test]
+    fn own_definition_beats_base() {
+        let rules = [
+            parse_rule("lowercase v 1236"),
+            parse_rule("base uppercase V v"),
+            parse_rule("letter V 1236f"),
+            parse_rule("capsletter 46"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("Vv"), "⠨\u{f4027}⠧");
+    }
+
+    #[test]
+    fn joinnum() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("space \\s 0"),
+            parse_rule("digit 1 1"),
+            parse_rule("sign § 346"),
+            parse_rule("joinnum § 346"),
+            parse_rule("numsign 3456"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("§ 1"), "⠬⠼⠁");
+        assert_eq!(table.translate("§  1"), "⠬⠼⠁");
+        assert_eq!(table.translate("§ a"), "⠬⠀⠁");
+    }
+
+    #[test]
+    fn context_rule_inside_a_number() {
+        let rules = [
+            parse_rule("space \\s 0"),
+            parse_rule("digit 1 1"),
+            parse_rule("numsign 3456"),
+            parse_rule("noback context [$d$s]$d @1"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("1 1"), "⠼⠁⠼⠁");
+    }
+
+    #[test]
+    fn replace() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("space \\x2060 0"),
+            parse_rule("replace \\x2060"),
+            parse_rule("replace c ab"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("a\u{2060}b"), "⠁⠃");
+        assert_eq!(table.translate("c"), "⠁⠃");
+        let table = PrimaryTable::compile(
+            &rules,
+            Direction::Backward,
+            TranslationStage::Main,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(table.translate("⠁⠃"), "ab");
     }
 
     #[test]

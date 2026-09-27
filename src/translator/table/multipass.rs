@@ -1,11 +1,8 @@
-use std::collections::HashSet;
-
 use crate::parser::multipass::ConsumesInput;
 use crate::translator::ResolvedTranslation;
 use crate::translator::context_pattern::{ContextPatterns, ContextPatternsBuilder};
 use crate::translator::effect::Environment;
 use crate::translator::table::TableContext;
-use crate::translator::translation::TranslationSubset;
 use crate::{
     Direction,
     parser::{AnchoredRule, Rule},
@@ -114,7 +111,8 @@ impl MultipassTable {
         let mut env = Environment::new();
         let mut chars = input.chars();
         let mut prev: Option<char> = None;
-        let mut seen: HashSet<TranslationSubset> = HashSet::default();
+        // liblouis copies the next character unchanged after a rule that did not advance
+        let mut advanced = true;
 
         loop {
             // given an input query the patterns for matching translations. Then split off the
@@ -132,18 +130,14 @@ impl MultipassTable {
             // use the longest translation
             let candidate = candidates
                 .iter()
-                // drop translation candidates that we have applied already at this position in the
-                // input
-                .filter(|&t| !seen.contains(&TranslationSubset::from(t)))
+                .filter(|_| advanced)
                 .cloned()
                 .max_by_key(|translation| translation.rank());
+            advanced = true;
             if let Some(t) = candidate {
                 if t.length() == 0 {
-                    // if there is a zero-length translation candiate we run the risk of an infinite
-                    // loop, so remember the current translation so we only apply it once
-                    seen.insert(TranslationSubset::from(&t));
+                    advanced = false;
                 } else {
-                    seen.clear();
                     // move the iterator forward by the number of characters in the translation
                     chars.nth(t.length() - 1);
                     prev = t.input().chars().last();
@@ -247,6 +241,30 @@ mod tests {
                 .unwrap();
         assert_eq!(transform.translate("⠃⠃"), "⠃");
         assert_eq!(transform.translate("⠃⠙⠃"), "⠃⠙⠃");
+    }
+
+    #[test]
+    fn zero_length_rule_fires_again_after_the_next_character() {
+        let rules = [parse_rule("pass2 []@1 @6")];
+        let ctx = TableContext::default();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Post1, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("⠁⠁"), "⠠⠁⠠⠁");
+        assert_eq!(transform.translate("⠁⠃⠁"), "⠠⠁⠃⠠⠁");
+    }
+
+    #[test]
+    fn swap_class_test_in_a_post_pass() {
+        let rules = [
+            parse_rule("swapdd foo 1,12 4,45"),
+            parse_rule("pass4 %foo %foo"),
+        ];
+        let ctx = TableContext::compile(&rules).unwrap();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Post3, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("⠁⠃⠉"), "⠈⠘⠉");
     }
 
     #[test]

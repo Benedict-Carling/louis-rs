@@ -21,10 +21,12 @@ impl IndicatorBuilder {
         IndicatorBuilder(Indicator {
             numeric_chars: HashSet::default(),
             extra_numeric_chars: HashSet::default(),
+            mid_end_numeric_chars: HashSet::default(),
             mid_numeric_chars: HashSet::default(),
             start_translation: None,
             end_translation: None,
             terminating_chars: HashSet::default(),
+            uses_numeric_mode: false,
         })
     }
 
@@ -61,11 +63,18 @@ impl IndicatorBuilder {
     }
 
     pub fn numericnocontchars(&mut self, s: &str) {
-        self.0.terminating_chars = HashSet::from_iter(s.chars());
+        self.0.terminating_chars.extend(s.chars());
+        self.0.uses_numeric_mode = true;
     }
 
     pub fn numericmodechars(&mut self, s: &str) {
-        self.0.extra_numeric_chars = HashSet::from_iter(s.chars());
+        self.0.extra_numeric_chars.extend(s.chars());
+        self.0.uses_numeric_mode = true;
+    }
+
+    pub fn midendnumericmodechars(&mut self, s: &str) {
+        self.0.mid_end_numeric_chars.extend(s.chars());
+        self.0.uses_numeric_mode = true;
     }
 
     pub fn numeric_characters(&mut self, chars: HashSet<char>) {
@@ -80,6 +89,8 @@ pub struct Indicator {
     /// Characters that extend a numeric run without being digits themselves
     /// (e.g. `numericmodechars`)
     extra_numeric_chars: HashSet<char>,
+    /// Characters that extend a numeric run but never start one (`midendnumericmodechars`)
+    mid_end_numeric_chars: HashSet<char>,
     /// Characters that extend a numeric run only when sandwiched between two
     /// digits (`midnum`)
     mid_numeric_chars: HashSet<char>,
@@ -89,6 +100,9 @@ pub struct Indicator {
     end_translation: Option<ResolvedTranslation>,
     /// Characters that trigger end-of-run indication when the run exits into them
     terminating_chars: HashSet<char>,
+    /// Whether the table declares numeric mode characters, which makes liblouis track
+    /// numeric runs by character attributes instead of by `midnum` rules
+    uses_numeric_mode: bool,
 }
 
 impl Indicator {
@@ -120,9 +134,11 @@ impl Indicator {
                     }
                 }
                 (true, true) => {}
-                (false, true) if self.extra_numeric_chars.contains(&c) => {}
                 (false, true)
-                    if self.extra_numeric_chars.is_empty()
+                    if self.extra_numeric_chars.contains(&c)
+                        || self.mid_end_numeric_chars.contains(&c) => {}
+                (false, true)
+                    if !self.uses_numeric_mode
                         && self.mid_numeric_chars.contains(&c)
                         && chars
                             .get(pos + 1)
@@ -194,6 +210,29 @@ mod tests {
         assert_eq!(
             pairs(&indicator.precompute("ab12a")),
             vec![(2, "⠼".to_string()), (4, "⠰".to_string())],
+        );
+    }
+
+    #[test]
+    fn midendnumericmodechars_continue_the_run() {
+        let mut builder = IndicatorBuilder::new();
+        builder.numeric_characters(HashSet::from(['1', '2', '3']));
+        builder.numsign("⠼", &rule("numsign 3456"));
+        builder.midnum(",");
+        builder.midendnumericmodechars(",");
+        let indicator = builder.build().unwrap();
+
+        assert_eq!(
+            pairs(&indicator.precompute("1,2 3, 1")),
+            vec![
+                (0, "⠼".to_string()),
+                (4, "⠼".to_string()),
+                (7, "⠼".to_string())
+            ]
+        );
+        assert_eq!(
+            pairs(&indicator.precompute("a,1")),
+            vec![(2, "⠼".to_string())]
         );
     }
 
