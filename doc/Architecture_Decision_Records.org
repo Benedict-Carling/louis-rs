@@ -114,6 +114,23 @@ So ambiguity is about *1% of the correctness problem but 100% of the
 determinism problem*. Worth fixing for the second reason, not the
 first.
 
+** [2026-09-27] Back-translation
+
+liblouis's back-translation order is mostly not definition order. A
+cell's single-cell rules are kept sorted by the length of their
+characters with character definitions after the rest, and multi-cell
+rules by the length of dots and characters together with ~always~
+after the rest (~addBackwardRuleWithSingleCell~,
+~addBackwardRuleWithMultipleCells~); ~back_selectRule~ takes the first
+that validates. ~BackwardSelector::order~ reproduces those keys from
+the rules' content. Where they tie, a longer match wins, which settles
+~de-g0-detailed~'s ~sign ¬~ against ~begnum ÷~; an exact tie beyond
+that is left to the trie's insertion order, which is the frozen order
+this ADR describes, not a claimed tie-break. The suite has a few such
+ties (~kn.tbl~'s ~always ಞ~ against an included ~postpunc :~), and
+there louis-rs and liblouis agree only because the frozen order
+happens to be liblouis's.
+
 ** Deferred: a table linter
 
 The 414 figure is only what the suite's inputs happen to reach; the
@@ -1373,6 +1390,15 @@ remains genuinely open in this ADR is the *divergent*-weight case
 above ("abandoning") -- not a tie at all, so the nondeterminism ADR's
 reasoning does not reach it, and options 1-4 are still undecided for
 it.
+
+**** [2026-09-27] A boundary that holds counts towards the weight
+
+Some equal weights were an artefact of counting only consumed
+characters: a ~%[_~^]~ that matches at the end of the input checks
+something but consumes nothing. Each start or end anchor that holds now
+adds one to the weight, so ~en-ueb-g2.ctb~'s ~match … be [B…](…)?%>*%[_~^] =~
+beats ~match … be [B…] 23~ on "beb" as it does in liblouis, on
+content rather than on order.
 
 ** Decision Drivers
 
