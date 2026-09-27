@@ -1,18 +1,17 @@
-//! Shared tier-selection engine behind [`mode`](super::mode) and
-//! [`uppercase`](super::uppercase): one algorithm, [`ClassIndicator`], letter / word /
+//! Tier-selection engine behind [`mode`](super::mode): [`ClassIndicator`], letter / word /
 //! passage / threshold-passage, parametrized by two character sets per mode:
 //!
 //! - [`active_characters`](ClassIndicator::active_characters) — which characters the mode
-//!   is "on" for (uppercase letters, digits, or a custom class).
+//!   is "on" for (digits, or a custom class).
 //! - [`letter_characters`](ClassIndicator::letter_characters) — what bounds a mode word,
-//!   i.e. what a run can extend across without an explicit `endmode`-family close.
-//!   Uppercase is bounded by `letter` (plus [`mode_characters`](ClassIndicator::mode_characters),
-//!   e.g. a hyphen, as a transparent gap); `digit` by digits and the base characters of
-//!   digits, with the numeric mode characters as the gap; any other custom class is
-//!   bounded by `letter`, like uppercase without the transparency carve-out.
+//!   i.e. what a run can extend across without an explicit `endmode`-family close:
+//!   `digit` by digits and the base characters of digits, with the numeric mode
+//!   characters ([`mode_characters`](ClassIndicator::mode_characters)) as the gap; any
+//!   other custom class by `letter`.
 //!
 //! [`mode::IndicatorBuilder::build`](super::mode::IndicatorBuilder::build) picks the
-//! boundary by attribute name; `uppercase` sets its classes directly.
+//! boundary by attribute name. Capitals are liblouis's emphasis model instead, see
+//! [`emphasis`](super::emphasis).
 
 use std::collections::HashSet;
 
@@ -63,7 +62,7 @@ struct Word {
     kind: WordKind,
 }
 
-/// Compiled indicator data for one mode class (e.g. "uppercase", "digit", or a custom
+/// Compiled indicator data for one mode class (e.g. "digit", or a custom
 /// attribute). See the module doc for what `active_chars`/`letter_chars`/`mode_chars` mean.
 #[derive(Debug, Clone)]
 pub(super) struct ClassIndicator {
@@ -80,9 +79,6 @@ pub(super) struct ClassIndicator {
     endmodephrase: Option<ResolvedTranslation>,
     endmodephrase_before: bool,
     len_phrase: usize,
-    /// Whether only whitespace separates the words of a passage, as for capitals; for
-    /// other modes anything that isn't a letter does (liblouis's `isEmphSpace`)
-    whitespace_separates_words: bool,
 }
 
 impl ClassIndicator {
@@ -101,7 +97,6 @@ impl ClassIndicator {
             endmodephrase: None,
             endmodephrase_before: true,
             len_phrase: 2,
-            whitespace_separates_words: false,
         }
     }
 
@@ -145,8 +140,7 @@ impl ClassIndicator {
         self.len_phrase = len;
     }
 
-    /// The mode's own active-character class (`uppercase_chars` for the built-in uppercase
-    /// mode, or the named attribute's class for a generic mode).
+    /// The mode's own active-character class (the named attribute's class)
     pub(super) fn active_characters(&mut self, chars: HashSet<char>) {
         self.active_chars = chars;
     }
@@ -156,14 +150,10 @@ impl ClassIndicator {
         self.letter_chars = chars;
     }
 
-    /// Characters transparent to word-boundary detection (`capsmodechars` for uppercase; no
+    /// Characters transparent to word-boundary detection (the numeric mode characters; no
     /// generic opcode sets this for any other mode).
     pub(super) fn mode_characters(&mut self, chars: HashSet<char>) {
         self.mode_chars = chars;
-    }
-
-    pub(super) fn whitespace_separates_words(&mut self) {
-        self.whitespace_separates_words = true;
     }
 
     pub(super) fn set_character_classes(&mut self, classes: CharacterClasses) {
@@ -433,12 +423,7 @@ impl ClassIndicator {
         let mut last_word = chars.len();
         let mut in_word = false;
         for (i, &c) in chars.iter().enumerate() {
-            let is_space = if self.whitespace_separates_words {
-                self.is_space(c)
-            } else {
-                !self.is_letter(c)
-            };
-            if is_space {
+            if !self.is_letter(c) {
                 if in_word {
                     last_word = i;
                     in_word = false;

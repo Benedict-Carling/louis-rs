@@ -9,14 +9,11 @@
 //! `attribute` naming the class that drives it (most commonly a custom class declared
 //! with `class`, or `digit`).
 //!
-//! [`Indicator`] shares its tier-selection logic with the built-in `capsletter`/
-//! `begcapsword`/... family in [`uppercase`](super::uppercase) — see
-//! [`class_indicator`](super::class_indicator) for how a run becomes a letter, word, or
-//! passage indicator. The one thing specific to this module is [`IndicatorBuilder::build`]
+//! See [`class_indicator`](super::class_indicator) for how a run becomes a letter,
+//! word, or passage indicator. The one thing specific to this module is [`IndicatorBuilder::build`]
 //! deciding, per attribute name, what bounds a mode word: for `digit` the digits and
 //! the characters they are based on, across numeric mode characters; any other custom
-//! class is bounded by `letter`, like uppercase minus the `capsmodechars` transparency
-//! (no generic opcode for that).
+//! class is bounded by `letter`, as a letter-bounded class.
 
 use std::collections::{HashMap, HashSet};
 
