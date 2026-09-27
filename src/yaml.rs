@@ -656,6 +656,19 @@ mod tests {
     }
 
     #[test]
+    fn hyphenate_mode_shows_the_breaks() {
+        let dic = format!("louis-rs-{}-hyphenate.dic", std::process::id());
+        std::fs::write(std::env::temp_dir().join(&dic), "UTF-8\na1b\n").unwrap();
+        let yaml = format!(
+            "table: |\n  include {dic}\n  letter a 1\n  letter b 12\n  hyphen - 36\nflags: {{testmode: hyphenate}}\ntests:\n  - [aabb, aa-bb]\n  - [ab-ab, a-b-|a-b]\n  - [bbaa, bbaa]\n"
+        );
+        let results = run("hyphenate_mode", &yaml).unwrap();
+        let _ = std::fs::remove_file(std::env::temp_dir().join(&dic));
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+    }
+
+    #[test]
     fn single_cursor_position_is_not_checked() {
         let yaml = format!("{AB_TABLE}tests:\n  - - ab\n    - ⠁⠃\n    - cursorPos: 1\n");
         let results = run("single_cursor", &yaml).unwrap();

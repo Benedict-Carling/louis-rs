@@ -1,6 +1,9 @@
 //! A test runner for tests defined in [liblouis](https://liblouis.io) YAML test files
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use enumset::EnumSet;
 use rayon::prelude::*;
@@ -9,8 +12,9 @@ use search_path::SearchPath;
 
 use crate::{
     emphasis::EmphasisSpan,
+    hyphenation::HyphenationTable,
     metadata,
-    parser::{self, AnchoredRule, Direction, TableError},
+    parser::{self, AnchoredRule, Direction, Rule, TableError},
     translator::{
         self, CharToDots, DisplayTable, ImpliedDisplay, PositionMap, TranslationModes,
         TranslationOptions, TranslationPipeline,
@@ -29,6 +33,8 @@ pub enum TestError {
     NoTableForQuery(String),
     #[error("The query {0} matches more than one table: {1:?}")]
     AmbiguousTableQuery(String, Vec<PathBuf>),
+    #[error("The table has no hyphenation dictionary")]
+    NoHyphenationTable,
 }
 
 impl From<Vec<TableError>> for TestError {
@@ -307,10 +313,144 @@ impl<'a> TestMatrix<'a> {
                     results.extend(self.tests.iter().map(|test| test.check_display(&table)));
                 }
             }
-            _ => (), // FIXME: not yet implemented
+            TestMode::Hyphenate | TestMode::HyphenateBraille => {
+                let braille = matches!(self.mode, TestMode::HyphenateBraille);
+                for table in self.tables {
+                    let rules = self.rules(table)?;
+                    let back = if braille {
+                        Some(self.translation_table(table, Direction::Backward)?)
+                    } else {
+                        None
+                    };
+                    let hyphenator = Hyphenator::compile(&rules)?;
+                    results.extend(self.tests.iter().map(|test| {
+                        let hyphens = match &back {
+                            Some((pipeline, display)) => hyphenator.hyphenate_braille(
+                                &test.input,
+                                pipeline,
+                                display.as_ref(),
+                            ),
+                            None => Some(hyphenator.hyphenate(&test.input)),
+                        };
+                        let shown = hyphens.map_or_else(String::new, |hyphens| {
+                            show_hyphens(&test.input, &hyphens)
+                        });
+                        test.verdict(shown, Direction::Forward, None)
+                    }));
+                }
+            }
         }
         Ok(results)
     }
+}
+
+/// liblouis's `lou_hyphenate`: where the letters of each word may be broken, `1` with a
+/// hyphen and `2` without one, as after a hyphen joining two words, `0` elsewhere
+struct Hyphenator {
+    dictionary: HyphenationTable,
+    letters: HashSet<char>,
+    hyphens: HashSet<char>,
+}
+
+impl Hyphenator {
+    fn compile(rules: &[AnchoredRule]) -> Result<Self, TestError> {
+        let dictionary = rules
+            .iter()
+            .rev()
+            .find_map(|rule| match &rule.rule {
+                Rule::IncludeHyphenation { table } => Some(table.clone()),
+                _ => None,
+            })
+            .ok_or(TestError::NoHyphenationTable)?;
+        let letters = translator::letters(rules)?;
+        let hyphens = rules
+            .iter()
+            .filter_map(|rule| match &rule.rule {
+                Rule::Hyphen { character, .. } => Some(*character),
+                _ => None,
+            })
+            .collect();
+        Ok(Self {
+            dictionary,
+            letters,
+            hyphens,
+        })
+    }
+
+    fn hyphenate(&self, text: &str) -> Vec<u8> {
+        let chars: Vec<char> = text.chars().collect();
+        let is_letter = |pos: usize| self.letters.contains(&chars[pos]);
+        let mut hyphens = vec![b'0'; chars.len()];
+        let mut start = 0;
+        while start < chars.len() {
+            if !is_letter(start) {
+                start += 1;
+                continue;
+            }
+            let end = (start + 1..chars.len())
+                .find(|&pos| !is_letter(pos))
+                .unwrap_or(chars.len());
+            let word: Vec<char> = chars[start..end]
+                .iter()
+                .map(|c| c.to_lowercase().next().unwrap_or(*c))
+                .collect();
+            let scores = self.dictionary.hyphens(&word);
+            for (k, score) in scores.iter().enumerate().skip(1) {
+                hyphens[start + k] = if score % 2 == 1 { b'1' } else { b'0' };
+            }
+            if start >= 2 && self.hyphens.contains(&chars[start - 1]) && is_letter(start - 2) {
+                hyphens[start] = b'2';
+            }
+            start = end + 1;
+        }
+        hyphens
+    }
+
+    /// Hyphenate the text `braille` back-translates to, and put the breaks back on the cells
+    fn hyphenate_braille(
+        &self,
+        braille: &str,
+        pipeline: &TranslationPipeline,
+        display: Option<&ImpliedDisplay>,
+    ) -> Option<Vec<u8>> {
+        let cells = match display {
+            Some(display) => display.read(braille),
+            None => braille.to_string(),
+        };
+        let (text, positions) =
+            pipeline.translate_with_positions(&cells, &TranslationOptions::default());
+        let text_hyphens = self.hyphenate(&text);
+        let mut hyphens = vec![b'0'; braille.chars().count()];
+        let mut previous = None;
+        for (k, &cell) in positions.input_positions().iter().enumerate() {
+            if cell >= hyphens.len() {
+                break;
+            }
+            if previous.is_none_or(|previous| cell > previous) {
+                hyphens[cell] = text_hyphens[k];
+                previous = Some(cell);
+            }
+        }
+        Some(hyphens)
+    }
+}
+
+/// The word with `-` where it breaks with a hyphen and `|` where it breaks without one, as
+/// liblouis's checker shows it
+fn show_hyphens(word: &str, hyphens: &[u8]) -> String {
+    if hyphens.first().is_some_and(|&h| h != b'0') {
+        return String::new();
+    }
+    let mut shown = String::new();
+    for (c, &h) in word.chars().zip(hyphens) {
+        match h {
+            b'2' => shown.push('|'),
+            b'1' => shown.push('-'),
+            _ => {}
+        }
+        shown.push(c);
+    }
+    shown
 }
 
 /// A braille table to be used in a [`Test`].

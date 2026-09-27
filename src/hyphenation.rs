@@ -34,8 +34,6 @@ pub enum ParseError {
         directive: &'static str,
         found: String,
     },
-    #[error("line {line}: pattern {pattern:?} has no hyphenation value")]
-    PatternWithoutValue { line: usize, pattern: String },
     #[error("the file is neither ISO8859-1 nor valid UTF-8")]
     InvalidUtf8,
 }
@@ -80,7 +78,7 @@ impl HyphenationTable {
                 parse_hyphenmin(rest, lineno, "RIGHTHYPHENMIN")?;
                 continue;
             }
-            let (letters, tally) = parse_pattern(line, lineno)?;
+            let (letters, tally) = parse_pattern(line);
             let chars: Vec<char> = letters.chars().collect();
             for len in 1..=chars.len() {
                 table.prefixes.insert(chars[..len].iter().collect());
@@ -148,9 +146,9 @@ fn parse_hyphenmin(
 }
 
 /// ".ab3a" -> ("aba", `[0,0,3,0]`) -- letters plus one score per gap
-/// (len(letters) + 1 of them). Fails if no digit was found, since such a
-/// pattern could never produce a break anywhere.
-fn parse_pattern(pattern: &str, lineno: usize) -> Result<(String, Vec<u8>), ParseError> {
+/// (len(letters) + 1 of them). A pattern without a digit breaks nowhere, but liblouis still
+/// counts it among the patterns the automaton reads.
+fn parse_pattern(pattern: &str) -> (String, Vec<u8>) {
     let mut letters = String::new();
     let mut tally = vec![0u8];
     for ch in pattern.chars() {
@@ -162,13 +160,7 @@ fn parse_pattern(pattern: &str, lineno: usize) -> Result<(String, Vec<u8>), Pars
             tally.push(0);
         }
     }
-    if tally.iter().all(|&v| v == 0) {
-        return Err(ParseError::PatternWithoutValue {
-            line: lineno + 1,
-            pattern: pattern.to_string(),
-        });
-    }
-    Ok((letters, tally))
+    (letters, tally)
 }
 
 #[cfg(test)]

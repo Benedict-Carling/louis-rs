@@ -43,6 +43,17 @@ pub enum TranslationError {
     GroupingNotDefined(String),
 }
 
+/// The characters `rules` give the letter attribute
+pub fn letters(
+    rules: &[AnchoredRule],
+) -> Result<std::collections::HashSet<char>, TranslationError> {
+    let ctx = table::TableContext::compile(rules)?;
+    Ok(ctx
+        .character_classes()
+        .get(&crate::parser::CharacterClass::Letter)
+        .unwrap_or_default())
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct CharacterDefinition(HashMap<char, String>);
 
