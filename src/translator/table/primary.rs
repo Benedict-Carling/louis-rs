@@ -6,8 +6,8 @@ use crate::{
     Direction,
     emphasis::EmphasisSpan,
     parser::{
-        AnchoredRule, Braille, BrailleChars, CharacterClass, CharacterClasses, HasDirection,
-        HasNocross, HasPrecedence, WithClass, WithMatch,
+        AnchoredRule, Braille, CharacterClass, CharacterClasses, HasDirection, HasNocross,
+        HasPrecedence, WithClass, WithMatch,
     },
     translator::{
         CharacterDefinition, ClassConstraint, ResolvedTranslation, Rule, TranslationError,
@@ -2099,6 +2099,16 @@ impl PrimaryTable {
                 if let Some(translation) = self.character_translations.get(&next_char) {
                     translations.push(translation.clone());
                     delayed_translations = self.update_offsets(delayed_translations, 1);
+                } else if self.direction == Direction::Backward {
+                    let translation = ResolvedTranslation::new(
+                        &next_char.to_string(),
+                        &unknown_dots(next_char),
+                        1,
+                        TranslationStage::Main,
+                        None,
+                    );
+                    translations.push(translation);
+                    delayed_translations = self.update_offsets(delayed_translations, 1);
                 } else if let Some(ref replacement) = self.undefined {
                     // there is a rule for undefined characters
                     let translation = ResolvedTranslation::new(
@@ -2148,21 +2158,45 @@ impl PrimaryTable {
         }
     }
 
+    /// liblouis's `undefinedCharacter`: the character as it would be written in a table,
+    /// quoted and in hex, each character shown by its single-cell definition or else by
+    /// its fallback cell
     fn handle_undefined_char(&self, ch: char) -> String {
-        ch.escape_unicode()
-            .to_string()
-            .replace(r"\u", r"\x") // replace \u by \x
-            .replace(['{', '}'], "") // drop the curly braces
+        let escaped = match ch as u32 {
+            c @ ..=0xffff => format!("'\\x{c:04x}'"),
+            c @ ..=0xfffff => format!("'\\y{c:x}'"),
+            c => format!("'\\z{c:08x}'"),
+        };
+        escaped
             .chars()
-            .map(|c| {
-                if let Some(t) = self.fallback_definitions.get(&c) {
-                    t.clone()
-                } else {
-                    fallback(c).to_string()
-                }
+            .map(|c| match self.fallback_definitions.get(&c) {
+                Some(t) if t.chars().count() == 1 => t.clone(),
+                _ => fallback(c).to_string(),
             })
             .collect()
     }
+}
+
+/// A cell no rule back-translates, shown as its dot numbers between `\` and `/`
+/// (liblouis's `_lou_unknownDots`)
+fn unknown_dots(cell: char) -> String {
+    let bits = match cell as u32 {
+        c @ 0x2800..=0x28ff => c - 0x2800,
+        c @ 0xf0000..=0xfffff => c - 0xf0000,
+        _ => return cell.to_string(),
+    };
+    let dots: String = "123456789ABCDEF"
+        .chars()
+        .enumerate()
+        .filter(|(i, _)| bits & (1 << i) != 0)
+        .map(|(_, d)| d)
+        .collect();
+    let dots = if dots.is_empty() {
+        "0".to_string()
+    } else {
+        dots
+    };
+    format!("\\{dots}/")
 }
 
 /// The opcodes liblouis's `for_selectRule` skips while `dontContract` is set
@@ -2199,29 +2233,25 @@ fn is_contraction(rule: &Rule) -> bool {
 /// unicode escapes for undefined characters when the table does not
 /// define the character mappings that are needed. Only the characters
 /// that [`PrimaryTable::handle_undefined_char`] can produce are mapped.
-fn fallback(ch: char) -> BrailleChars {
-    let dots = match ch {
-        '0' => "356",
-        '1' => "2",
-        '2' => "23",
-        '3' => "25",
-        '4' => "256",
-        '5' => "26",
-        '6' => "235",
-        '7' => "2356",
-        '8' => "236",
-        '9' => "35",
-        'a' => "1",
-        'b' => "12",
-        'c' => "14",
-        'd' => "145",
-        'e' => "15",
-        'f' => "124",
-        '\\' => "1256",
-        'x' => "1346",
-        _ => unreachable!("no NABCC fallback for {ch:?}"),
+fn fallback(ch: char) -> char {
+    let c = if ch.is_ascii() { ch as u32 } else { '?' as u32 };
+    // liblouis's `_lou_charToFallbackDots`: fold the ASCII range onto 0x20..0x5F
+    let (c, dot7) = match c {
+        0x7f.. => (c & !0x20, 0x40),
+        0x60.. => (c & !0x20, 0),
+        0x5f.. => (c, 0),
+        0x40.. => (c, 0x40),
+        0x20.. => (c, 0),
+        _ => (c | 0x40, 0xc0),
     };
-    BrailleChars::try_from(dots).expect("NABCC dot pattern is valid")
+    const DOTS: [u32; 64] = [
+        0x00, 0x2e, 0x10, 0x3c, 0x2b, 0x29, 0x2f, 0x04, 0x37, 0x3e, 0x21, 0x2c, 0x20, 0x24, 0x28,
+        0x0c, 0x34, 0x02, 0x06, 0x12, 0x32, 0x22, 0x16, 0x36, 0x26, 0x14, 0x31, 0x30, 0x23, 0x3f,
+        0x1c, 0x39, 0x08, 0x01, 0x03, 0x09, 0x19, 0x11, 0x0b, 0x1b, 0x13, 0x0a, 0x1a, 0x05, 0x07,
+        0x0d, 0x1d, 0x15, 0x0f, 0x1f, 0x17, 0x0e, 0x1e, 0x25, 0x27, 0x3a, 0x2d, 0x3d, 0x35, 0x2a,
+        0x33, 0x3b, 0x18, 0x38,
+    ];
+    char::from_u32(0x2800 | dot7 | DOTS[(c - 0x20) as usize]).unwrap()
 }
 
 fn is_emphasis_indicator(rule: Option<&Rule>, caps_only: bool) -> bool {
@@ -2261,14 +2291,19 @@ mod tests {
     use crate::parser::{RuleParser, expand_includes};
 
     #[test]
-    fn fallback_covers_every_escaped_char() {
-        // handle_undefined_char emits `\x` plus lowercase hex digits, so
-        // fallback must map all of them without hitting the unreachable arm
-        for c in r"\x0123456789abcdef".chars() {
-            assert_eq!(fallback(c).len(), 1);
-        }
-        assert_eq!(fallback('a').to_string(), "\u{2801}"); // dot 1
-        assert_eq!(fallback('9').to_string(), "\u{2814}"); // dots 35, not 25
+    fn unknown_dots_shows_dot_numbers() {
+        assert_eq!(unknown_dots('⠈'), "\\4/");
+        assert_eq!(unknown_dots('⠀'), "\\0/");
+        assert_eq!(unknown_dots('\u{F0203}'), "\\12A/");
+    }
+
+    #[test]
+    fn fallback_follows_liblouis() {
+        assert_eq!(fallback('a'), '\u{2801}'); // dot 1
+        assert_eq!(fallback('9'), '\u{2814}'); // dots 35, not 25
+        assert_eq!(fallback('\\'), '\u{2873}'); // dots 12567
+        assert_eq!(fallback('\''), '\u{2804}');
+        assert_eq!(fallback('é'), fallback('?'));
     }
 
     fn parse_rule(source: &str) -> AnchoredRule {
@@ -2294,7 +2329,7 @@ mod tests {
                 .unwrap();
         assert_eq!(table.translate("foobar"), "⠇⠸");
         assert_eq!(table.translate("  "), "⠀⠀");
-        assert_eq!(table.translate("🐂"), "⠳⠭⠂⠋⠲⠴⠆");
+        assert_eq!(table.translate("🐂"), "⠄⡳⠽⠂⠋⠲⠴⠆⠄");
     }
 
     #[test]
