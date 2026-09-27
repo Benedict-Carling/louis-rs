@@ -1526,7 +1526,14 @@ impl PrimaryTable {
                 _ => (),
             }
         }
-        let numeric_chars: HashSet<char> = [CharacterClass::Digit, CharacterClass::Litdigit]
+        // only liblouis' numeric mode counts a litdigit as a digit
+        let numeric_classes: &[CharacterClass] =
+            if builder.numeric_indicator.runs().uses_numeric_mode() {
+                &[CharacterClass::Digit, CharacterClass::Litdigit]
+            } else {
+                &[CharacterClass::Digit]
+            };
+        let numeric_chars: HashSet<char> = numeric_classes
             .iter()
             .flat_map(|class| ctx.character_classes().get(class).unwrap_or_default())
             .collect();
@@ -3852,6 +3859,21 @@ mod tests {
     fn nocont_takes_back_the_contractions_of_its_word() {
         let table = repeated_and_nocont_table();
         assert_eq!(table.translate("ab abc ab"), "⠂⠀⠁⠃⠉⠀⠂");
+    }
+
+    #[test]
+    fn no_numsign_before_a_litdigit_outside_numeric_mode() {
+        let rules = [
+            parse_rule("litdigit 1 1"),
+            parse_rule("digit 2 12"),
+            parse_rule("numsign 3456"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("1"), "⠁");
+        assert_eq!(table.translate("2"), "⠼⠃");
     }
 
     #[test]
