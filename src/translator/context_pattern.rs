@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::parser::multipass::test::Operator;
 use crate::parser::{Action, ActionInstruction, HasPrecedence, Quantifier, Test, TestInstruction};
 
+use crate::Direction;
 use crate::parser::{AnchoredRule, Attribute, CharacterClass, CharacterClasses};
 use crate::translator::effect::{Effect, Environment};
 use crate::translator::regexp::{self, CompiledRegexp, Regexp};
@@ -20,7 +21,16 @@ use crate::translator::{
 
 impl Regexp {
     fn from_test(test: &Test, whole_match: bool, ctx: &CharacterClasses) -> Self {
-        let regexp = Regexp::from_instructions(test.tests(), whole_match, ctx);
+        Regexp::from_test_in(test, whole_match, ctx, Direction::Forward)
+    }
+
+    fn from_test_in(
+        test: &Test,
+        whole_match: bool,
+        ctx: &CharacterClasses,
+        direction: Direction,
+    ) -> Self {
+        let regexp = Regexp::from_instructions(test.tests(), whole_match, ctx, direction);
         if whole_match {
             Regexp::Consume(Box::new(regexp))
         } else {
@@ -32,25 +42,20 @@ impl Regexp {
         instructions: &[TestInstruction],
         whole_match: bool,
         ctx: &CharacterClasses,
+        direction: Direction,
     ) -> Self {
-        match instructions.len() {
-            0 => Regexp::Empty,
-            1 => Regexp::from_instruction(&instructions[0], whole_match, ctx),
-            _ => {
-                let mut ast = Regexp::from_instruction(&instructions[0], whole_match, ctx);
-                for instruction in &instructions[1..] {
-                    let other = Regexp::from_instruction(instruction, whole_match, ctx);
-                    ast = Regexp::Concat(Box::new(ast), Box::new(other));
-                }
-                ast
-            }
-        }
+        instructions
+            .iter()
+            .map(|instruction| Regexp::from_instruction(instruction, whole_match, ctx, direction))
+            .reduce(|ast, other| Regexp::Concat(Box::new(ast), Box::new(other)))
+            .unwrap_or(Regexp::Empty)
     }
 
     fn from_instruction(
         instruction: &TestInstruction,
         whole_match: bool,
         ctx: &CharacterClasses,
+        direction: Direction,
     ) -> Self {
         match instruction {
             // liblouis' `_N` rewinds a single mutable cursor by N so a later test can peek at
@@ -83,12 +88,28 @@ impl Regexp {
             TestInstruction::Class { name, quantifier } => {
                 Regexp::from_class(name, quantifier, ctx)
             }
-            TestInstruction::Negate { test } => {
-                Regexp::from_instruction(test, whole_match, ctx).negate()
-            }
+            TestInstruction::Negate { test } => match (direction, test.as_ref()) {
+                (Direction::Backward, TestInstruction::Attributes { attrs, quantifier }) => {
+                    Regexp::backward_negation(Regexp::attributes_set(attrs, ctx), quantifier)
+                }
+                (Direction::Backward, TestInstruction::Class { name, quantifier }) => {
+                    Regexp::backward_negation(Some(Regexp::class_set(name, ctx)), quantifier)
+                }
+                (Direction::Forward, TestInstruction::Attributes { attrs, quantifier }) => {
+                    Regexp::forward_negation(Regexp::attributes_set(attrs, ctx), quantifier)
+                }
+                (Direction::Forward, TestInstruction::Class { name, quantifier }) => {
+                    Regexp::forward_negation(Some(Regexp::class_set(name, ctx)), quantifier)
+                }
+                _ => Regexp::from_instruction(test, whole_match, ctx, direction).negate(),
+            },
             TestInstruction::Replace { tests } => {
-                let regexp =
-                    Regexp::Capture(Box::new(Regexp::from_instructions(tests, whole_match, ctx)));
+                let regexp = Regexp::Capture(Box::new(Regexp::from_instructions(
+                    tests,
+                    whole_match,
+                    ctx,
+                    direction,
+                )));
                 if whole_match {
                     regexp
                 } else {
@@ -100,21 +121,44 @@ impl Regexp {
         }
     }
 
-    fn quantified(self, quantifier: &Option<Quantifier>) -> Self {
+    /// A quantified attribute test: liblouis's `passDoTest` takes as many matching
+    /// characters as the quantifier allows and never gives any back
+    fn possessive(characters: Option<HashSet<char>>, quantifier: &Option<Quantifier>) -> Self {
+        let (single, not_ahead) = match characters {
+            Some(characters) => (
+                Regexp::CharacterClass(characters.clone()),
+                Regexp::NotCharacterClassAhead(characters),
+            ),
+            None => (Regexp::Any, Regexp::EndAnchor),
+        };
         match quantifier {
-            None => self,
-            Some(Quantifier::Number(n)) => Regexp::RepeatExactly(*n, Box::new(self)),
+            None => single,
+            Some(Quantifier::Number(n)) => Regexp::RepeatExactly(*n, Box::new(single)),
             Some(Quantifier::Range(min, max)) => {
-                Regexp::RepeatAtLeastAtMost(*min, *max, Box::new(self))
+                let tail = (*min..*max).fold(Regexp::Empty, |rest, _| {
+                    Regexp::Either(
+                        Box::new(Regexp::Concat(Box::new(single.clone()), Box::new(rest))),
+                        Box::new(not_ahead.clone()),
+                    )
+                });
+                Regexp::Concat(
+                    Box::new(Regexp::RepeatExactly(*min, Box::new(single))),
+                    Box::new(tail),
+                )
             }
-            Some(Quantifier::OneOrMore) => Regexp::OneOrMore(Box::new(self)),
+            Some(Quantifier::OneOrMore) => Regexp::Concat(
+                Box::new(Regexp::OneOrMore(Box::new(single))),
+                Box::new(not_ahead),
+            ),
         }
     }
 
     fn from_class(name: &str, quantifier: &Option<Quantifier>, ctx: &CharacterClasses) -> Self {
-        let class = CharacterClass::from(name);
-        let characters = ctx.get(&class).unwrap_or_default(); // FIXME: should probably fail if we cannot find the class
-        Regexp::CharacterClass(characters).quantified(quantifier)
+        Regexp::possessive(Some(Regexp::class_set(name, ctx)), quantifier)
+    }
+
+    fn class_set(name: &str, ctx: &CharacterClasses) -> HashSet<char> {
+        ctx.get(&CharacterClass::from(name)).unwrap_or_default() // FIXME: should probably fail if we cannot find the class
     }
 
     fn from_multipass_attributes(
@@ -122,10 +166,15 @@ impl Regexp {
         quantifier: &Option<Quantifier>,
         ctx: &CharacterClasses,
     ) -> Self {
-        // liblouis compiles `a` to the full attribute mask, so it matches any character no
-        // matter what else is in the list -- an alternative with everything else is pointless
+        Regexp::possessive(Regexp::attributes_set(attrs, ctx), quantifier)
+    }
+
+    /// The characters an attribute test matches, or `None` for every character: liblouis
+    /// compiles `a` to the full attribute mask, so it matches any character no matter what
+    /// else is in the list
+    fn attributes_set(attrs: &HashSet<Attribute>, ctx: &CharacterClasses) -> Option<HashSet<char>> {
         if attrs.contains(&Attribute::Any) {
-            return Regexp::Any.quantified(quantifier);
+            return None;
         }
         let mut characters: HashSet<char> = HashSet::default();
         for attr in attrs {
@@ -140,7 +189,55 @@ impl Regexp {
                 Attribute::Any => unreachable!("handled above"),
             }
         }
-        Regexp::CharacterClass(characters).quantified(quantifier)
+        Some(characters)
+    }
+
+    fn forward_negation(
+        characters: Option<HashSet<char>>,
+        quantifier: &Option<Quantifier>,
+    ) -> Self {
+        let single = match characters {
+            Some(characters) => Regexp::CharacterClass(characters),
+            None => Regexp::Any,
+        }
+        .negate();
+        match quantifier {
+            None => single,
+            Some(Quantifier::Number(n)) => Regexp::RepeatExactly(*n, Box::new(single)),
+            Some(Quantifier::Range(min, max)) => {
+                Regexp::RepeatAtLeastAtMost(*min, *max, Box::new(single))
+            }
+            Some(Quantifier::OneOrMore) => Regexp::OneOrMore(Box::new(single)),
+        }
+    }
+
+    /// A negated attribute test in back-translation: liblouis's `back_passDoTest` inverts
+    /// the test's outcome, so it holds when fewer than the minimum count of characters
+    /// match, and it consumes only those that did
+    fn backward_negation(
+        characters: Option<HashSet<char>>,
+        quantifier: &Option<Quantifier>,
+    ) -> Self {
+        let min = match quantifier {
+            Some(Quantifier::Number(n)) | Some(Quantifier::Range(n, _)) => *n,
+            None | Some(Quantifier::OneOrMore) => 1,
+        };
+        let (single, not_ahead) = match characters {
+            Some(characters) => (
+                Regexp::CharacterClass(characters.clone()),
+                Regexp::NotCharacterClassAhead(characters),
+            ),
+            None => (Regexp::Any, Regexp::EndAnchor),
+        };
+        (0..min)
+            .map(|k| {
+                Regexp::Concat(
+                    Box::new(Regexp::RepeatExactly(k, Box::new(single.clone()))),
+                    Box::new(not_ahead.clone()),
+                )
+            })
+            .reduce(|a, b| Regexp::Either(Box::new(a), Box::new(b)))
+            .unwrap_or(Regexp::Never)
     }
 }
 
@@ -206,6 +303,7 @@ impl Effects {
 #[derive(Debug)]
 pub struct ContextPatternsBuilder {
     regexps: Vec<CompiledRegexp>,
+    direction: Direction,
     put_captures: bool,
     definitions: Option<Arc<CharacterDefinition>>,
 }
@@ -214,6 +312,7 @@ impl ContextPatternsBuilder {
     pub fn new() -> Self {
         Self {
             regexps: Vec::new(),
+            direction: Direction::Forward,
             put_captures: false,
             definitions: None,
         }
@@ -226,6 +325,10 @@ impl ContextPatternsBuilder {
             put_captures,
             ..self
         }
+    }
+
+    pub fn for_direction(self, direction: Direction) -> Self {
+        Self { direction, ..self }
     }
 
     /// Create a translation based on `test`, `action`, `origin` and `swap_classes`
@@ -274,8 +377,13 @@ impl ContextPatternsBuilder {
             // a display table is a plain character mapping, it has no context rules
             TranslationStage::Display => unreachable!(),
         };
-        let regexp = Regexp::from_test(&test, action.consumes_whole_match(), character_classes)
-            .compile_with_payload(translation);
+        let regexp = Regexp::from_test_in(
+            &test,
+            action.consumes_whole_match(),
+            character_classes,
+            self.direction,
+        )
+        .compile_with_payload(translation);
         self.regexps.push(regexp);
         Ok(())
     }
@@ -378,6 +486,37 @@ mod tests {
             ResolvedTranslation::new("", "", 1, stage, None).with_length(1)
         );
         assert_eq!(re.find("", &env), None);
+    }
+
+    /// liblouis takes as many characters as a quantified attribute test allows and never
+    /// gives any back to the tests after it
+    #[test]
+    fn quantified_attribute_is_possessive() {
+        let env = Environment::new();
+        let ctx = context(CharacterClass::Digit, &['1', '2', '3']);
+        let re =
+            Regexp::from_test(&test::Parser::new("$d.$d").tests().unwrap(), true, &ctx).compile();
+        assert!(!re.is_match("123", &env));
+        let re =
+            Regexp::from_test(&test::Parser::new("$d1-2$d").tests().unwrap(), true, &ctx).compile();
+        assert!(!re.is_match("12", &env));
+        assert!(re.is_match("123", &env));
+    }
+
+    /// In back-translation a negated attribute test only inverts the outcome, so it
+    /// consumes nothing when the character doesn't match
+    #[test]
+    fn negated_attribute_backward_is_zero_width() {
+        let env = Environment::new();
+        let mut ctx = context(CharacterClass::Digit, &['1']);
+        ctx.insert(CharacterClass::Letter, 'a');
+        let tests = test::Parser::new("!$d$l").tests().unwrap();
+        let backward = Regexp::from_test_in(&tests, true, &ctx, Direction::Backward).compile();
+        assert!(backward.is_match("a", &env));
+        assert!(!backward.is_match("1a", &env));
+        let forward = Regexp::from_test_in(&tests, true, &ctx, Direction::Forward).compile();
+        assert!(!forward.is_match("a", &env));
+        assert!(forward.is_match("aa", &env));
     }
 
     #[test]
