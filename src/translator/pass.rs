@@ -519,22 +519,53 @@ impl PassRule {
         vars: &mut Variables,
         stage: TranslationStage,
     ) -> (Vec<ResolvedTranslation>, usize) {
+        let copies = self.action.iter().any(|act| matches!(act, Act::Copy));
+        let new_pos = if copies { m.end_match } else { m.end_replace }.max(m.start_match);
+        let region = m.start_replace.clamp(m.start_match, new_pos)
+            ..m.end_replace.clamp(m.start_match, new_pos);
+        let translation = |input: &[char], output: &str| {
+            let input: String = input.iter().collect();
+            ResolvedTranslation::new(
+                &input,
+                output,
+                input.chars().count(),
+                stage,
+                self.origin.clone(),
+            )
+        };
+        let mut translations = Vec::new();
+        // the input before the replace region is kept, unless a `*` takes the whole match
+        if copies {
+            if region.start > m.start_match {
+                translations.push(translation(&input[m.start_match..region.start], ""));
+            }
+        } else {
+            for c in &input[m.start_match..region.start] {
+                translations.push(translation(&[*c], &c.to_string()));
+            }
+        }
+        // liblouis maps what `*` and a swap produce char by char, and everything else to the
+        // start of the replace region
+        let per_char = copies || self.action.iter().any(|act| matches!(act, Act::Swap(_)));
+        let mut consumed = region.start;
         let mut output = String::new();
-        let mut new_pos = m.end_replace;
-        let mut keep_prefix = true;
         for act in &self.action {
-            match act {
-                Act::Output(s) => output.push_str(s),
-                Act::Swap(swapper) => output.extend(
-                    input[m.start_replace..m.end_replace]
-                        .iter()
-                        .filter_map(|c| swapper.replacement(*c)),
-                ),
-                Act::Copy => {
-                    keep_prefix = false;
-                    output.extend(&input[m.start_replace..m.end_replace]);
-                    new_pos = m.end_match;
+            let mut region_chars = |replace: &dyn Fn(char) -> Option<String>| {
+                for (i, c) in input[region.clone()].iter().enumerate() {
+                    let replacement = replace(*c).unwrap_or_default();
+                    if region.start + i >= consumed {
+                        translations.push(translation(&[*c], &replacement));
+                        consumed = region.start + i + 1;
+                    } else {
+                        translations.push(translation(&[], &replacement));
+                    }
                 }
+            };
+            match act {
+                Act::Output(s) if per_char => translations.push(translation(&[], s)),
+                Act::Output(s) => output.push_str(s),
+                Act::Swap(swapper) => region_chars(&|c| swapper.replacement(c).map(str::to_string)),
+                Act::Copy => region_chars(&|c| Some(c.to_string())),
                 Act::Omit => {}
                 Act::Assign { var, value } => {
                     vars.0.insert(*var, u16::from(*value));
@@ -549,27 +580,13 @@ impl PassRule {
                 }
             }
         }
-        let translation = |input: &[char], output: &str| {
-            let input: String = input.iter().collect();
-            ResolvedTranslation::new(
-                &input,
-                output,
-                input.chars().count(),
-                stage,
-                self.origin.clone(),
-            )
-        };
-        let mut translations = Vec::new();
-        let mut from = m.start_match;
-        let new_pos = new_pos.max(m.start_match);
-        if keep_prefix {
-            // backward, a replace region may start before the match, and nothing is kept then
-            from = m.start_replace.clamp(m.start_match, new_pos);
-            for c in &input[m.start_match..from] {
-                translations.push(translation(&[*c], &c.to_string()));
+        if per_char {
+            if consumed < new_pos {
+                translations.push(translation(&input[consumed..new_pos], ""));
             }
+        } else {
+            translations.push(translation(&input[region.start..new_pos], &output));
         }
-        translations.push(translation(&input[from..new_pos], &output));
         (translations, new_pos)
     }
 
