@@ -37,11 +37,22 @@ pub enum ParseError {
     },
     #[error("line {line}: pattern {pattern:?} has no hyphenation value")]
     PatternWithoutValue { line: usize, pattern: String },
-    #[error("unsupported encoding {encoding:?}: only UTF-8 .dic files are supported")]
-    UnsupportedEncoding { encoding: String },
+    #[error("the file is neither ISO8859-1 nor valid UTF-8")]
+    InvalidUtf8,
 }
 
 impl HyphenationTable {
+    /// Parse a `.dic` file's bytes, which are Latin-1 when its first line names an `ISO`
+    /// encoding, as liblouis reads them, and UTF-8 otherwise.
+    pub fn parse_bytes(bytes: &[u8]) -> Result<Self, ParseError> {
+        let source = if bytes.trim_ascii_start().starts_with(b"ISO") {
+            bytes.iter().map(|&b| char::from(b)).collect()
+        } else {
+            String::from_utf8(bytes.to_vec()).map_err(|_| ParseError::InvalidUtf8)?
+        };
+        Self::parse(&source)
+    }
+
     /// Parse a `.dic` hyphenation-pattern file.
     ///
     /// `LEFTHYPHENMIN`/`RIGHTHYPHENMIN` set the boundary minima when
@@ -59,16 +70,9 @@ impl HyphenationTable {
             if line.is_empty() {
                 continue;
             }
-            // The first line is an encoding marker; we only support UTF-8.
-            if lineno == 0 {
-                if line.eq_ignore_ascii_case("UTF-8") {
-                    continue;
-                }
-                if line.eq_ignore_ascii_case("ISO8859-1") {
-                    return Err(ParseError::UnsupportedEncoding {
-                        encoding: line.to_string(),
-                    });
-                }
+            // The first line is an encoding marker, the text is already decoded
+            if lineno == 0 && (line.starts_with("UTF-8") || line.starts_with("ISO")) {
+                continue;
             }
             // Comment lines.
             if line.starts_with('#') || line.starts_with('%') {
@@ -222,8 +226,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_iso8859_1_encoding() {
-        assert!(HyphenationTable::parse("ISO8859-1\n.ab3a\n").is_err());
+    fn reads_iso8859_1_as_latin1() {
+        let t = HyphenationTable::parse_bytes(b"ISO8859-1\n.\xe93a\n").unwrap();
+        assert_eq!(t.break_points("éa"), vec![true]);
+        assert!(HyphenationTable::parse_bytes(b"UTF-8\n.\xe93a\n").is_err());
     }
 
     #[test]

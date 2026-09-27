@@ -8,7 +8,7 @@ use std::{
     iter::Peekable,
     num::ParseIntError,
     path::{Path, PathBuf},
-    str::{Chars, SplitAsciiWhitespace},
+    str::SplitAsciiWhitespace,
 };
 
 use enumset::enum_set;
@@ -1705,9 +1705,23 @@ impl<'a> RuleParser<'a> {
     }
 
     pub fn rule(&mut self) -> Result<Rule, ParseError> {
+        self.rule_or_blank()?
+            .ok_or(ParseError::OpcodeExpected { found: None })
+    }
+
+    /// Like [`Self::rule`], but a line holding only prefixes such as `nofor` or `after x`
+    /// reads as a blank line, as liblouis's compiler finds no opcode token after them.
+    pub fn rule_or_blank(&mut self) -> Result<Option<Rule>, ParseError> {
         let constraints = self.constraints();
         let classes = self.with_classes().unwrap_or_default().unwrap_or_default();
         let matches = self.with_matches();
+        if self
+            .tokens
+            .peek()
+            .is_none_or(|token| token.starts_with('#') || token.starts_with('<'))
+        {
+            return Ok(None);
+        }
         let opcode = self.opcode()?;
         let rule = match opcode {
             Opcode::Include => {
@@ -2465,7 +2479,7 @@ impl<'a> RuleParser<'a> {
                 }
             }
         };
-        Ok(rule)
+        Ok(Some(rule))
     }
 }
 
@@ -2572,20 +2586,23 @@ pub fn table(table: &str, path: Option<PathBuf>) -> Result<Vec<AnchoredRule>, Ve
         .enumerate()
         // drop comments and empty lines
         .filter(|(_, line)| !line.trim().starts_with('#') && !line.trim().is_empty())
-        .map(|(line_no, line)| {
+        .filter_map(|(line_no, line)| {
             // parse the line
             RuleParser::new(line)
-                .rule()
-                .map(|rule| AnchoredRule {
-                    rule,
-                    path: path.clone(),
-                    line: line_no + 1,
+                .rule_or_blank()
+                .map(|rule| {
+                    rule.map(|rule| AnchoredRule {
+                        rule,
+                        path: path.clone(),
+                        line: line_no + 1,
+                    })
                 })
                 .map_err(|e| TableError::ParseError {
                     path: path.clone(),
                     line: line_no + 1,
                     error: e,
                 })
+                .transpose()
         })
         .partition(Result::is_ok);
     let rules: Vec<_> = rules.into_iter().map(Result::unwrap).collect();
@@ -2667,13 +2684,13 @@ fn expand_include(
                 let resolved = search_path
                     .find_file(path)
                     .ok_or(vec![TableError::HyphenationTableNotFound(path.into())])?;
-                let source = read_to_string(&resolved).map_err(|error| {
+                let source = std::fs::read(&resolved).map_err(|error| {
                     vec![TableError::HyphenationTableNotReadable {
                         path: resolved.clone(),
                         error,
                     }]
                 })?;
-                let table = HyphenationTable::parse(&source).map_err(|error| {
+                let table = HyphenationTable::parse_bytes(&source).map_err(|error| {
                     vec![TableError::HyphenationTableNotParseable {
                         path: resolved,
                         error,
@@ -3080,6 +3097,21 @@ mod tests {
         assert_eq!(
             Err(ParseError::DotsTupleExpected),
             RuleParser::new("grouping brackets () 123").rule()
+        );
+    }
+
+    #[test]
+    fn prefixes_without_an_opcode_are_a_blank_line() {
+        let rules = table(
+            "attribute x x\nafter x\nnofor # comment\nletter a 1\n",
+            None,
+        )
+        .unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[1].line(), 4);
+        assert_eq!(
+            RuleParser::new("nofor").rule(),
+            Err(ParseError::OpcodeExpected { found: None })
         );
     }
 
