@@ -74,13 +74,12 @@ impl MultipassTable {
 
     fn translation_candidates(
         &self,
+        before: &str,
         input: &str,
-        _prev: Option<char>,
         env: &Environment,
-        at_start: bool,
     ) -> (Vec<ResolvedTranslation>, Vec<ResolvedTranslation>) {
         self.patterns
-            .find(input, env, at_start)
+            .find(before, input, env)
             .into_iter()
             .partition(|t| t.offset() == 0)
     }
@@ -110,16 +109,15 @@ impl MultipassTable {
         let mut delayed_translations: Vec<ResolvedTranslation> = Vec::new();
         let mut env = Environment::new();
         let mut chars = input.chars();
-        let mut prev: Option<char> = None;
         // liblouis copies the next character unchanged after a rule that did not advance
         let mut advanced = true;
 
         loop {
             // given an input query the patterns for matching translations. Then split off the
             // translations that are delayed, i.e. have an offset because they have a pre-pattern
-            let at_start = chars.as_str().len() == input.len();
+            let before = &input[..input.len() - chars.as_str().len()];
             let (mut candidates, delayed) =
-                self.translation_candidates(chars.as_str(), prev, &env, at_start);
+                self.translation_candidates(before, chars.as_str(), &env);
             delayed_translations.extend(delayed);
 
             // move delayed_translations with zero offset into candidates
@@ -140,7 +138,6 @@ impl MultipassTable {
                 } else {
                     // move the iterator forward by the number of characters in the translation
                     chars.nth(t.length() - 1);
-                    prev = t.input().chars().last();
                 }
                 // there is a matching translation rule
                 let translation = t.clone();
@@ -154,7 +151,6 @@ impl MultipassTable {
                     }
                 }
             } else if let Some(next_char) = chars.next() {
-                prev = Some(next_char);
                 // no translation rule found, just pass the character through
                 let translation = ResolvedTranslation::new(
                     &next_char.to_string(),

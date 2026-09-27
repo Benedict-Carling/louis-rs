@@ -1722,12 +1722,12 @@ impl PrimaryTable {
 
     fn context_candidates(
         &self,
+        before: &str,
         input: &str,
         env: &Environment,
-        at_start: bool,
     ) -> (Vec<ResolvedTranslation>, Vec<ResolvedTranslation>) {
         self.context_patterns
-            .find(input, env, at_start)
+            .find(before, input, env)
             .into_iter()
             .partition(|t| t.offset() == 0)
     }
@@ -1897,8 +1897,11 @@ impl PrimaryTable {
 
             // then search for context patterns. Unless they have empty pre patterns they will all
             // have an offset. Split those off.
-            let (context_candidates, context_delayed) =
-                self.context_candidates(chars.as_str(), &env, at_start);
+            let (context_candidates, context_delayed) = self.context_candidates(
+                &input[..input.len() - chars.as_str().len()],
+                chars.as_str(),
+                &env,
+            );
             delayed_translations.extend(context_delayed);
             // merge the candidates from the context patters with the candidates from the plain translations
             candidates.extend(context_candidates);
@@ -3545,6 +3548,20 @@ mod tests {
             PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
                 .unwrap();
         assert_eq!(table.translate("0i"), "⠁⠠⠠⠊");
+    }
+
+    #[test]
+    fn context_lookback_reaches_into_a_consumed_rule() {
+        let table = forward_table(&[
+            "lowercase a 1",
+            "lowercase r 1235",
+            "lowercase o 135",
+            "lowercase d 145",
+            "always ar 345",
+            "context _$l[\"od\"] @46",
+        ]);
+        assert_eq!(table.translate("arod"), "⠜⠨");
+        assert_eq!(table.translate("od"), "⠕⠙");
     }
 
     #[test]
