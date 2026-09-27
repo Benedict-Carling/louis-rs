@@ -780,8 +780,10 @@ mod tests {
         builder
             .insert(&tests, &action, &origin, stage, &TableContext::default())
             .unwrap();
+        // the variable test is checked context
         let translation =
-            ResolvedTranslation::new("a", "X", 1, TranslationStage::Main, origin.clone());
+            ResolvedTranslation::new("a", "X", 1, TranslationStage::Main, origin.clone())
+                .with_weight(2);
         let patterns = builder.build();
         assert_eq!(patterns.find("a", &env, true), [translation]);
         assert!(patterns.find("a", &env, false).is_empty());

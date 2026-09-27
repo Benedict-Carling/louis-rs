@@ -1759,6 +1759,8 @@ impl PrimaryTable {
         let mut chars = input.chars();
         let mut prev: Option<char> = None;
         let mut seen: HashSet<TranslationSubset> = HashSet::default();
+        let mut seen_at: usize = 0;
+        let mut stalled_rank = None;
         let mut char_pos: usize = 0;
         // A zero-length candidate (e.g. a zero-width `context`/`match` action) re-enters
         // the loop at the same char_pos without advancing, so indications must only be
@@ -1859,9 +1861,13 @@ impl PrimaryTable {
         let mut backward_state = backward::State::default();
 
         loop {
+            let mut pending_indications = Vec::new();
             if last_indications_pos != Some(char_pos) {
-                translations.extend(indications.translations_at(char_pos));
+                pending_indications = indications.translations_at(char_pos);
                 last_indications_pos = Some(char_pos);
+            }
+            if self.direction == Direction::Backward {
+                translations.append(&mut pending_indications);
             }
 
             // whether we're about to match starting at the true beginning of the whole input,
@@ -1908,6 +1914,13 @@ impl PrimaryTable {
             // move delayed_translations with zero offset into candidates
             let (current, delayed) = self.partition_delayed_translations(delayed_translations);
             delayed_translations = delayed;
+            // a context rule whose test began before this position was applied there by
+            // liblouis, ahead of the indicators here
+            let begun_before: HashSet<TranslationSubset> = current
+                .iter()
+                .filter(|t| t.length() == 0 && matches!(t.rule(), Some(Rule::Context { .. })))
+                .map(TranslationSubset::from)
+                .collect();
             candidates.extend(current);
             // a tie between the two goes to the later, prepunc, as when they shared a trie
             for trie in [&self.postpunc_trie, &self.prepunc_trie] {
@@ -1992,9 +2005,27 @@ impl PrimaryTable {
 
             // drop translation candidates that we have applied already at this position in the
             // input
+            if seen_at != char_pos {
+                seen.clear();
+                stalled_rank = None;
+                seen_at = char_pos;
+            }
+            // liblouis tries no further context rule at a position where one did not advance.
+            // Zero-length rules tying with the one that fired are a table ambiguity; they all
+            // fire rather than one being picked by position.
+            let stalled = |t: &ResolvedTranslation| {
+                self.direction == Direction::Forward
+                    && stalled_rank.is_some_and(|rank| {
+                        if t.length() == 0 {
+                            t.rank() != rank
+                        } else {
+                            matches!(t.rule(), Some(Rule::Context { .. }))
+                        }
+                    })
+            };
             let unseen = candidates
                 .iter()
-                .filter(|t| !seen.contains(&TranslationSubset::from(*t)));
+                .filter(|t| !seen.contains(&TranslationSubset::from(*t)) && !stalled(t));
             let candidate = match &self.backward {
                 Some(selector) => {
                     selector.begin(&mut backward_state, &translations);
@@ -2017,9 +2048,15 @@ impl PrimaryTable {
             };
             // A nocross rule wins if there is no plain candidate to beat (many, e.g.
             // liblouis' `nocross always en`, have no plain counterpart at all).
-            if let Some(nocross) = &nocross_candidate
-                && candidate.is_none_or(|t| nocross.rank() >= t.rank())
+            let nocross_wins = nocross_candidate
+                .as_ref()
+                .is_some_and(|nocross| candidate.is_none_or(|t| nocross.rank() >= t.rank()));
+            if nocross_wins
+                || !candidate.is_some_and(|t| begun_before.contains(&TranslationSubset::from(t)))
             {
+                translations.append(&mut pending_indications);
+            }
+            if nocross_wins && let Some(nocross) = &nocross_candidate {
                 let translation = nocross.clone();
                 let translation = uppercase_if_needed(translation);
                 let consumed = chars.as_str();
@@ -2050,8 +2087,8 @@ impl PrimaryTable {
                     // if there is a zero-length translation candiate we run the risk of an infinite
                     // loop, so remember the current translation so we only apply it once
                     seen.insert(TranslationSubset::from(t));
+                    stalled_rank = Some(t.rank());
                 } else {
-                    seen.clear();
                     // move the iterator forward by the number of characters in the translation
                     chars.nth(t.length() - 1);
                     prev = t.input().chars().last();
@@ -2064,6 +2101,7 @@ impl PrimaryTable {
                 let translation = t.clone();
                 let translation = uppercase_if_needed(translation);
                 translations.push(translation);
+                translations.append(&mut pending_indications);
                 delayed_translations = self.update_offsets(delayed_translations, t.length());
                 delayed_translations.extend(self.match_candidates_within(consumed, t.length()));
                 // liblouis drops the spaces after a joinword or joinnum
@@ -3588,6 +3626,51 @@ mod tests {
             PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
                 .unwrap();
         assert_eq!(table.translate("α"), "⠰⠁");
+    }
+
+    #[test]
+    fn one_context_rule_per_position() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("context []$l$l @3"),
+            parse_rule("context []$l @6"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("ab"), "⠄⠁⠠⠃");
+    }
+
+    #[test]
+    fn variable_test_counts_as_checked_context() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("context #1=0[]$l ?"),
+            parse_rule("context []$l @6"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("a"), "⠁");
+    }
+
+    #[test]
+    fn context_begun_earlier_precedes_indicators() {
+        let rules = [
+            parse_rule("digit 1 1"),
+            parse_rule("lowercase a 1"),
+            parse_rule("base uppercase A a"),
+            parse_rule("capsletter 46"),
+            parse_rule("context $d[]$U @6"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("1A"), "⠁⠠⠨⠁");
     }
 
     #[test]

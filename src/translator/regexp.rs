@@ -525,7 +525,7 @@ impl CompiledRegexp {
                         consumed,
                         sp,
                         cp,
-                        bonus,
+                        bonus + 1,
                         input_len,
                         at_start,
                         env,
