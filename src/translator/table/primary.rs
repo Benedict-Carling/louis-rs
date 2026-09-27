@@ -1886,9 +1886,14 @@ impl PrimaryTable {
         let mut backward_state = backward::State::default();
         // a `context` rule liblouis files among its pass rules, due at the current position
         let mut forced: Option<ResolvedTranslation> = None;
+        // whether `forced` matched from before the position its replacement starts at
+        let mut forced_from_before = false;
+        // where the indications for the current position start in `translations`
+        let mut indications_at = 0;
 
         loop {
             if last_indications_pos != Some(char_pos) {
+                indications_at = translations.len();
                 translations.extend(indications.translations_at(char_pos));
                 last_indications_pos = Some(char_pos);
             }
@@ -1944,6 +1949,7 @@ impl PrimaryTable {
                 context_candidates.retain(|t| !is_pass_rule(t));
                 context_delayed.retain(|t| !is_pass_rule(t));
                 if forced.is_none() && !constraints.use_comp6_at(char_pos) {
+                    forced_from_before = pass_rule.as_ref().is_some_and(|t| t.offset() > 0);
                     forced = pass_rule;
                 }
             }
@@ -2106,7 +2112,14 @@ impl PrimaryTable {
                     }
                     None => t.clone(),
                 };
-                translations.push(translation);
+                // liblouis puts out a pass rule matched from an earlier position before it
+                // inserts the indicators of the position its replacement starts at
+                if forced_now.is_some() && forced_from_before && t.length() == 0 {
+                    translations.insert(indications_at, translation);
+                    indications_at += 1;
+                } else {
+                    translations.push(translation);
+                }
                 delayed_translations = self.update_offsets(delayed_translations, t.length());
                 delayed_translations.extend(self.match_candidates_within(consumed, t.length()));
                 // liblouis drops the spaces after a joinword or joinnum
@@ -2921,6 +2934,18 @@ mod tests {
         ]);
         assert_eq!(table.translate("¼-"), "⠌⠄");
         assert_eq!(table.translate("a-"), "⠁⠤");
+    }
+
+    #[test]
+    fn a_pass_rule_matched_earlier_inserts_before_the_indicators() {
+        let table = forward_table(&[
+            "lowercase a 1",
+            "digit 1 1",
+            "litdigit 1 1",
+            "numsign 3456",
+            "noback context $l[]$d @56",
+        ]);
+        assert_eq!(table.translate("a1"), "⠁⠰⠼⠁");
     }
 
     #[test]
