@@ -646,6 +646,16 @@ mod tests {
     }
 
     #[test]
+    fn the_word_at_the_cursor_is_computer_braille() {
+        let yaml = format!(
+            "{AB_TABLE}  space \\s 0\n  always ab 12-1\ntests:\n  - - ab ab\n    - ⠃⠁ ⠁⠃\n    - mode: [compbrlAtCursor]\n      cursorPos: [4, 4]\n      inputPos: [0, 0, 2, 3, 4]\n"
+        );
+        let results = run("compbrl_at_cursor", &yaml).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_success(), "{:?}", results[0]);
+    }
+
+    #[test]
     fn single_cursor_position_is_not_checked() {
         let yaml = format!("{AB_TABLE}tests:\n  - - ab\n    - ⠁⠃\n    - cursorPos: 1\n");
         let results = run("single_cursor", &yaml).unwrap();

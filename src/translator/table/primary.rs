@@ -1711,6 +1711,24 @@ impl PrimaryTable {
             .partition(|t| t.offset() == 0)
     }
 
+    /// The span liblouis's `compbrlAtCursor` mode renders in computer braille: the word around
+    /// `cursor`, or just the cursor's character if that is a space
+    fn word_at(&self, chars: &[char], cursor: usize) -> std::ops::Range<usize> {
+        let is_space = |c: &char| self.space_chars.contains(c);
+        if is_space(&chars[cursor]) {
+            return cursor..cursor + 1;
+        }
+        let start = chars[..cursor]
+            .iter()
+            .rposition(is_space)
+            .map_or(0, |p| p + 1);
+        let end = chars[cursor..]
+            .iter()
+            .position(is_space)
+            .map_or(chars.len(), |p| cursor + p);
+        start..end
+    }
+
     fn context_candidates(
         &self,
         input: &str,
@@ -1770,9 +1788,21 @@ impl PrimaryTable {
             None => options.emphasis().to_vec(),
         };
 
-        let mut indications = self.indicators.precompute(input, &enriched_spans);
-        let constraints = self.constrainers.precompute(input, &enriched_spans);
         let input_chars: Vec<char> = input.chars().collect();
+        let mut indications = self.indicators.precompute(input, &enriched_spans);
+        // the word under the cursor is computer braille, without its indicators
+        let mut constraint_spans = enriched_spans.clone();
+        if self.direction == Direction::Forward
+            && options.mode().contains(TranslationMode::CompbrlAtCursor)
+            && let Some(cursor) = options.cursor_pos()
+            && cursor < input_chars.len()
+        {
+            constraint_spans.push(EmphasisSpan {
+                class: "computer_braille".to_string(),
+                range: self.word_at(&input_chars, cursor),
+            });
+        }
+        let constraints = self.constrainers.precompute(input, &constraint_spans);
         let stands_alone = |t: &ResolvedTranslation, pos: usize| match &self.sequences {
             Some(sequences)
                 if matches!(t.rule(), Some(Rule::Word { .. } | Rule::Contraction { .. })) =>
