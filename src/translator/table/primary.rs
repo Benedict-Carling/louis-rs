@@ -2035,6 +2035,19 @@ impl PrimaryTable {
                 delayed_translations
                     .extend(self.match_candidates_within(consumed, nocross.length()));
             } else if let Some(t) = candidate {
+                // an endnum rule takes back the letter sign inserted before it (liblouis's
+                // CTO_EndNum case in translateString)
+                if self.direction == Direction::Forward
+                    && matches!(t.rule(), Some(Rule::Endnum { .. }))
+                    && let Some(i) = translations
+                        .iter()
+                        .rposition(|t| matches!(t.rule(), Some(Rule::Letsign { .. })))
+                    && translations[i + 1..]
+                        .iter()
+                        .all(|t| t.length() == 0 || t.input().is_empty())
+                {
+                    translations.remove(i);
+                }
                 let consumed = chars.as_str();
                 if t.length() == 0 {
                     // if there is a zero-length translation candiate we run the risk of an infinite
@@ -2942,6 +2955,24 @@ mod tests {
         assert_eq!(table.translate("a"), "⠠");
         assert_eq!(table.translate("1a"), "⠼⠁⠁");
         assert_eq!(table.translate("1 a"), "⠼⠁⠀⠠");
+    }
+
+    #[test]
+    fn endnum_takes_back_the_letter_sign() {
+        let rules = [
+            parse_rule("lowercase s 234"),
+            parse_rule("lowercase t 2345"),
+            parse_rule("lowercase b 12"),
+            parse_rule("digit 1 1"),
+            parse_rule("letsign 56"),
+            parse_rule("endnum st 34"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("1st"), "⠁⠌");
+        assert_eq!(table.translate("1bt"), "⠁⠰⠃⠞");
     }
 
     #[test]
