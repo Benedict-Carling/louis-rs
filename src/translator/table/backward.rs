@@ -70,7 +70,10 @@ pub struct State {
     no_contract: NoContract,
     /// liblouis's `nextUpper`: set by `capsletter`, it capitalizes the next character put
     /// out, however many indicators come between.
-    pub next_upper: bool,
+    next_upper: bool,
+    /// liblouis's `allUpper`: 1 right after a `begcapsword`, 2 once a capital has been
+    /// put out, 0 outside a capitalized word.
+    all_upper: u8,
 }
 
 #[derive(Debug, Default)]
@@ -81,6 +84,7 @@ pub struct BackwardSelector {
     defined_cells: HashSet<char>,
     cells: HashMap<char, CellRules>,
     numeric_mode_chars: HashSet<char>,
+    caps_mode_chars: HashSet<char>,
     /// The uppercase character a table derives from a character with `base uppercase`.
     uppercase: HashMap<char, char>,
 }
@@ -227,6 +231,14 @@ impl BackwardSelector {
             })
             .flatten()
             .collect();
+        let caps_mode_chars = rules
+            .iter()
+            .filter_map(|rule| match &rule.rule {
+                Rule::Capsmodechars { chars } => Some(chars.chars()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
         // the first base rule for a character is the one that counts
         let mut based = HashSet::new();
         let uppercase = rules
@@ -268,6 +280,7 @@ impl BackwardSelector {
             defined_cells,
             cells,
             numeric_mode_chars,
+            caps_mode_chars,
             uppercase,
         }
     }
@@ -290,6 +303,45 @@ impl BackwardSelector {
         {
             state.number = 0;
         }
+        let before = last_char(output);
+        let upper = self.char_is(before, &[CharacterClass::Uppercase]);
+        if state.all_upper == 1 && upper {
+            state.all_upper = 2;
+        } else if state.all_upper == 2 && !upper && !before.is_some_and(|c| self.caps_mode(c)) {
+            state.all_upper = 0;
+        }
+    }
+
+    fn caps_mode(&self, c: char) -> bool {
+        self.caps_mode_chars.contains(&c)
+    }
+
+    /// Capitalize `output` as liblouis's `putchars` does for the caps indicators in
+    /// `state`: the first character after a `capsletter`, and every character of a
+    /// capitalized word up to the first that is neither a letter nor in `capsmodechars`.
+    pub fn put(&self, state: &mut State, output: &str) -> String {
+        let mut chars = output.chars();
+        let mut put = String::new();
+        if state.next_upper
+            && let Some(c) = chars.next()
+        {
+            put.push_str(&self.to_uppercase(c));
+            state.next_upper = false;
+        }
+        for c in chars.by_ref() {
+            if state.all_upper == 0 {
+                put.push(c);
+            } else if state.all_upper == 2
+                && !self.char_is(Some(c), &[CharacterClass::Letter])
+                && !self.caps_mode(c)
+            {
+                state.all_upper = 0;
+                put.push(c);
+            } else {
+                put.push_str(&self.to_uppercase(c));
+            }
+        }
+        put
     }
 
     /// Update `state` after `rule` has been applied.
@@ -341,6 +393,7 @@ impl BackwardSelector {
                 state.no_contract = NoContract::Off;
                 state.number = 0;
                 state.next_upper = false;
+                state.all_upper = 0;
             }
             _ => {}
         }
@@ -358,14 +411,26 @@ impl BackwardSelector {
         match name {
             "capsletter" => {
                 state.next_upper = true;
+                state.all_upper = 0;
                 state.number = 0;
             }
-            "begcapsword" | "endcapsword" | "begcaps" | "endcaps" | "begcomp" => state.number = 0,
+            "begcapsword" => {
+                state.all_upper = 1;
+                state.number = 0;
+            }
+            "endcapsword" => {
+                state.all_upper = 0;
+                state.number = 0;
+            }
+            "begcaps" | "endcaps" | "begcomp" => state.number = 0,
             "letsign" | "nonumsign" | "nocontractsign" => {
                 state.no_contract = NoContract::Active;
                 state.number = 0;
             }
-            "numsign" => state.number = 1,
+            "numsign" => {
+                state.number = 1;
+                state.all_upper = 0;
+            }
             _ => {}
         }
     }
