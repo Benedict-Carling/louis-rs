@@ -31,7 +31,9 @@ pub struct IndicatorBuilder(ClassIndicator);
 
 impl IndicatorBuilder {
     pub fn new() -> Self {
-        IndicatorBuilder(ClassIndicator::new())
+        let mut indicator = ClassIndicator::new();
+        indicator.whitespace_separates_words();
+        IndicatorBuilder(indicator)
     }
 
     pub fn build(mut self, ctx: &TableContext) -> Option<Indicator> {
@@ -267,6 +269,32 @@ mod tests {
         assert_eq!(
             pairs(&indicator.precompute("AB CD EF")),
             vec![(0, "⠠⠠⠠".to_string()), (8, "⠄".to_string())]
+        );
+    }
+
+    #[test]
+    fn begcaps_alone_runs_until_a_lowercase_letter() {
+        // see the begcaps block of liblouis/tests/yaml/capsword.yaml
+        let mut builder = base_builder();
+        builder.begcaps("⠸", &rule("begcaps 456"));
+        builder.endcaps("⠐", &rule("endcaps 5"));
+        let indicator = builder.build(&space_ctx()).unwrap();
+
+        assert_eq!(
+            pairs(&indicator.precompute("AB%AB")),
+            vec![(0, "⠸".to_string()), (5, "⠐".to_string())]
+        );
+        assert_eq!(
+            pairs(&indicator.precompute("AB-ab")),
+            vec![(0, "⠸".to_string()), (3, "⠐".to_string())]
+        );
+        assert_eq!(
+            pairs(&indicator.precompute("AB ab")),
+            vec![(0, "⠸".to_string()), (2, "⠐".to_string())]
+        );
+        assert_eq!(
+            pairs(&indicator.precompute("AB AB")),
+            vec![(0, "⠸".to_string()), (5, "⠐".to_string())]
         );
     }
 }
