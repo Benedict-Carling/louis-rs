@@ -81,11 +81,21 @@ pub struct Indicators(Vec<Indicator>);
 /// Holds per-position braille translations to emit, indexed by
 /// character position (with one extra slot at index `n` for translations that
 /// must appear after all input characters, e.g. `endemph` at end of string).
-pub struct PrecomputedIndications(Vec<Vec<ResolvedTranslation>>);
+pub struct PrecomputedIndications {
+    translations: Vec<Vec<ResolvedTranslation>>,
+    /// Positions with a caps indication. liblouis's `emphasisBuffer` also holds emphasis,
+    /// but our emphasis indicator places some indications where liblouis has none.
+    caps_changes: Vec<bool>,
+}
 
 impl PrecomputedIndications {
     pub fn translations_at(&self, pos: usize) -> Vec<ResolvedTranslation> {
-        self.0.get(pos).cloned().unwrap_or_default()
+        self.translations.get(pos).cloned().unwrap_or_default()
+    }
+
+    /// Whether a caps indication falls strictly inside the `length` characters at `pos`
+    pub fn caps_change_within(&self, pos: usize, length: usize) -> bool {
+        (pos + 1..pos + length).any(|p| self.caps_changes.get(p).copied().unwrap_or(false))
     }
 }
 
@@ -97,6 +107,7 @@ impl Indicators {
     pub fn precompute(&self, input: &str, spans: &[EmphasisSpan]) -> PrecomputedIndications {
         let n = input.chars().count();
         let mut indications: Vec<Vec<ResolvedTranslation>> = vec![vec![]; n + 1];
+        let mut caps_changes = vec![false; n + 1];
 
         for indicator in &self.0 {
             let pairs: Vec<(usize, ResolvedTranslation)> = match indicator {
@@ -108,12 +119,17 @@ impl Indicators {
                 Indicator::LetterSign(i) => i.precompute(input),
                 Indicator::NoContract(i) => i.precompute(input),
             };
+            let is_caps = matches!(indicator, Indicator::Uppercase(_));
             for (pos, t) in pairs {
+                caps_changes[pos] |= is_caps;
                 indications[pos].push(t);
             }
         }
 
-        PrecomputedIndications(indications)
+        PrecomputedIndications {
+            translations: indications,
+            caps_changes,
+        }
     }
 }
 

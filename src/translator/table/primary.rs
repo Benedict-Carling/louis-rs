@@ -1737,6 +1737,11 @@ impl PrimaryTable {
                 candidates.push(digit_translation.clone());
             }
 
+            candidates.retain(|t| {
+                !(t.rule().is_some_and(checks_caps_change)
+                    && indications.caps_change_within(char_pos, t.length()))
+            });
+
             if constraints.dont_contract_at(char_pos) {
                 candidates.retain(|t| !t.rule().is_some_and(is_contraction));
             }
@@ -1896,6 +1901,15 @@ impl PrimaryTable {
             })
             .collect()
     }
+}
+
+/// The opcodes liblouis's `for_selectRule` rejects when an indication falls inside them
+/// (`checkEmphasisChange`)
+fn checks_caps_change(rule: &Rule) -> bool {
+    matches!(
+        rule,
+        Rule::Always { .. } | Rule::Syllable { .. } | Rule::Word { .. } | Rule::Match { .. }
+    )
 }
 
 /// The opcodes liblouis's `for_selectRule` skips while `dontContract` is set
@@ -2457,6 +2471,28 @@ mod tests {
         assert_eq!(table.translate("1oo"), "⠼⠁⠈⠈");
         assert_eq!(table.translate("1-foo"), "⠼⠁⠤⠂⠈");
         assert_eq!(table.translate("1-1"), "⠼⠁⠤⠁");
+    }
+
+    #[test]
+    fn contraction_not_across_caps_indication() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase c 14"),
+            parse_rule("base uppercase A a"),
+            parse_rule("base uppercase B b"),
+            parse_rule("base uppercase C c"),
+            parse_rule("capsletter 46"),
+            parse_rule("begcapsword 6-6"),
+            parse_rule("always bc 2345"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("abc"), "⠁⠞");
+        assert_eq!(table.translate("aBC"), "⠁⠠⠠⠞");
+        assert_eq!(table.translate("abC"), "⠁⠃⠨⠉");
     }
 
     #[test]
