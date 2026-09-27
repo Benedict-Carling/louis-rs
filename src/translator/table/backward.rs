@@ -113,9 +113,9 @@ fn with_classes(rule: &Rule) -> &[WithClass] {
     }
 }
 
-/// How many cells a `context` rule's test starts with literally, as liblouis's
-/// `passFindCharacters` counts them. liblouis only back-translates with a `context` rule
-/// that has some, filed among the other rules for those cells.
+/// How many characters or cells a `context` rule's test starts with literally, as
+/// liblouis's `passFindCharacters` counts them. liblouis files a `context` rule that has
+/// some among the other rules for them.
 fn leading_cells(tests: &[TestInstruction], lookback: &mut usize) -> Option<usize> {
     for test in tests {
         match test {
@@ -160,7 +160,7 @@ fn leading_cells(tests: &[TestInstruction], lookback: &mut usize) -> Option<usiz
     None
 }
 
-fn context_cells(rule: &Rule) -> usize {
+pub fn context_cells(rule: &Rule) -> usize {
     match rule {
         Rule::Context { test, .. } => leading_cells(test.tests(), &mut 0).unwrap_or(0),
         _ => 0,

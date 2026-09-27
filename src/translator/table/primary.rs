@@ -138,6 +138,9 @@ pub struct PrimaryTable {
     sequences: Option<Sequences>,
     /// Backward-only: picks among the rules the trie finds at a position.
     backward: Option<BackwardSelector>,
+    uppercase_chars: HashSet<char>,
+    lowercase_chars: HashSet<char>,
+    letter_chars: HashSet<char>,
 }
 
 /// A builder for [`PrimaryTable`]
@@ -367,6 +370,18 @@ impl PrimaryTableBuilder {
             }),
             sequences: self.sequences,
             backward: self.backward,
+            uppercase_chars: ctx
+                .character_classes()
+                .get(&CharacterClass::Uppercase)
+                .unwrap_or_default(),
+            lowercase_chars: ctx
+                .character_classes()
+                .get(&CharacterClass::Lowercase)
+                .unwrap_or_default(),
+            letter_chars: ctx
+                .character_classes()
+                .get(&CharacterClass::Letter)
+                .unwrap_or_default(),
         }
     }
 }
@@ -1564,10 +1579,47 @@ impl PrimaryTable {
 
         let indications = self.indicators.precompute(input, &enriched_spans);
         let constraints = self.constrainers.precompute(input, &enriched_spans);
-        let input_chars: Vec<char> = if self.sequences.is_some() || self.backward.is_some() {
-            input.chars().collect()
-        } else {
-            Vec::new()
+        let input_chars: Vec<char> = input.chars().collect();
+        let caps_at: Vec<bool> = (0..=input_chars.len())
+            .map(|pos| {
+                indications
+                    .translations_at(pos)
+                    .iter()
+                    .any(|t| t.rule().is_some_and(is_caps_indicator))
+            })
+            .collect();
+        // liblouis's `validMatch` and `checkEmphasisChange`: in forward translation a rule
+        // of several characters may not span a change of case after its second character,
+        // and some opcodes may not span a caps indicator either
+        let spans_change = |t: &ResolvedTranslation, pos: usize| {
+            let len = match t.rule() {
+                Some(rule @ Rule::Context { .. }) => backward::context_cells(rule),
+                _ => t.length(),
+            };
+            if self.direction == Direction::Backward || len < 2 || pos + len > input_chars.len() {
+                return false;
+            }
+            let case = |c: &char| {
+                (
+                    self.uppercase_chars.contains(c),
+                    self.lowercase_chars.contains(c),
+                )
+            };
+            let span = &input_chars[pos..pos + len];
+            let case_change = span.windows(2).skip(1).any(|pair| {
+                let (a, b) = (case(&pair[0]), case(&pair[1]));
+                b != (false, false) && self.letter_chars.contains(&pair[0]) && a != b
+            });
+            case_change
+                || (matches!(
+                    t.rule(),
+                    Some(
+                        Rule::Always { .. }
+                            | Rule::Syllable { .. }
+                            | Rule::Word { .. }
+                            | Rule::Match { .. }
+                    )
+                ) && (pos + 1..pos + len).any(|i| caps_at[i]))
         };
         let stands_alone = |t: &ResolvedTranslation, pos: usize| match &self.sequences {
             Some(sequences)
@@ -1594,7 +1646,7 @@ impl PrimaryTable {
             let nocross_candidate = self
                 .nocross_candidates(chars.as_str(), prev, char_pos, &constraints)
                 .into_iter()
-                .filter(|t| stands_alone(t, char_pos))
+                .filter(|t| stands_alone(t, char_pos) && !spans_change(t, char_pos))
                 .max_by_key(|t| t.rank());
 
             // given an input query the trie for matching translations. Then split off the
@@ -1629,6 +1681,7 @@ impl PrimaryTable {
             // definition (`character_translations`), matching liblouis.
             candidates.retain(|t| match t.rule() {
                 _ if self.backward.is_some() => true,
+                _ if spans_change(t, char_pos) => false,
                 Some(Rule::Prepunc { .. }) => constraints.prepunc_ok_at(char_pos),
                 Some(Rule::Postpunc { .. }) => constraints.postpunc_ok_at(char_pos),
                 _ => stands_alone(t, char_pos),
@@ -1804,6 +1857,19 @@ impl PrimaryTable {
             })
             .collect()
     }
+}
+
+fn is_caps_indicator(rule: &Rule) -> bool {
+    matches!(
+        rule,
+        Rule::Capsletter { .. }
+            | Rule::Begcapsword { .. }
+            | Rule::Endcapsword { .. }
+            | Rule::Begcaps { .. }
+            | Rule::Endcaps { .. }
+            | Rule::Begcapsphrase { .. }
+            | Rule::Endcapsphrase { .. }
+    )
 }
 
 /// Map a char to dots according to the North American Braille Computer Code (NABCC)
@@ -2362,6 +2428,33 @@ mod tests {
         assert_eq!(table.translate("cd"), "⠠⠉⠙");
         assert_eq!(table.translate("abcd"), "⠁⠃⠉⠙");
         assert_eq!(table.translate("ef"), "⠑⠋");
+    }
+
+    #[test]
+    fn rule_does_not_span_a_change_of_case() {
+        let rules = [
+            parse_rule("lowercase c 14"),
+            parse_rule("lowercase d 145"),
+            parse_rule("lowercase m 134"),
+            parse_rule("lowercase u 136"),
+            parse_rule("base uppercase C c"),
+            parse_rule("base uppercase D d"),
+            parse_rule("base uppercase M m"),
+            parse_rule("base uppercase U u"),
+            parse_rule("capsletter 6"),
+            parse_rule("always cc 25"),
+            parse_rule("always duc 1256"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("mcc"), "⠍⠒");
+        // the second c gets a capital sign within the span of `always cc`
+        assert_eq!(table.translate("mcC"), "⠍⠉⠠⠉");
+        // the case may change after the first character, but not later
+        assert_eq!(table.translate("Duc"), "⠠⠳");
+        assert_eq!(table.translate("duC"), "⠙⠥⠠⠉");
     }
 
     #[test]
