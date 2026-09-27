@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use crate::parser::multipass::test::Operator;
+use crate::parser::multipass::test::{Operator, split_trailing_lookback};
 use crate::parser::{Action, ActionInstruction, HasPrecedence, Quantifier, Test, TestInstruction};
 
 use crate::parser::{AnchoredRule, Attribute, CharacterClass, CharacterClasses};
@@ -152,48 +152,6 @@ impl Regexp {
         }
         Regexp::CharacterClass(characters).quantified(quantifier)
     }
-}
-
-/// The number of characters `test` always advances over, if fixed
-fn fixed_width(test: &TestInstruction) -> Option<usize> {
-    let repeat = |quantifier: &Option<Quantifier>| match quantifier {
-        None => Some(1),
-        Some(Quantifier::Number(n)) => Some(*n as usize),
-        _ => None,
-    };
-    match test {
-        TestInstruction::String { s } => Some(s.chars().count()),
-        TestInstruction::Dots { dots } => Some(dots.len()),
-        TestInstruction::Attributes { quantifier, .. }
-        | TestInstruction::Class { quantifier, .. } => repeat(quantifier),
-        TestInstruction::Negate { test } => fixed_width(test),
-        TestInstruction::Variable { .. }
-        | TestInstruction::AtBeginning
-        | TestInstruction::AtEnd => Some(0),
-        TestInstruction::Lookback { .. } | TestInstruction::Replace { .. } => None,
-    }
-}
-
-/// Split `tests` ending in `_N` into the tests before the last N characters and the tests
-/// that check those characters
-fn split_trailing_lookback(tests: &[TestInstruction]) -> (&[TestInstruction], &[TestInstruction]) {
-    let Some((TestInstruction::Lookback { len }, rest)) = tests.split_last() else {
-        return (tests, &[]);
-    };
-    let mut width = 0;
-    for start in (0..rest.len()).rev() {
-        match fixed_width(&rest[start]) {
-            Some(w) => width += w,
-            None => break,
-        }
-        if width == *len as usize {
-            return (&rest[..start], &rest[start..]);
-        }
-        if width > *len as usize {
-            break;
-        }
-    }
-    (tests, &[])
 }
 
 impl TranslationTarget {

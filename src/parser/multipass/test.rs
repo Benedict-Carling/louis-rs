@@ -26,15 +26,65 @@ impl Test {
             .any(|t| matches!(t, TestInstruction::Replace { .. }))
     }
 
+    /// Without `[` and `]` liblouis replaces all the test matched, up to where it ends
     pub fn add_implicit_replace(self) -> Self {
-        if !self.has_replace() {
-            Self {
-                tests: vec![TestInstruction::Replace { tests: self.tests }],
-            }
-        } else {
-            self
+        if self.has_replace() {
+            return self;
+        }
+        let (replaced, checked) = split_trailing_lookback(&self.tests);
+        let mut tests = vec![TestInstruction::Replace {
+            tests: replaced.to_vec(),
+        }];
+        if !checked.is_empty() {
+            tests.extend_from_slice(checked);
+            tests.extend(self.tests.last().cloned());
+        }
+        Self { tests }
+    }
+}
+
+/// The number of characters `test` always advances over, if fixed
+fn fixed_width(test: &TestInstruction) -> Option<usize> {
+    let repeat = |quantifier: &Option<Quantifier>| match quantifier {
+        None => Some(1),
+        Some(Quantifier::Number(n)) => Some(*n as usize),
+        _ => None,
+    };
+    match test {
+        TestInstruction::String { s } => Some(s.chars().count()),
+        TestInstruction::Dots { dots } => Some(dots.len()),
+        TestInstruction::Attributes { quantifier, .. }
+        | TestInstruction::Class { quantifier, .. } => repeat(quantifier),
+        TestInstruction::Negate { test } => fixed_width(test),
+        TestInstruction::Variable { .. }
+        | TestInstruction::AtBeginning
+        | TestInstruction::AtEnd => Some(0),
+        TestInstruction::Lookback { .. } | TestInstruction::Replace { .. } => None,
+    }
+}
+
+/// Split `tests` ending in `_N` into the tests before the last N characters and the tests
+/// that check those characters
+pub fn split_trailing_lookback(
+    tests: &[TestInstruction],
+) -> (&[TestInstruction], &[TestInstruction]) {
+    let Some((TestInstruction::Lookback { len }, rest)) = tests.split_last() else {
+        return (tests, &[]);
+    };
+    let mut width = 0;
+    for start in (0..rest.len()).rev() {
+        match fixed_width(&rest[start]) {
+            Some(w) => width += w,
+            None => break,
+        }
+        if width == *len as usize {
+            return (&rest[..start], &rest[start..]);
+        }
+        if width > *len as usize {
+            break;
         }
     }
+    (tests, &[])
 }
 
 impl IsLiteral for Test {
@@ -602,6 +652,23 @@ mod tests {
 
     use super::braille::BrailleDot;
     use super::*;
+
+    #[test]
+    fn implicit_replace_ends_before_trailing_lookback() {
+        let test = |test: &str| Parser::new(test).tests().unwrap();
+        assert_eq!(
+            test(r#""ab"!"c"_"#).add_implicit_replace(),
+            Test::new(vec![
+                TestInstruction::Replace {
+                    tests: vec![TestInstruction::String { s: "ab".into() }]
+                },
+                TestInstruction::Negate {
+                    test: Box::new(TestInstruction::String { s: "c".into() })
+                },
+                TestInstruction::Lookback { len: 1 },
+            ])
+        );
+    }
 
     #[test]
     fn ascii_number() {
