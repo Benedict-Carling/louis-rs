@@ -68,6 +68,8 @@ pub enum Transition {
     /// after the match ends the word (liblouis's backward `isEndWord`). Evaluated against the
     /// word ends passed to [`Trie::find_translations_with_word_ends`].
     EndWord(bool),
+    /// The wrapped check, without the weight a check normally adds to a rule.
+    Unweighted(Box<Transition>),
 }
 
 /// The resolved, trie-internal counterpart of [`Transition`] plus the character transitions
@@ -173,6 +175,7 @@ impl Trie {
 
     fn resolve_transition(&self, transition: Transition) -> ResolvedTransition {
         match transition {
+            Transition::Unweighted(transition) => self.resolve_transition(*transition),
             Transition::Start(classes) => {
                 ResolvedTransition::Start(ResolvedClasses::resolve(self.before_ctx(), &classes))
             }
@@ -235,6 +238,11 @@ impl Trie {
             "Cannot insert empty `from` string (or `to` string in case of backward translation) - this causes infinite loops when translating"
         );
 
+        let weighs = |t: &Option<Transition>| {
+            t.as_ref()
+                .is_some_and(|t| !matches!(t, Transition::Unweighted(_)))
+        };
+        let (before_weighs, after_weighs) = (weighs(&before), weighs(&after));
         let before = before.map(|t| self.resolve_transition(t));
         let after = after.map(|t| self.resolve_transition(t));
 
@@ -255,7 +263,9 @@ impl Trie {
         }
 
         if let Some(t) = before {
-            length += 1;
+            if before_weighs {
+                length += 1;
+            }
             current_node = current_node.transitions.entry(t).or_default();
         }
 
@@ -267,7 +277,9 @@ impl Trie {
         }
 
         if let Some(t) = after {
-            length += 1;
+            if after_weighs {
+                length += 1;
+            }
             current_node = current_node.transitions.entry(t).or_default();
         }
 

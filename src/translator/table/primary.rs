@@ -7,7 +7,7 @@ use crate::{
     emphasis::EmphasisSpan,
     parser::{
         AnchoredRule, Braille, BrailleChars, CharacterClass, CharacterClasses, HasNocross,
-        HasPrecedence, WithClass,
+        HasPrecedence, Precedence, WithClass,
     },
     translator::{
         CharacterDefinition, ClassConstraint, ResolvedTranslation, Rule, TranslationError,
@@ -417,8 +417,8 @@ impl PrimaryTableBuilder {
                         .then(|| self.hyphenation_constrainer.build())
                         .flatten()
                         .map(Constrainer::Hyphenation),
-                    // liblouis's `CTO_PrePunc`/`CTO_PostPunc` are forward-translation-only
-                    // opcodes (never consulted by `lou_backTranslateString.c`).
+                    // Backward, liblouis checks `prepunc`/`postpunc` with `isBegWord`/
+                    // `isEndWord` instead of this scan.
                     (direction == Direction::Forward)
                         .then(|| self.punctuation_constrainer.build())
                         .flatten()
@@ -439,6 +439,34 @@ impl PrimaryTableBuilder {
 }
 
 impl PrimaryTable {
+    /// Breaks a tie in rank in backward translation the way liblouis orders the rules of a
+    /// cell: a translation rule before any other, and on a single cell every other rule
+    /// before a character definition.
+    fn backward_order(&self, translation: &ResolvedTranslation) -> (Precedence, bool) {
+        if self.direction == Direction::Forward {
+            return (Precedence::Default, false);
+        }
+        let precedence = translation
+            .rule()
+            .map(|rule| rule.precedence())
+            .unwrap_or_default();
+        let definition = matches!(
+            translation.rule(),
+            Some(
+                Rule::Space { .. }
+                    | Rule::Digit { .. }
+                    | Rule::Punctuation { .. }
+                    | Rule::Math { .. }
+                    | Rule::Sign { .. }
+                    | Rule::Letter { .. }
+                    | Rule::Uppercase { .. }
+                    | Rule::Lowercase { .. }
+                    | Rule::Grouping { .. }
+            )
+        );
+        (precedence, !(definition && translation.length() == 1))
+    }
+
     /// Classifies cells the way liblouis's backward `isEndWord` does: by the attributes of
     /// the single-cell character definitions and by the backward rules translating just that
     /// cell.
@@ -1496,13 +1524,17 @@ impl PrimaryTable {
                             .get(&CharacterClass::Punctuation)
                             .is_some_and(|class| class.contains(&c))
                     }) {
-                        // See the comment in the `Rule::Prepunc` arm above.
+                        // See the comment in the `Rule::Prepunc` arm above. Backward,
+                        // liblouis checks `isEndWord`, which does not make it more
+                        // specific than a same-cell rule.
                         builder.punctuation_constrainer.mark_present();
                         builder.get_trie_mut(rule).insert(
                             chars,
                             &dots.to_string(),
                             None,
-                            None,
+                            backward.then(|| {
+                                Transition::Unweighted(Box::new(Transition::EndWord(true)))
+                            }),
                             direction,
                             rule.precedence(),
                             vec![],
@@ -1849,7 +1881,9 @@ impl PrimaryTable {
             // definition (`character_translations`), matching liblouis.
             candidates.retain(|t| match t.rule() {
                 Some(Rule::Prepunc { .. }) => constraints.prepunc_ok_at(char_pos),
-                Some(Rule::Postpunc { .. }) => constraints.postpunc_ok_at(char_pos),
+                Some(Rule::Postpunc { .. }) => {
+                    self.direction == Direction::Backward || constraints.postpunc_ok_at(char_pos)
+                }
                 _ => stands_alone(t, char_pos),
             });
 
@@ -1926,7 +1960,7 @@ impl PrimaryTable {
                 // drop translation candidates that we have applied already at this position in the
                 // input
                 .filter(|t| !seen.contains(&TranslationSubset::from(*t)))
-                .max_by_key(|translation| translation.rank());
+                .max_by_key(|translation| (translation.rank(), self.backward_order(translation)));
             // A nocross rule wins if there is no plain candidate to beat (many, e.g.
             // liblouis' `nocross always en`, have no plain counterpart at all).
             if let Some(nocross) = &nocross_candidate
@@ -2986,6 +3020,31 @@ mod tests {
         ]);
         assert_eq!(table.translate("⠼⠁⠤⠤⠓"), "1–h");
         assert_eq!(table.translate("⠼⠁⠤⠤⠁"), "1—1");
+    }
+
+    #[test]
+    fn backward_postpunc_at_the_end_of_a_word() {
+        let table = backward_table(&[
+            parse_rule("lowercase a 1"),
+            parse_rule("digit 8 236"),
+            parse_rule("punctuation ? 1456"),
+            parse_rule("postpunc ? 236"),
+            parse_rule("space \\s 0"),
+        ]);
+        assert_eq!(table.translate("⠁⠦"), "a?");
+        assert_eq!(table.translate("⠁⠦⠀⠁"), "a? a");
+        assert_eq!(table.translate("⠁⠦⠁"), "a8a");
+    }
+
+    #[test]
+    fn backward_always_beats_postpunc_on_the_same_cell() {
+        let table = backward_table(&[
+            parse_rule("letter \\x0A1D 356"),
+            parse_rule("always \\x0A1D 356"),
+            parse_rule("punctuation \" 236"),
+            parse_rule("postpunc \" 356"),
+        ]);
+        assert_eq!(table.translate("⠴"), "\u{0A1D}");
     }
 
     #[test]
