@@ -34,6 +34,14 @@ pub enum CharacterClass {
     UserDefined(String),
 }
 
+impl CharacterClass {
+    /// The `n`th class a table defines, which multipass tests call `w`, `x`, `y` or `z`.
+    pub fn by_order(n: u8) -> Self {
+        // a class name read from a table cannot contain a NUL
+        CharacterClass::UserDefined(format!("\0{n}"))
+    }
+}
+
 impl From<&str> for CharacterClass {
     fn from(value: &str) -> Self {
         match value {

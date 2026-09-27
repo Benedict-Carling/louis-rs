@@ -2851,6 +2851,20 @@ mod tests {
     }
 
     #[test]
+    fn a_test_names_the_classes_a_table_defines_by_their_order() {
+        let table = forward_table(&[
+            "punctuation - 36",
+            "lowercase a 1",
+            "sign \\x00bc 34",
+            "attribute first a",
+            "attribute second \\x00bc",
+            "context $x[\"-\"] @3",
+        ]);
+        assert_eq!(table.translate("¼-"), "⠌⠄");
+        assert_eq!(table.translate("a-"), "⠁⠤");
+    }
+
+    #[test]
     fn nocont_leaves_its_word_uncontracted() {
         let table = forward_table(&[
             "space \\s 0",

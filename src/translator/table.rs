@@ -88,6 +88,8 @@ impl TableContext {
         let mut dots_classes = CharacterClasses::default();
         let mut swap_classes = SwapClasses::default();
         let mut seq_after_patterns = Vec::new();
+        // liblouis names the first four classes a table defines w, x, y and z
+        let mut user_classes: Vec<CharacterClass> = Vec::new();
 
         // First pass: everything that later rules need to *look up*. These include
         // character definitions (`space`, `letter`, `digit`, …), because `Rule::Base` and
@@ -216,8 +218,15 @@ impl TableContext {
                         }
                     }
                 }
-                Rule::Attribute { name, chars } => {
+                Rule::Attribute { name, chars } | Rule::Class { name, chars } => {
                     let class = CharacterClass::from(name.as_str());
+                    let numbered = name.len() == 1 && name.chars().all(|c| c.is_ascii_digit());
+                    if matches!(class, CharacterClass::UserDefined(_))
+                        && !numbered
+                        && !user_classes.contains(&class)
+                    {
+                        user_classes.push(class.clone());
+                    }
                     for c in chars.chars() {
                         character_classes.insert(class.clone(), c);
                         dots_classes.insert_associated_dot(
@@ -311,6 +320,15 @@ impl TableContext {
                     swap_classes.insert(name, &mapping);
                 }
                 _ => (),
+            }
+        }
+        for (order, class) in (1..=4).zip(user_classes) {
+            let by_order = CharacterClass::by_order(order);
+            for c in character_classes.get(&class).unwrap_or_default() {
+                character_classes.insert(by_order.clone(), c);
+            }
+            for c in dots_classes.get(&class).unwrap_or_default() {
+                dots_classes.insert(by_order.clone(), c);
             }
         }
         Ok(TableContext {
