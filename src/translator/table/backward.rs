@@ -151,6 +151,9 @@ fn leading_cells(tests: &[TestInstruction], lookback: &mut usize) -> Option<usiz
                     return Some(count);
                 }
             }
+            TestInstruction::GroupStart { .. } | TestInstruction::GroupEnd { .. } => {
+                return Some(0);
+            }
             TestInstruction::Variable { .. }
             | TestInstruction::Negate { .. }
             | TestInstruction::AtBeginning

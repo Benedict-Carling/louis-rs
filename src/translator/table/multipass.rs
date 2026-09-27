@@ -1,41 +1,15 @@
-use crate::parser::multipass::ConsumesInput;
 use crate::translator::ResolvedTranslation;
-use crate::translator::context_pattern::{ContextPatterns, ContextPatternsBuilder};
-use crate::translator::effect::Environment;
+use crate::translator::pass::PassRules;
 use crate::translator::table::TableContext;
 use crate::{
     Direction,
-    parser::{AnchoredRule, Rule},
+    parser::AnchoredRule,
     translator::{TranslationError, TranslationStage},
 };
 
 #[derive(Debug)]
 pub struct MultipassTable {
-    patterns: ContextPatterns,
-    stage: TranslationStage,
-    direction: Direction,
-}
-
-/// A builder for [`MultipassTable`]
-#[derive(Debug)]
-struct MultipassTableBuilder {
-    patterns: ContextPatternsBuilder,
-}
-
-impl MultipassTableBuilder {
-    fn new() -> Self {
-        Self {
-            patterns: ContextPatternsBuilder::new(),
-        }
-    }
-
-    fn build(self, direction: Direction, stage: TranslationStage) -> MultipassTable {
-        MultipassTable {
-            direction,
-            stage,
-            patterns: self.patterns.build(),
-        }
-    }
+    rules: PassRules,
 }
 
 impl MultipassTable {
@@ -45,132 +19,17 @@ impl MultipassTable {
         stage: TranslationStage,
         ctx: &TableContext,
     ) -> Result<Self, TranslationError> {
-        let mut builder = MultipassTableBuilder::new();
-
-        for rule in rules {
-            match &rule.rule {
-                Rule::Correct { test, action, .. }
-                | Rule::Pass2 { test, action, .. }
-                | Rule::Pass3 { test, action, .. }
-                | Rule::Pass4 { test, action, .. } => {
-                    if direction == Direction::Backward && !action.consumes_input() {
-                        // Correct rules can map to an empty string, i.e. to drop some
-                        // characters. Such rules cannot be used for backtranslation (you cannot
-                        // translate the empty string to something)
-                        continue;
-                    }
-                    builder.patterns.insert(test, action, rule, stage, ctx)?;
-                }
-                _ => (),
-            }
-        }
-
-        Ok(builder.build(direction, stage))
+        Ok(Self {
+            rules: PassRules::compile(rules, direction, stage, ctx)?,
+        })
     }
 
     pub fn translate(&self, input: &str) -> String {
         self.trace(input).iter().map(|t| t.output()).collect()
     }
 
-    fn translation_candidates(
-        &self,
-        input: &str,
-        _prev: Option<char>,
-        env: &Environment,
-        at_start: bool,
-    ) -> (Vec<ResolvedTranslation>, Vec<ResolvedTranslation>) {
-        self.patterns
-            .find(input, env, at_start)
-            .into_iter()
-            .partition(|t| t.offset() == 0)
-    }
-
-    fn update_offsets(
-        &self,
-        translations: Vec<ResolvedTranslation>,
-        decrement: usize,
-    ) -> Vec<ResolvedTranslation> {
-        translations
-            .into_iter()
-            // drop translations where the offet is smaller than the decrement
-            .filter(|t| t.offset() >= decrement)
-            .map(|t| t.decrement_offset(decrement))
-            .collect()
-    }
-
-    fn partition_delayed_translations(
-        &self,
-        delayed: Vec<ResolvedTranslation>,
-    ) -> (Vec<ResolvedTranslation>, Vec<ResolvedTranslation>) {
-        delayed.into_iter().partition(|t| t.offset() == 0)
-    }
-
     pub fn trace(&self, input: &str) -> Vec<ResolvedTranslation> {
-        let mut translations: Vec<ResolvedTranslation> = Vec::new();
-        let mut delayed_translations: Vec<ResolvedTranslation> = Vec::new();
-        let mut env = Environment::new();
-        let mut chars = input.chars();
-        let mut prev: Option<char> = None;
-        // liblouis copies the next character unchanged after a rule that did not advance
-        let mut advanced = true;
-
-        loop {
-            // given an input query the patterns for matching translations. Then split off the
-            // translations that are delayed, i.e. have an offset because they have a pre-pattern
-            let at_start = chars.as_str().len() == input.len();
-            let (mut candidates, delayed) =
-                self.translation_candidates(chars.as_str(), prev, &env, at_start);
-            delayed_translations.extend(delayed);
-
-            // move delayed_translations with zero offset into candidates
-            let (current, delayed) = self.partition_delayed_translations(delayed_translations);
-            delayed_translations = delayed;
-            candidates.extend(current);
-
-            // use the longest translation
-            let candidate = candidates
-                .iter()
-                .filter(|_| advanced)
-                .cloned()
-                .max_by_key(|translation| translation.rank());
-            advanced = true;
-            if let Some(t) = candidate {
-                if t.length() == 0 {
-                    advanced = false;
-                } else {
-                    // move the iterator forward by the number of characters in the translation
-                    chars.nth(t.length() - 1);
-                    prev = t.input().chars().last();
-                }
-                // there is a matching translation rule
-                let translation = t.clone();
-                translations.push(translation);
-                delayed_translations = self.update_offsets(delayed_translations, t.length());
-
-                // update the environment if needed
-                if !t.effects().is_empty() {
-                    for effect in t.effects() {
-                        env.apply(effect);
-                    }
-                }
-            } else if let Some(next_char) = chars.next() {
-                prev = Some(next_char);
-                // no translation rule found, just pass the character through
-                let translation = ResolvedTranslation::new(
-                    &next_char.to_string(),
-                    &next_char.to_string(),
-                    1,
-                    self.stage,
-                    None,
-                );
-                translations.push(translation);
-                delayed_translations = self.update_offsets(delayed_translations, 1);
-            } else {
-                // the chars iterator is exhausted
-                break;
-            }
-        }
-        translations
+        self.rules.trace(input)
     }
 }
 
@@ -283,5 +142,63 @@ mod tests {
                 .unwrap();
         assert_eq!(transform.translate("⠁⠁⠇⠁⠁⠸⠁⠁"), "⠁⠁⠇⠠⠠⠸⠁⠁");
         assert_eq!(transform.translate("🐂"), "🐂");
+    }
+
+    fn corrections(rules: &[&str]) -> MultipassTable {
+        let rules: Vec<_> = rules.iter().map(|r| parse_rule(r)).collect();
+        let ctx = TableContext::compile(&rules).unwrap();
+        MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Pre, &ctx).unwrap()
+    }
+
+    #[test]
+    fn a_test_is_greedy_and_does_not_backtrack() {
+        let table = corrections(&["lowercase a 1", "correct $l.\"a\" \"x\""]);
+        // `$l.` takes every letter, so nothing is left for the "a"
+        assert_eq!(table.translate("aaa"), "aaa");
+    }
+
+    #[test]
+    fn a_negated_attribute_takes_a_character_without_it() {
+        let table = corrections(&["lowercase a 1", "sign ; 46", "correct !$l[\"a\"] \"x\""]);
+        assert_eq!(table.translate(";a"), ";x");
+        assert_eq!(table.translate("aa"), "aa");
+    }
+
+    #[test]
+    fn rules_with_more_leading_characters_are_tried_first() {
+        let table = corrections(&[
+            "lowercase a 1",
+            "correct $l.\"b\" \"y\"",
+            "correct \"ab\" \"x\"",
+        ]);
+        assert_eq!(table.translate("ab"), "x");
+    }
+
+    #[test]
+    fn a_lookback_checks_what_came_before() {
+        let table = corrections(&["lowercase a 1", "correct _\"a\"[\"b\"] \"x\""]);
+        assert_eq!(table.translate("abb"), "axb");
+    }
+
+    #[test]
+    fn a_copy_replaces_the_whole_match() {
+        let table = corrections(&["lowercase a 1", "correct \"<\"[$l.]\">\" \"(\"*\")\""]);
+        assert_eq!(table.translate("<aa>"), "(aa)");
+    }
+
+    #[test]
+    fn variables_count_up_and_down() {
+        let table = corrections(&[
+            "correct \"+\" #1+?",
+            "correct \"-\" #1-?",
+            "correct #1=2\"a\" \"x\"",
+        ]);
+        assert_eq!(table.translate("++a-a"), "xa");
+    }
+
+    #[test]
+    fn grouping_characters_in_tests_and_actions() {
+        let table = corrections(&["grouping p () 1,2", "correct {p}p }p{p"]);
+        assert_eq!(table.translate("()"), ")(");
     }
 }

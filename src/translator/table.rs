@@ -3,6 +3,8 @@ pub mod display;
 pub mod multipass;
 pub mod primary;
 
+use std::collections::HashMap;
+
 use crate::{
     parser::{AnchoredRule, CharacterClass, CharacterClasses, Rule},
     translator::{CharacterDefinition, TranslationError, swap::SwapClasses},
@@ -19,7 +21,30 @@ pub struct TableContext {
     direction_dots_classes: Option<CharacterClasses>,
     swap_classes: SwapClasses,
     seq_after_patterns: Vec<String>,
+    groupings: HashMap<String, Grouping>,
+    /// Names of the classes a table defines, in the order liblouis allocates their attributes
+    user_classes: Vec<String>,
 }
+
+/// The pair of characters and the pair of cells a `grouping` rule names
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Grouping {
+    pub chars: (char, char),
+    pub dots: (char, char),
+}
+
+/// Names liblouis gives attributes of its own rather than allocating one per table
+const PREDEFINED_CLASSES: [&str; 9] = [
+    "space",
+    "letter",
+    "digit",
+    "punctuation",
+    "uppercase",
+    "lowercase",
+    "math",
+    "sign",
+    "litdigit",
+];
 
 impl TableContext {
     // used for testing
@@ -36,7 +61,20 @@ impl TableContext {
             seq_after_patterns: Vec::new(),
             direction_character_classes: None,
             direction_dots_classes: None,
+            groupings: HashMap::new(),
+            user_classes: Vec::new(),
         }
+    }
+
+    pub fn grouping(&self, name: &str) -> Option<Grouping> {
+        self.groupings.get(name).copied()
+    }
+
+    /// The `n`th (from 1) class the table defines, which multipass tests name `w`, `x`, `y`
+    /// and `z`
+    pub fn user_class(&self, n: u8) -> Option<CharacterClass> {
+        let name = self.user_classes.get(usize::from(n).checked_sub(1)?)?;
+        Some(CharacterClass::from(name.as_str()))
     }
 
     pub fn character_definitions(&self) -> &CharacterDefinition {
@@ -88,6 +126,8 @@ impl TableContext {
         let mut dots_classes = CharacterClasses::default();
         let mut swap_classes = SwapClasses::default();
         let mut seq_after_patterns = Vec::new();
+        let mut groupings = HashMap::new();
+        let mut user_classes: Vec<String> = Vec::new();
 
         // First pass: everything that later rules need to *look up*. These include
         // character definitions (`space`, `letter`, `digit`, …), because `Rule::Base` and
@@ -183,7 +223,31 @@ impl TableContext {
         }
         // go through the rules again with all the character_definitions sorted out
         for rule in rules {
+            if let Some(name) = defined_class(&rule.rule)
+                && !PREDEFINED_CLASSES.contains(&name)
+                && !matches!(name.as_bytes(), [b'0'..=b'7'])
+                && !user_classes.iter().any(|n| n == name)
+            {
+                user_classes.push(name.to_string());
+            }
             match &rule.rule {
+                Rule::Grouping {
+                    name,
+                    chars,
+                    left,
+                    right,
+                } => {
+                    let mut chars = chars.chars();
+                    if let (Some(open), Some(close)) = (chars.next(), chars.next()) {
+                        groupings.insert(
+                            name.clone(),
+                            Grouping {
+                                chars: (open, close),
+                                dots: (left.to_unicode(), right.to_unicode()),
+                            },
+                        );
+                    }
+                }
                 Rule::Base {
                     derived,
                     base,
@@ -321,7 +385,27 @@ impl TableContext {
             seq_after_patterns,
             direction_character_classes: None,
             direction_dots_classes: None,
+            groupings,
+            user_classes,
         })
+    }
+}
+
+/// The class a rule names, which liblouis allocates an attribute for on first mention
+fn defined_class(rule: &Rule) -> Option<&str> {
+    match rule {
+        Rule::Attribute { name, .. }
+        | Rule::Class { name, .. }
+        | Rule::Base { name, .. }
+        | Rule::Modeletter { name, .. }
+        | Rule::Begmodeword { name, .. }
+        | Rule::Endmodeword { name, .. }
+        | Rule::Begmode { name, .. }
+        | Rule::Endmode { name, .. }
+        | Rule::Begmodephrase { name, .. }
+        | Rule::Endmodephrase { name, .. }
+        | Rule::Lenmodephrase { name, .. } => Some(name),
+        _ => None,
     }
 }
 

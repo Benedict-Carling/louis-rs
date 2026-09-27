@@ -1,6 +1,6 @@
 use crate::{
     Direction,
-    parser::{AnchoredRule, HasDirection, Rule},
+    parser::{AnchoredRule, BrailleChars, Constraints, HasDirection, Rule},
     translator::{
         PositionMap, ResolvedTranslation, TranslationError, TranslationOptions, TranslationStage,
         table::{
@@ -46,6 +46,33 @@ impl Transformation {
     }
 }
 
+/// liblouis defines the two characters of a `grouping` rule as `math` characters translating
+/// to its two cells.
+fn with_grouping_characters(rules: &[AnchoredRule]) -> Vec<AnchoredRule> {
+    let mut expanded = Vec::with_capacity(rules.len());
+    for rule in rules {
+        expanded.push(rule.clone());
+        if let Rule::Grouping {
+            chars, left, right, ..
+        } = &rule.rule
+        {
+            for (character, dots) in chars.chars().zip([left, right]) {
+                let math = Rule::Math {
+                    character,
+                    dots: BrailleChars::from(vec![dots.clone()]),
+                    constraints: Constraints::empty(),
+                };
+                expanded.push(AnchoredRule::new(
+                    math,
+                    rule.path().map(Into::into),
+                    rule.line(),
+                ));
+            }
+        }
+    }
+    expanded
+}
+
 #[derive(Debug)]
 pub struct TranslationPipeline {
     steps: Vec<Transformation>,
@@ -57,6 +84,7 @@ impl TranslationPipeline {
         all_rules: &[AnchoredRule],
         direction: Direction,
     ) -> Result<Self, TranslationError> {
+        let all_rules = &with_grouping_characters(all_rules);
         let ctx = TableContext::compile(all_rules)?;
         let mut steps = Vec::new();
 

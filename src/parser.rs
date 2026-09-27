@@ -76,7 +76,7 @@ impl Constraints {
         Constraints(self.0.difference(other.0))
     }
 
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Constraints(EnumSet::empty())
     }
 

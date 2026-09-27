@@ -20,6 +20,7 @@ mod effect;
 mod indication;
 mod match_pattern;
 mod options;
+mod pass;
 mod pipeline;
 mod position_constraints;
 mod positions;
@@ -38,6 +39,8 @@ pub enum TranslationError {
     BaseCharacterNotDefined { base: char, derived: char },
     #[error("Swap class {0} not defined")]
     SwapClassNotDefined(String),
+    #[error("Grouping {0} not defined")]
+    GroupingNotDefined(String),
 }
 
 #[derive(Debug, Default, Clone)]
