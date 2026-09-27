@@ -106,6 +106,12 @@ impl Indicator {
         for (pos, &c) in chars.iter().enumerate() {
             let is_numeric = self.numeric_chars.contains(&c);
             match (is_numeric, in_numeric) {
+                (false, false) if self.starts_numeric_mode(&chars[pos..]) => {
+                    in_numeric = true;
+                    if let Some(t) = &self.start_translation {
+                        translations.push((pos, t.clone()));
+                    }
+                }
                 (false, false) => {}
                 (true, false) => {
                     in_numeric = true;
@@ -133,6 +139,16 @@ impl Indicator {
         }
 
         translations
+    }
+
+    /// A run of `numericmodechars` followed by a digit enters numeric mode at its first
+    /// character, as liblouis' `checkNumericMode` does.
+    fn starts_numeric_mode(&self, chars: &[char]) -> bool {
+        chars
+            .iter()
+            .find(|c| !self.extra_numeric_chars.contains(c))
+            .is_some_and(|c| self.numeric_chars.contains(c))
+            && self.extra_numeric_chars.contains(&chars[0])
     }
 }
 
@@ -179,5 +195,28 @@ mod tests {
             pairs(&indicator.precompute("ab12a")),
             vec![(2, "⠼".to_string()), (4, "⠰".to_string())],
         );
+    }
+
+    #[test]
+    fn precompute_numericmodechars_before_digit() {
+        let mut builder = IndicatorBuilder::new();
+        builder.numeric_characters(HashSet::from(['1', '2', '3']));
+        builder.numsign("⠼", &rule("numsign 3456"));
+        builder.numericmodechars(".,");
+        let indicator = builder.build().unwrap();
+
+        assert_eq!(
+            pairs(&indicator.precompute("a.1")),
+            vec![(1, "⠼".to_string())]
+        );
+        assert_eq!(
+            pairs(&indicator.precompute(".,2")),
+            vec![(0, "⠼".to_string())]
+        );
+        assert_eq!(
+            pairs(&indicator.precompute("1.2")),
+            vec![(0, "⠼".to_string())]
+        );
+        assert!(pairs(&indicator.precompute("a.b")).is_empty());
     }
 }

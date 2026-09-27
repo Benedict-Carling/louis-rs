@@ -315,15 +315,6 @@ impl ResolvedTranslation {
         &self.effects
     }
 
-    /// Set the `input` of a translation.
-    pub fn with_input(self, input: &str) -> Self {
-        Self {
-            input: input.to_string(),
-            length: input.chars().count(),
-            ..self
-        }
-    }
-
     /// Set the `weight` of a translation.
     pub fn with_weight(self, weight: usize) -> Self {
         Self { weight, ..self }
