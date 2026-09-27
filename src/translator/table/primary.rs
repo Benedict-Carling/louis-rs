@@ -2105,6 +2105,11 @@ impl PrimaryTable {
                 candidates.extend(self.comp6_trie.find_translations(chars.as_str(), prev));
             }
 
+            let contraction_rank = candidates
+                .iter()
+                .filter(|t| matches!(t.rule(), Some(Rule::Contraction { .. })))
+                .map(|t| t.rank())
+                .max();
             let unseen = candidates
                 .iter()
                 .filter(|t| !seen.contains(&TranslationSubset::from(*t)) && !stalled(t));
@@ -2147,6 +2152,19 @@ impl PrimaryTable {
             } else {
                 candidate.is_some_and(|t| begun_before.contains(&TranslationSubset::from(t)))
             };
+            // liblouis puts the letter sign before a contraction only if it is the rule chosen
+            // here, which it is not when another rule outranks it
+            let chosen_rank = if nocross_wins {
+                nocross_candidate.as_ref().map(|t| t.rank())
+            } else {
+                candidate.map(|t| t.rank())
+            };
+            pending_indications.retain(|p| {
+                !matches!(p.rule(), Some(Rule::Contraction { .. }))
+                    || chosen_rank.is_none_or(|rank| {
+                        contraction_rank.is_none_or(|contraction| rank <= contraction)
+                    })
+            });
             if nocross_wins || !begun_before {
                 translations.append(&mut pending_indications);
             }
@@ -3976,6 +3994,25 @@ mod tests {
             PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
                 .unwrap();
         assert_eq!(table.translate("ab abk ab"), "⠼⠀⠁⠃⠅⠀⠼");
+    }
+
+    #[test]
+    fn contraction_letsign_only_where_the_contraction_is_chosen() {
+        let rules = [
+            parse_rule("lowercase d 145"),
+            parse_rule("lowercase a 1"),
+            parse_rule("punctuation ' 3"),
+            parse_rule("space \\s 0"),
+            parse_rule("letsign 56"),
+            parse_rule("noletsignafter '"),
+            parse_rule("contraction d"),
+            parse_rule("word d'a 145-3-1"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("d'a d'"), "⠙⠄⠁⠀⠰⠙⠄");
     }
 
     #[test]
