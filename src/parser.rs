@@ -1149,7 +1149,10 @@ pub enum EscapingContext {
     MatchPattern,
 }
 
-fn unescape_unicode(chars: &mut Chars, len: u8) -> Result<char, ParseError> {
+pub(crate) fn unescape_unicode<I: Iterator<Item = char> + Clone>(
+    chars: &mut I,
+    len: u8,
+) -> Result<char, ParseError> {
     let mut s = String::new();
 
     for _ in 0..len {

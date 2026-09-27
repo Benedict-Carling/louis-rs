@@ -203,18 +203,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn unescape_unicode(&mut self, len: usize) -> Result<char, ParseError> {
-        let mut s = String::new();
-        for _ in 0..len {
-            match self.chars.next() {
-                Some(c) => s.push(c),
-                None => return Err(ParseError::InvalidEscapeSequence { found: None }),
-            }
-        }
-        u32::from_str_radix(&s, 16)
-            .ok()
-            .and_then(char::from_u32)
-            .ok_or(ParseError::InvalidEscapeSequence { found: None })
+    fn unescape_unicode(&mut self, len: u8) -> Result<char, ParseError> {
+        crate::parser::unescape_unicode(&mut self.chars, len)
+            .map_err(|_| ParseError::InvalidEscapeSequence { found: None })
     }
 
     fn string(&mut self) -> Result<ActionInstruction, ParseError> {
@@ -261,8 +252,14 @@ impl<'a> Parser<'a> {
                     value: self.ascii_number()?,
                 })
             }
-            Some('+') => Ok(ActionInstruction::Increment { variable }),
-            Some('-') => Ok(ActionInstruction::Decrement { variable }),
+            Some('+') => {
+                self.consume('+')?;
+                Ok(ActionInstruction::Increment { variable })
+            }
+            Some('-') => {
+                self.consume('-')?;
+                Ok(ActionInstruction::Decrement { variable })
+            }
             c => Err(ParseError::InvalidOperator { found: c.copied() }),
         }
     }
@@ -414,6 +411,10 @@ mod tests {
             Parser::new(r#"".\s\"""#).string(),
             Ok(ActionInstruction::String { s: ". \"".into() })
         );
+        assert_eq!(
+            Parser::new(r#""\xd83d\xde02""#).string(),
+            Ok(ActionInstruction::String { s: "😂".into() })
+        );
         // an escaped backslash is one backslash, and must not swallow the
         // closing quote (it-it-comp6.utb:248, `nofor context @16 "\\"`)
         assert_eq!(
@@ -459,6 +460,13 @@ mod tests {
         assert_eq!(
             Parser::new("#5-").action(),
             Ok(ActionInstruction::Decrement { variable: 5 })
+        );
+        assert_eq!(
+            Parser::new("#1+?").actions(),
+            Ok(Action::new(vec![
+                ActionInstruction::Increment { variable: 1 },
+                ActionInstruction::Ignore
+            ]))
         );
         assert_ne!(
             Parser::new("#1=").action(),
