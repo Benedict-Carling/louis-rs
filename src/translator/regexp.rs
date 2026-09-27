@@ -517,7 +517,7 @@ impl CompiledRegexp {
                 env,
             ),
             Instruction::VariableEqual(var, expected) => {
-                if env.get(var) == Some(&expected) {
+                if env.get(var) == expected {
                     self.add_thread(
                         list,
                         pc + 1,
@@ -533,7 +533,7 @@ impl CompiledRegexp {
                 }
             }
             Instruction::NotVariableEqual(var, expected) => {
-                if env.get(var).is_some_and(|&actual| actual != expected) {
+                if env.get(var) != expected {
                     self.add_thread(
                         list,
                         pc + 1,

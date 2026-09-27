@@ -29,8 +29,9 @@ impl Environment {
         Environment(HashMap::new())
     }
 
-    pub fn get(&self, slot: u8) -> Option<&u8> {
-        self.0.get(&slot)
+    /// liblouis starts every pass variable at 0
+    pub fn get(&self, slot: u8) -> u8 {
+        self.0.get(&slot).copied().unwrap_or(0)
     }
 
     pub fn apply(&mut self, effect: &Effect) {

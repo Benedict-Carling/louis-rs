@@ -268,6 +268,19 @@ mod tests {
     }
 
     #[test]
+    fn unset_variable_is_zero() {
+        let rules = [
+            parse_rule("pass2 #1=0@1 @6#1=1"),
+            parse_rule("pass2 !#2=1@2 @3"),
+        ];
+        let ctx = TableContext::default();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Post1, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("⠁⠁⠂"), "⠠⠁⠄");
+    }
+
+    #[test]
     fn effects() {
         let rules = [
             // when encountering @123 set var 1 to 1
