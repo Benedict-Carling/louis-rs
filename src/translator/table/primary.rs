@@ -11,7 +11,7 @@ use crate::{
     },
     translator::{
         CharacterDefinition, ClassConstraint, ResolvedTranslation, Rule, TranslationError,
-        TranslationOptions, TranslationStage,
+        TranslationMode, TranslationOptions, TranslationStage,
         context_pattern::{ContextPatterns, ContextPatternsBuilder},
         effect::Environment,
         indication::{
@@ -26,7 +26,10 @@ use crate::{
             PositionConstraints, PunctuationConstrainerBuilder,
         },
         sequence::{Sequences, whole_word_boundaries},
-        table::TableContext,
+        table::{
+            TableContext,
+            backward::{self, BackwardSelector, Situation},
+        },
         translation::TranslationSubset,
         trie::{Transition, Trie},
     },
@@ -140,6 +143,8 @@ pub struct PrimaryTable {
     backward_digit_overrides: HashMap<char, ResolvedTranslation>,
     /// Forward-only: the standing-alone check for `word` and `contraction` rules.
     sequences: Option<Sequences>,
+    /// Backward-only: picks among the rules the trie finds at a position.
+    backward: Option<BackwardSelector>,
 }
 
 /// A builder for [`PrimaryTable`]
@@ -168,6 +173,8 @@ struct PrimaryTableBuilder {
     backward_digit_overrides: HashMap<char, ResolvedTranslation>,
     compbrl_triggers: Vec<String>,
     sequences: Option<Sequences>,
+    backward: Option<BackwardSelector>,
+    direction: Direction,
 }
 
 impl PrimaryTableBuilder {
@@ -175,11 +182,16 @@ impl PrimaryTableBuilder {
     /// boundary checks against: text classes for forward translation, dots classes for
     /// backward. The tries need it from construction on, since `Trie::insert` resolves those
     /// checks against its own context immediately rather than deferring to match time.
-    fn new(trie_ctx: CharacterClasses) -> Self {
+    fn new(trie_ctx: CharacterClasses, direction: Direction) -> Self {
+        let trie = Trie::new().with_context(trie_ctx.clone());
+        let trie = match direction {
+            Direction::Forward => trie,
+            Direction::Backward => trie.keep_all(),
+        };
         Self {
             undefined: None,
             character_translations: CharacterTranslation::new(),
-            trie: Trie::new().with_context(trie_ctx.clone()),
+            trie,
             comp6_trie: Trie::new().with_context(trie_ctx.clone()).case_sensitive(),
             nocross_trie: Trie::new().with_context(trie_ctx),
             match_patterns: MatchPatternsBuilder::new(),
@@ -200,6 +212,8 @@ impl PrimaryTableBuilder {
             backward_digit_overrides: HashMap::new(),
             compbrl_triggers: Vec::new(),
             sequences: None,
+            backward: None,
+            direction,
         }
     }
 
@@ -208,7 +222,8 @@ impl PrimaryTableBuilder {
     }
 
     fn get_trie_mut(&mut self, rule: &AnchoredRule) -> &mut Trie {
-        if rule.is_nocross() {
+        // back-translation ignores nocross
+        if rule.is_nocross() && self.direction == Direction::Forward {
             &mut self.nocross_trie
         } else {
             &mut self.trie
@@ -429,6 +444,7 @@ impl PrimaryTableBuilder {
             }),
             backward_digit_overrides: self.backward_digit_overrides,
             sequences: self.sequences,
+            backward: self.backward,
         }
     }
 }
@@ -474,7 +490,7 @@ impl PrimaryTable {
             Direction::Forward => ctx.character_classes.clone(),
             Direction::Backward => ctx.dots_classes().clone(),
         };
-        let mut builder = PrimaryTableBuilder::new(trie_ctx);
+        let mut builder = PrimaryTableBuilder::new(trie_ctx, direction);
         if direction == Direction::Forward {
             builder.sequences = Sequences::new(ctx);
         }
@@ -535,7 +551,9 @@ impl PrimaryTable {
                 Rule::Decpoint {
                     character, dots, ..
                 } => {
-                    builder.insert_character(*character, &dots.to_string(), direction, rule);
+                    if direction == Direction::Forward {
+                        builder.insert_character(*character, &dots.to_string(), direction, rule);
+                    }
                     // A decimal point extends the numeric run: digits that follow it
                     // must not get a second numsign.  Registering it as a midnum
                     // character achieves this via the numeric indicator and constrainer.
@@ -545,7 +563,7 @@ impl PrimaryTable {
                 }
                 Rule::Hyphen {
                     character, dots, ..
-                } => {
+                } if direction == Direction::Forward => {
                     builder.insert_character(*character, &dots.to_string(), direction, rule);
                 }
                 _ => (),
@@ -553,6 +571,14 @@ impl PrimaryTable {
         }
         for rule in rules {
             match &rule.rule {
+                Rule::Decpoint {
+                    character, dots, ..
+                }
+                | Rule::Hyphen {
+                    character, dots, ..
+                } if direction == Direction::Backward => {
+                    builder.insert_character(*character, &dots.to_string(), direction, rule);
+                }
                 Rule::Undefined { dots } => {
                     builder.undefined = Some(dots.to_string());
                 }
@@ -856,6 +882,9 @@ impl PrimaryTable {
                             .indicator(&dots.to_string());
                     }
                 }
+                Rule::Multind { dots, .. } if direction == Direction::Backward => {
+                    builder.insert_backward_indicator(&dots.to_string(), rule);
+                }
                 Rule::Noletsign { chars } => {
                     builder.lettersign_indicator.noletsign(chars);
                 }
@@ -907,6 +936,8 @@ impl PrimaryTable {
                             .indicator(&dots.to_string());
                     }
                 }
+                // liblouis defines no back-translation rule for a base character
+                Rule::Base { .. } if direction == Direction::Backward => {}
                 Rule::Base { derived, base, .. } => {
                     if let Some(translation) = ctx.character_definitions().get(base).cloned() {
                         builder.insert_character(*derived, &translation, direction, rule);
@@ -1511,7 +1542,28 @@ impl PrimaryTable {
                 .backward_numeric_constrainer
                 .digit_cells(digit_cells);
         }
+        if direction == Direction::Backward {
+            builder.backward = Some(BackwardSelector::new(
+                rules,
+                ctx,
+                builder.trie.single_char_alternatives(),
+            ));
+        }
         Ok(builder.build(direction, ctx))
+    }
+
+    /// liblouis sets the attributes of characters and cells from every definition in a table,
+    /// including those not meant for this direction. Back-translation consults them, so
+    /// base them on all the `rules` of the table.
+    pub fn with_all_definitions(mut self, rules: &[AnchoredRule], ctx: &TableContext) -> Self {
+        if self.backward.is_some() {
+            self.backward = Some(BackwardSelector::new(
+                rules,
+                ctx,
+                self.trie.single_char_alternatives(),
+            ));
+        }
+        self
     }
 
     fn update_offsets(
@@ -1645,9 +1697,10 @@ impl PrimaryTable {
 
         let indications = self.indicators.precompute(input, &enriched_spans);
         let constraints = self.constrainers.precompute(input, &enriched_spans);
-        let input_chars: Vec<char> = match self.sequences {
-            Some(_) => input.chars().collect(),
-            None => Vec::new(),
+        let input_chars: Vec<char> = if self.sequences.is_some() || self.backward.is_some() {
+            input.chars().collect()
+        } else {
+            Vec::new()
         };
         let stands_alone = |t: &ResolvedTranslation, pos: usize| match &self.sequences {
             Some(sequences)
@@ -1657,6 +1710,8 @@ impl PrimaryTable {
             }
             _ => true,
         };
+
+        let mut backward_state = backward::State::default();
 
         loop {
             if last_indications_pos != Some(char_pos) {
@@ -1706,46 +1761,15 @@ impl PrimaryTable {
             // leaving the position to fall through to the plain punctuation character
             // definition (`character_translations`), matching liblouis.
             candidates.retain(|t| match t.rule() {
+                _ if self.backward.is_some() => true,
                 Some(Rule::Prepunc { .. }) => constraints.prepunc_ok_at(char_pos),
                 Some(Rule::Postpunc { .. }) => constraints.postpunc_ok_at(char_pos),
                 _ => stands_alone(t, char_pos),
             });
 
-            // Backward numeric mode: prefer the digit reading of a cell shared with a
-            // letter (common in six-dot literary codes). Rather than out-weighing the
-            // trie's single-cell letter candidate, replace it outright — any genuinely
-            // longer (multi-cell) candidate at this position is left alone to compete
-            // on its own weight, same as usual.
-            if self.direction == Direction::Backward
-                && constraints.prefer_digit_at(char_pos)
-                && let Some(next_char) = chars.clone().next()
-                && let Some(digit_translation) = self.backward_digit_overrides.get(&next_char)
-            {
-                candidates.retain(|t| t.length() != 1);
-                candidates.push(digit_translation.clone());
-            }
-
             // inside a numeric run, suppress multi-character contractions
-            if constraints.dont_contract_at(char_pos) {
+            if self.direction == Direction::Forward && constraints.dont_contract_at(char_pos) {
                 candidates.retain(|t| t.length() <= 1);
-            }
-
-            // Backward no-contract mode: a letsign/nocontractsign/nonumsign says the
-            // cells that follow spell out letters, so the word-family rules must not
-            // claim them. Only these four opcodes are suppressed -- liblouis leaves
-            // `always`, `partword` and the mid-word opcodes eligible.
-            if self.direction == Direction::Backward && constraints.no_contract_at(char_pos) {
-                candidates.retain(|t| {
-                    !matches!(
-                        t.rule(),
-                        Some(
-                            Rule::Word { .. }
-                                | Rule::Sufword { .. }
-                                | Rule::Prfword { .. }
-                                | Rule::Begword { .. }
-                        )
-                    )
-                });
             }
 
             // In computer braille mode, discard normal candidates and use comp6 rules only.
@@ -1763,16 +1787,23 @@ impl PrimaryTable {
             let is_backward = self.direction == Direction::Backward;
             let uppercase_here = is_backward && constraints.uppercase_at(char_pos);
             let titlecase_here = is_backward && constraints.titlecase_at(char_pos);
+            let to_uppercase = |c: char| -> String {
+                match &self.backward {
+                    Some(selector) => selector.to_uppercase(c),
+                    None => c.to_uppercase().collect(),
+                }
+            };
             let uppercase_if_needed =
                 move |translation: ResolvedTranslation| -> ResolvedTranslation {
                     if uppercase_here {
-                        let upper = translation.output().to_uppercase();
+                        let upper: String =
+                            translation.output().chars().map(to_uppercase).collect();
                         translation.with_output(&upper)
                     } else if titlecase_here {
                         let output = translation.output();
                         let mut chars = output.chars();
                         let titled = match chars.next() {
-                            Some(c) => c.to_uppercase().chain(chars).collect::<String>(),
+                            Some(c) => to_uppercase(c) + chars.as_str(),
                             None => String::new(),
                         };
                         translation.with_output(&titled)
@@ -1781,13 +1812,31 @@ impl PrimaryTable {
                     }
                 };
 
-            // use the longest translation
-            let candidate = candidates
+            // drop translation candidates that we have applied already at this position in the
+            // input
+            let unseen = candidates
                 .iter()
-                // drop translation candidates that we have applied already at this position in the
-                // input
-                .filter(|t| !seen.contains(&TranslationSubset::from(*t)))
-                .max_by_key(|translation| translation.rank());
+                .filter(|t| !seen.contains(&TranslationSubset::from(*t)));
+            let candidate = match &self.backward {
+                Some(selector) => {
+                    selector.begin(&mut backward_state, &translations);
+                    let situation = Situation {
+                        output: &translations,
+                        cells: &input_chars,
+                        pos: char_pos,
+                        state: backward_state,
+                        partial: options.mode().contains(TranslationMode::PartialTrans),
+                    };
+                    // `rev` so that of equally ranked rules the first defined wins, as in
+                    // liblouis
+                    unseen
+                        .filter(|t| selector.is_valid(t, &situation))
+                        .rev()
+                        .max_by_key(|t| (t.length() == 0, BackwardSelector::order(t)))
+                }
+                // use the longest translation
+                None => unseen.max_by_key(|translation| translation.rank()),
+            };
             // A nocross rule wins if there is no plain candidate to beat (many, e.g.
             // liblouis' `nocross always en`, have no plain counterpart at all).
             if let Some(nocross) = &nocross_candidate
@@ -1816,6 +1865,9 @@ impl PrimaryTable {
                     chars.nth(t.length() - 1);
                     prev = t.input().chars().last();
                     char_pos += t.length();
+                }
+                if let Some(selector) = &self.backward {
+                    selector.applied(&mut backward_state, t.rule());
                 }
                 // there is a matching translation rule
                 let translation = t.clone();
@@ -2561,6 +2613,103 @@ mod tests {
         assert_eq!(table.translate("⠇⠸"), "foobar");
         assert_eq!(table.translate("⠀⠀"), "  ");
         assert_eq!(table.translate("⠄⠈⠈"), "foo");
+    }
+
+    fn backward_table(rules: &[AnchoredRule]) -> PrimaryTable {
+        let context = TableContext::compile(rules).unwrap();
+        PrimaryTable::compile(rules, Direction::Backward, TranslationStage::Main, &context).unwrap()
+    }
+
+    #[test]
+    fn backward_word_checks_the_text_before_it() {
+        let rules = [
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase e 15"),
+            parse_rule("lowercase a 1"),
+            parse_rule("punctuation , 2"),
+            parse_rule("word but 12"),
+            parse_rule("midword ea 2"),
+            parse_rule("space \\s 0"),
+        ];
+        let table = backward_table(&rules);
+        assert_eq!(table.translate("⠃"), "but");
+        assert_eq!(table.translate("⠃⠀⠃"), "but but");
+        // the cell before ⠃ is a comma cell, but the text before it is the letter a
+        assert_eq!(table.translate("⠑⠂⠃"), "eeab");
+    }
+
+    #[test]
+    fn backward_end_of_word_skips_cells_that_are_not_letters() {
+        let rules = [
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase e 15"),
+            parse_rule("lowercase a 1"),
+            parse_rule("punctuation , 2"),
+            parse_rule("word but 12"),
+            parse_rule("midword ea 2"),
+            parse_rule("always ch 16"),
+            parse_rule("space \\s 0"),
+        ];
+        let table = backward_table(&rules);
+        // ⠂ says nothing about the end of the word, ⠡ stands for letters, so ⠃ is not a word
+        assert_eq!(table.translate("⠃⠂⠡"), "beach");
+        // at the end of the input the word does end
+        assert_eq!(table.translate("⠃⠂"), "but,");
+    }
+
+    #[test]
+    fn backward_prefers_a_longer_translation_of_one_cell() {
+        let rules = [
+            parse_rule("lowercase y 13456"),
+            parse_rule("word you 13456"),
+            parse_rule("lowercase b 12"),
+            parse_rule("space \\s 0"),
+        ];
+        let table = backward_table(&rules);
+        assert_eq!(table.translate("⠽"), "you");
+        assert_eq!(table.translate("⠃⠽"), "by");
+    }
+
+    #[test]
+    fn backward_indicator_before_character_definition() {
+        let rules = [
+            parse_rule("sign # 3456"),
+            parse_rule("numsign 3456"),
+            parse_rule("lowercase a 1"),
+            parse_rule("litdigit 1 1"),
+        ];
+        let table = backward_table(&rules);
+        assert_eq!(table.translate("⠼⠁"), "1");
+        assert_eq!(table.translate("⠁"), "a");
+    }
+
+    #[test]
+    fn backward_letsign_stops_whole_word_contractions() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("word but 12"),
+            parse_rule("letsign 56"),
+            parse_rule("space \\s 0"),
+        ];
+        let table = backward_table(&rules);
+        assert_eq!(table.translate("⠰⠃"), "b");
+        assert_eq!(table.translate("⠰⠃⠀⠃"), "b but");
+    }
+
+    #[test]
+    fn backward_multind_applies_its_indicators() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("word also 1-123"),
+            parse_rule("lowercase l 123"),
+            parse_rule("nocontractsign 56"),
+            parse_rule("capsletter 6"),
+            parse_rule("multind 56-6 nocontractsign capsletter"),
+        ];
+        let table = backward_table(&rules);
+        assert_eq!(table.translate("⠁⠇"), "also");
+        assert_eq!(table.translate("⠰⠠⠁⠇"), "Al");
     }
 
     #[test]

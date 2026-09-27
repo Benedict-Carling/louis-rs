@@ -102,6 +102,15 @@ impl CharacterClasses {
         self.0.get(class).cloned()
     }
 
+    pub fn contains(&self, class: &CharacterClass, c: char) -> bool {
+        self.0.get(class).is_some_and(|chars| chars.contains(&c))
+    }
+
+    /// Every character in any of the classes.
+    pub fn members(&self) -> HashSet<char> {
+        self.0.values().flatten().copied().collect()
+    }
+
     pub fn is_punctuation(&self, c: char) -> bool {
         self.get(&CharacterClass::Punctuation)
             .is_some_and(|class| class.contains(&c))

@@ -93,6 +93,8 @@ struct TrieNode {
     // to hash every member of its `ResolvedClasses` (whose own layout is chosen for the same
     // comparison -- see `ResolvedClasses::chars`).
     transitions: BTreeMap<ResolvedTransition, TrieNode>,
+    /// Every translation inserted at this node, in a [`Trie::keep_all`] trie.
+    alternatives: Vec<ResolvedTranslation>,
 }
 
 impl TrieNode {
@@ -123,6 +125,9 @@ pub struct Trie {
     /// being lowercased first. Needed for `comp6`, where `comp6 a 1` and `comp6 A 17`
     /// are independent rules.
     case_sensitive: bool,
+    /// When true, every translation is kept instead of one per path, and boundary checks
+    /// are left to the caller.
+    keep_all: bool,
 }
 
 impl Trie {
@@ -131,6 +136,16 @@ impl Trie {
             root: TrieNode::default(),
             ctx: CharacterClasses::default(),
             case_sensitive: false,
+            keep_all: false,
+        }
+    }
+
+    /// Keep every rule inserted along a path, ignoring its `Transition`s and
+    /// `ClassConstraint`s, so the caller can select among them itself.
+    pub fn keep_all(self) -> Self {
+        Trie {
+            keep_all: true,
+            ..self
         }
     }
 
@@ -204,6 +219,31 @@ impl Trie {
             !from.is_empty(),
             "Cannot insert empty `from` string (or `to` string in case of backward translation) - this causes infinite loops when translating"
         );
+
+        if self.keep_all {
+            let mut node = &mut self.root;
+            for c in from.chars() {
+                node = node
+                    .transitions
+                    .entry(ResolvedTransition::Character(c))
+                    .or_default();
+            }
+            if !node
+                .alternatives
+                .iter()
+                .any(|t| t.rule() == Some(&origin.rule))
+            {
+                let length = from.chars().count();
+                node.alternatives.push(ResolvedTranslation::new(
+                    from,
+                    to,
+                    length,
+                    stage,
+                    origin.clone(),
+                ));
+            }
+            return;
+        }
 
         let before = before.map(|t| self.resolve_transition(t));
         let after = after.map(|t| self.resolve_transition(t));
@@ -299,6 +339,7 @@ impl Trie {
             let translation = translation.clone();
             matching_rules.push(translation)
         }
+        matching_rules.extend(node.alternatives.iter().cloned());
         let c = chars.next();
         if let Some(c) = c {
             let bytes = c.len_utf8();
@@ -335,6 +376,17 @@ impl Trie {
         matching_rules
     }
 
+    /// The translations kept for every single character path, in a [`Trie::keep_all`] trie.
+    pub fn single_char_alternatives(&self) -> impl Iterator<Item = (char, &[ResolvedTranslation])> {
+        self.root
+            .transitions
+            .iter()
+            .filter_map(|(transition, node)| match transition {
+                ResolvedTransition::Character(c) => Some((*c, node.alternatives.as_slice())),
+                _ => None,
+            })
+    }
+
     pub fn find_translations(&self, input: &str, prev: Option<char>) -> Vec<ResolvedTranslation> {
         self.find_translations_from_node(input, prev, &self.root)
     }
@@ -359,6 +411,34 @@ mod tests {
             trie.find_translations("foo", None),
             Vec::<ResolvedTranslation>::new()
         );
+    }
+
+    #[test]
+    fn keep_all_keeps_every_rule_for_a_path() {
+        let mut trie = Trie::new().keep_all();
+        let letter = AnchoredRule::new(RuleParser::new("letter b 12").rule().unwrap(), None, 0);
+        let word = AnchoredRule::new(RuleParser::new("word but 12").rule().unwrap(), None, 0);
+        for (rule, to) in [(&letter, "b"), (&word, "but")] {
+            trie.insert(
+                "⠃",
+                to,
+                Some(Transition::Start(vec![CharacterClass::Space])),
+                None,
+                Direction::Forward,
+                Precedence::Default,
+                vec![],
+                TranslationStage::Main,
+                rule,
+            );
+        }
+        let outputs: Vec<String> = trie
+            .find_translations("⠃", Some('x'))
+            .iter()
+            .map(|t| t.output())
+            .collect();
+        assert_eq!(outputs, ["b", "but"]);
+        let single: Vec<char> = trie.single_char_alternatives().map(|(c, _)| c).collect();
+        assert_eq!(single, ['⠃']);
     }
 
     #[test]
