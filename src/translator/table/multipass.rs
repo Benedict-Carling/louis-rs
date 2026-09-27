@@ -201,4 +201,20 @@ mod tests {
         let table = corrections(&["grouping p () 1,2", "correct {p}p }p{p"]);
         assert_eq!(table.translate("()"), ")(");
     }
+
+    /// liblouis applies back-translation's `correct` rules like forward ones, so one whose
+    /// action copies the match (`*`) keeps a shorter rule from rewriting it
+    #[test]
+    fn correct_backward_copy() {
+        let rules = [
+            parse_rule("nofor correct \"ssze\" \"szsze\""),
+            parse_rule("nofor correct \"sszel\" *"),
+        ];
+        let ctx = TableContext::default();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Backward, TranslationStage::Pre, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("resszel"), "resszel");
+        assert_eq!(transform.translate("ressze"), "reszsze");
+    }
 }

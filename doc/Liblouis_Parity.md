@@ -75,7 +75,9 @@ mutate `LOUIS_TABLE_PATH`.
 
 **Hyphenation, natively.** liblouis `.dic` pattern files are parsed directly
 (`src/hyphenation.rs`) — no external crate, no build or conversion step. Resolved
-through the same search path as any other table.
+through the same search path as any other table. `nocross` rules follow liblouis's
+`syllableBreak`/`hyphenateWord`, including its pattern automaton and lack of
+`LEFTHYPHENMIN`/`RIGHTHYPHENMIN`.
 
 **Position mapping.** `inputPos`, `outputPos` and `cursorPos`, composed across every
 pipeline stage in both directions. One known mismatch remains in the whole suite.
@@ -98,11 +100,9 @@ Honest list, no dates attached:
 - **No C ABI and no bindings.** Rust consumers only, for now. PyO3 bindings are
   proposed in [#1](https://github.com/liblouis/louis-rs/issues/1) /
   [PR #12](https://github.com/liblouis/louis-rs/pull/12).
-- **Two screen-reader modes are missing**: `partialTrans`
-  ([#19](https://github.com/liblouis/louis-rs/issues/19)) and
-  `compbrlAtCursor`/`compbrlLeftCursor`
-  ([#20](https://github.com/liblouis/louis-rs/issues/20)). The option flags are
-  accepted; nothing reads them yet.
+- **A screen-reader mode is missing**: `partialTrans`
+  ([#19](https://github.com/liblouis/louis-rs/issues/19)). The option flag is
+  accepted; nothing reads it yet.
 - **Back-translation returns text but not typeform.** `TranslationResult::emphasis`
   is never populated, and nothing reports whether a back-translation result could
   still change if more cells arrive
@@ -129,7 +129,7 @@ a few hundred either way on the million-assertion files.
 | `afr-za-g2` forward                                 |      13 | Not yet surveyed. The dictionary harness it shared this row with passes since back-translation selects rules as liblouis does and a boundary that holds counts towards a `match` rule's weight. | M    |
 | `ml`, `pa`, `hi`, `ta`, `fa`, `th`, `bn`            |    ≈950 | Complex scripts: conjunct and reph forms, and stacked combining marks firing an indicator each instead of once per grapheme cluster.                                             | L    |
 | `da-dk-g28-dictionary_harness`                      |       9 | Not yet surveyed; the backward `letsign` ambiguity that made up most of it went with the back-translation rule selection. | S    |
-| `hu-hu-g1_dictionary_special_consonants`            |  ≈1 100 | `nocross` asks "can this hyphenate anywhere?" instead of liblouis's positional `syllableBreak()`.                                                                                | L    |
+| `hu-hu-g1_dictionary_special_consonants`            |      11 | Four `always` rules defined twice with different dots in `hu-exceptionwords.cti`; liblouis keeps the first, a definition-order tie (table bug).                                   | —    |
 | `sw-ke-dictionary`, `sw-ke`                         |      37 | Not yet surveyed; the backward lookup that spliced in unrelated dictionary words went with the back-translation rule selection.                                                                    | M    |
 | `en-g3`, `en-ueb`                                   |    ≈600 | A literal hyphen breaks per-segment contraction in compounds — "do-it-yourself" gives `do-x-y\|rself`, not `d-x-yrf`.                                                            | M    |
 | `numericmode`, `capsword`, `mixed-case`            |    ≈110 | Forward translations match; the expectations are written in the table's own `display` characters, which we decline to infer (ADR "Don't infer `DisplayTable` entries"). Some of `mixed-case` fail in liblouis too. | —    |
@@ -143,15 +143,13 @@ Two cross-cutting items have no single file behind them:
   last character of the text produced so far, classified by the text classes; the side
   after is the next cell's attributes or `isEndWord`'s scan; rules are tried in
   liblouis's order; and `itsANumber` and `noContractMode` are state set by the rules
-  applied. Caps passages and emphasis still have no backward path, and capitalization
-  is still precomputed from the input rather than carried as liblouis's `nextUpper`/
-  `allUpper` state. *(M)*
+  applied, as are capitalization's `nextUpper`/`allUpper`/`allUpperPhrase`. Emphasis
+  still has no backward path. *(M)*
 - **Engine debt.** Regexp negation of concatenation and alternation is wrong
   (`!(e1e2)` ≠ `(!e1!e2)`); `Attribute::ByOrder` and `Any` are no-ops in
   `match_pattern.rs` and all three are no-ops in `context_pattern.rs`; the
   `syllable` opcode's cross-boundary restriction is unimplemented. In multipass and
-  `context` tests a negated test consumes a character where liblouis's consumes none,
-  and `_N` is dropped rather than looking back, which is why `no-no-g2`'s pass4 rule
+  `context` tests `_N` is dropped rather than looking back, which is why `no-no-g2`'s pass4 rule
   `_!$sp[@6@6]` rewrites `⠰⠠⠠` differently and back-translating `NVV` fails. *(M)*
 
 ## Forty-four blocks that never run
@@ -191,7 +189,6 @@ by the ambiguous `{language: de, grade: 0}` query above; with the queries pinned
 | Capability                                                                                      | Status                                                                                                                                                    | Size   |
 |-------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------|--------|
 | `partialTrans` ([#19](https://github.com/liblouis/louis-rs/issues/19))                          | Flag accepted, nothing reads it. A screen reader sets it on every keystroke of contracted input; without it, word-final rules fire on an unfinished word. | M      |
-| `compbrlAtCursor` / `compbrlLeftCursor` ([#20](https://github.com/liblouis/louis-rs/issues/20)) | Flags accepted, nothing reads them. Computer-braille rendering already works, so this is cursor plumbing.                                                 | M      |
 | Back-translation finality ([#29](https://github.com/liblouis/louis-rs/issues/29))               | Nothing says whether more cells could change the characters already produced.                                                                             | M      |
 | Display tables for library callers                                                              | `TranslationPipeline::with_display` and `louis translate/trace --display` exist; `Translator` doesn't expose it yet.                                       | S      |
 | `hyphenate`, `charToDots`, `dotsToChar`, `getEmphClasses`                                       | Working internals, nothing exposed on `Translator`.                                                                                                       | S each |
@@ -224,8 +221,8 @@ relevant ADR before starting; both record an approach that was tested and dispro
   ([#27](https://github.com/liblouis/louis-rs/issues/27)) — ADR accepted, prototype
   parked
 - gzip+bincode table bundling ([PR #10](https://github.com/liblouis/louis-rs/pull/10))
-- Backward `capsletter`/`begcapsword` failures in `hu-hu-g1`
-  ([#4](https://github.com/liblouis/louis-rs/issues/4))
+- `hu-hu-g1` failures ([#4](https://github.com/liblouis/louis-rs/issues/4)): only the
+  duplicated-rule ties above remain
 - Translation performance — the regexp VM was 59% of translation time, and there is a
   measured 2.0–3.4× in hand plus a larger structural idea (compiling all of a stage's
   `match`/`context` patterns into one automaton) not yet attempted. Everything on the

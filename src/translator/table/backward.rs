@@ -68,6 +68,13 @@ pub struct State {
     /// a digit.
     number: u8,
     no_contract: NoContract,
+    /// liblouis's `nextUpper`: capitalize the next character output.
+    next_upper: bool,
+    /// liblouis's `allUpper`: 1 right after a begcapsword, 2 once a capital has been
+    /// output.
+    all_upper: u8,
+    /// liblouis's `allUpperPhrase`.
+    all_upper_phrase: bool,
 }
 
 #[derive(Debug, Default)]
@@ -78,6 +85,7 @@ pub struct BackwardSelector {
     defined_cells: HashSet<char>,
     cells: HashMap<char, CellRules>,
     numeric_mode_chars: HashSet<char>,
+    caps_mode_chars: HashSet<char>,
     /// The uppercase character a table derives from a character with `base uppercase`.
     uppercase: HashMap<char, char>,
 }
@@ -227,6 +235,14 @@ impl BackwardSelector {
             })
             .flatten()
             .collect();
+        let caps_mode_chars = rules
+            .iter()
+            .filter_map(|rule| match &rule.rule {
+                Rule::Capsmodechars { chars } => Some(chars.chars()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
         // the first base rule for a character is the one that counts
         let mut based = HashSet::new();
         let uppercase = rules
@@ -268,6 +284,7 @@ impl BackwardSelector {
             defined_cells,
             cells,
             numeric_mode_chars,
+            caps_mode_chars,
             uppercase,
         }
     }
@@ -283,6 +300,16 @@ impl BackwardSelector {
     /// `backTranslateString` does: a number ends at the first character that cannot
     /// continue it.
     pub fn begin(&self, state: &mut State, output: &[ResolvedTranslation]) {
+        let before = last_char(output);
+        let caps_mode = before.is_some_and(|c| self.caps_mode_chars.contains(&c));
+        if state.all_upper == 1 && self.char_is(before, &[CharacterClass::Uppercase]) {
+            state.all_upper = 2;
+        } else if state.all_upper == 2
+            && !self.char_is(before, &[CharacterClass::Uppercase])
+            && !caps_mode
+        {
+            state.all_upper = 0;
+        }
         if state.number == 2
             && let Some(before) = last_char(output)
             && !self.char_is(Some(before), &[CharacterClass::Litdigit])
@@ -340,6 +367,8 @@ impl BackwardSelector {
             Rule::Space { .. } => {
                 state.no_contract = NoContract::Off;
                 state.number = 0;
+                state.all_upper = 0;
+                state.next_upper = false;
             }
             _ => {}
         }
@@ -353,7 +382,48 @@ impl BackwardSelector {
         }
     }
 
+    /// liblouis's `putchars`: capitalize `output` as the caps state asks.
+    pub fn capitalize(&self, state: &mut State, output: &str) -> String {
+        let mut chars = output.chars();
+        let mut result = String::new();
+        if state.next_upper
+            && let Some(c) = chars.next()
+        {
+            result.push_str(&self.to_uppercase(c));
+            state.next_upper = false;
+        }
+        if state.all_upper == 0 && !state.all_upper_phrase {
+            result.extend(chars);
+            return result;
+        }
+        while let Some(c) = chars.next() {
+            if state.all_upper == 2
+                && !state.all_upper_phrase
+                && !self.char_is(Some(c), &[CharacterClass::Letter])
+                && !self.caps_mode_chars.contains(&c)
+            {
+                state.all_upper = 0;
+                result.push(c);
+                result.extend(chars);
+                return result;
+            }
+            result.push_str(&self.to_uppercase(c));
+        }
+        result
+    }
+
     fn indicator_applied(state: &mut State, name: &str) {
+        match name {
+            "capsletter" => {
+                state.next_upper = true;
+                state.all_upper = 0;
+            }
+            "begcapsword" => state.all_upper = 1,
+            "endcapsword" => state.all_upper = 0,
+            "begcaps" => state.all_upper_phrase = true,
+            "endcaps" => state.all_upper_phrase = false,
+            _ => {}
+        }
         match name {
             "capsletter" | "begcapsword" | "endcapsword" | "begcaps" | "endcaps" | "begcomp" => {
                 state.number = 0
@@ -362,7 +432,10 @@ impl BackwardSelector {
                 state.no_contract = NoContract::Active;
                 state.number = 0;
             }
-            "numsign" => state.number = 1,
+            "numsign" => {
+                state.number = 1;
+                state.all_upper = 0;
+            }
             _ => {}
         }
     }
