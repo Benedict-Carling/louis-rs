@@ -1,6 +1,7 @@
 //! Store and find simple translation rules using a prefix tree ([Trie](https://en.wikipedia.org/wiki/Trie))
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use crate::{
     parser::{AnchoredRule, CharacterClass, CharacterClasses, Direction, Precedence},
@@ -125,9 +126,18 @@ struct TrieNode {
 }
 
 impl TrieNode {
-    fn char_transition(&self, c: char, case_sensitive: bool) -> Option<&TrieNode> {
+    fn char_transition(
+        &self,
+        c: char,
+        case_sensitive: bool,
+        fold: Option<&HashMap<char, char>>,
+    ) -> Option<&TrieNode> {
         if case_sensitive {
             self.transitions.get(&ResolvedTransition::Character(c))
+        } else if let Some(fold) = fold {
+            let lowercase = fold.get(&c).copied().unwrap_or(c);
+            self.transitions
+                .get(&ResolvedTransition::Character(lowercase))
         } else if c.to_lowercase().count() != 1 {
             // FIXME: we ignore characters that do not map to a single
             // character lowercase character
@@ -152,6 +162,9 @@ pub struct Trie {
     /// being lowercased first. Needed for `comp6`, where `comp6 a 1` and `comp6 A 17`
     /// are independent rules.
     case_sensitive: bool,
+    /// The lowercase of each character the table derives with `base uppercase`. When set,
+    /// only these characters are folded, as liblouis does; otherwise Unicode lowercase is.
+    fold: Option<Arc<HashMap<char, char>>>,
     /// When true, every translation is kept instead of one per path, and boundary checks
     /// are left to the caller.
     keep_all: bool,
@@ -163,6 +176,7 @@ impl Trie {
             root: TrieNode::default(),
             ctx: CharacterClasses::default(),
             case_sensitive: false,
+            fold: None,
             keep_all: false,
         }
     }
@@ -178,6 +192,13 @@ impl Trie {
 
     pub fn with_context(self, ctx: CharacterClasses) -> Self {
         Trie { ctx, ..self }
+    }
+
+    pub fn with_fold(self, fold: Arc<HashMap<char, char>>) -> Self {
+        Trie {
+            fold: Some(fold),
+            ..self
+        }
     }
 
     pub fn case_sensitive(self) -> Self {
@@ -359,7 +380,7 @@ impl Trie {
         let c = chars.next();
         if let Some(c) = c {
             let bytes = c.len_utf8();
-            if let Some(node) = node.char_transition(c, self.case_sensitive) {
+            if let Some(node) = node.char_transition(c, self.case_sensitive, self.fold.as_deref()) {
                 matching_rules.extend(self.find_translations_from_node(
                     &input[bytes..],
                     Some(c),

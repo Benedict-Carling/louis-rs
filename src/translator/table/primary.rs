@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use log::warn;
 
@@ -209,8 +210,14 @@ impl PrimaryTableBuilder {
     /// boundary checks against: text classes for forward translation, dots classes for
     /// backward. The tries need it from construction on, since `Trie::insert` resolves those
     /// checks against its own context immediately rather than deferring to match time.
-    fn new(trie_ctx: CharacterClasses, direction: Direction) -> Self {
-        let trie = Trie::new().with_context(trie_ctx.clone());
+    fn new(
+        trie_ctx: CharacterClasses,
+        direction: Direction,
+        fold: Arc<HashMap<char, char>>,
+    ) -> Self {
+        let trie = Trie::new()
+            .with_context(trie_ctx.clone())
+            .with_fold(fold.clone());
         let trie = match direction {
             Direction::Forward => trie,
             Direction::Backward => trie.keep_all(),
@@ -220,9 +227,13 @@ impl PrimaryTableBuilder {
             character_translations: CharacterTranslation::new(),
             trie,
             comp6_trie: Trie::new().with_context(trie_ctx.clone()).case_sensitive(),
-            prepunc_trie: Trie::new().with_context(trie_ctx.clone()),
-            postpunc_trie: Trie::new().with_context(trie_ctx.clone()),
-            nocross_trie: Trie::new().with_context(trie_ctx),
+            prepunc_trie: Trie::new()
+                .with_context(trie_ctx.clone())
+                .with_fold(fold.clone()),
+            postpunc_trie: Trie::new()
+                .with_context(trie_ctx.clone())
+                .with_fold(fold.clone()),
+            nocross_trie: Trie::new().with_context(trie_ctx).with_fold(fold),
             match_patterns: MatchPatternsBuilder::new(),
             context_patterns: ContextPatternsBuilder::new().for_direction(direction),
             numeric_indicator: numeric::IndicatorBuilder::new(),
@@ -484,7 +495,20 @@ impl PrimaryTable {
             Direction::Forward => ctx.character_classes.clone(),
             Direction::Backward => ctx.dots_classes().clone(),
         };
-        let mut builder = PrimaryTableBuilder::new(trie_ctx, direction);
+        // liblouis folds the case of only the characters a table derives with `base uppercase`
+        let mut fold = HashMap::new();
+        for rule in rules {
+            if let Rule::Base {
+                name,
+                derived,
+                base,
+            } = &rule.rule
+                && name == "uppercase"
+            {
+                fold.entry(*derived).or_insert(*base);
+            }
+        }
+        let mut builder = PrimaryTableBuilder::new(trie_ctx, direction, Arc::new(fold));
         if direction == Direction::Forward {
             builder.sequences = Sequences::new(ctx);
         }
@@ -2967,6 +2991,23 @@ mod tests {
     }
 
     #[test]
+    fn rules_match_case_blind_only_through_base_uppercase() {
+        let rules = [
+            "space \\s 0",
+            "lowercase c 14",
+            "lowercase h 125",
+            "lowercase o 135",
+            "word och 14",
+            "word Och 147",
+        ];
+        let table = forward_table(&[&rules[..], &["uppercase O 1357"]].concat());
+        assert_eq!(table.translate("och"), "⠉");
+        assert_eq!(table.translate("Och"), "⡉");
+        let table = forward_table(&[&rules[..], &["base uppercase O o"]].concat());
+        assert_eq!(table.translate("och"), "⠉");
+    }
+
+    #[test]
     fn a_pass_rule_applies_again_at_a_later_position() {
         let table = forward_table(&[
             "lowercase h 125",
@@ -3360,7 +3401,7 @@ mod tests {
             parse_rule("lowercase s 234"),
             parse_rule("lowercase t 2345"),
             parse_rule("lowercase u 136"),
-            parse_rule("uppercase H 125"),
+            parse_rule("base uppercase H h"),
             parse_rule("always hausboot 123"),
             parse_rule("nocross always hausboot 456"),
             parse_rule("always fff 123"),
