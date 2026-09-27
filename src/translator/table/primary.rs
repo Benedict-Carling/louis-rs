@@ -1666,14 +1666,31 @@ impl PrimaryTable {
                 .dots_classes()
                 .get(&CharacterClass::Letter)
                 .unwrap_or_default();
-            // Multi-letter `always` rules (e.g. Hungarian "sz"/"cs" digraphs) define
-            // their own dots but aren't registered in the Letter dots class; a
-            // begcapsword span must still continue across them.
+            // Contractions spelling letters (e.g. Hungarian "sz"/"cs" digraphs) define
+            // their own dots, which are no letter by definition; a begcapsword span or a
+            // numeric run must still treat them as letters.
             for rule in rules {
-                if let Rule::Always { chars, dots, .. } = &rule.rule
-                    && chars.chars().all(|c| c.is_alphabetic())
-                {
-                    letter_cells.extend(dots.to_string().chars());
+                match &rule.rule {
+                    Rule::Always { chars, dots, .. }
+                    | Rule::Word { chars, dots, .. }
+                    | Rule::Sufword { chars, dots, .. }
+                    | Rule::Prfword { chars, dots, .. }
+                    | Rule::Begword { chars, dots, .. }
+                    | Rule::Begmidword { chars, dots, .. }
+                    | Rule::Midword { chars, dots, .. }
+                    | Rule::Midendword { chars, dots, .. }
+                    | Rule::Endword { chars, dots, .. }
+                    | Rule::Partword { chars, dots, .. }
+                        if chars.chars().all(|c| c.is_alphabetic()) =>
+                    {
+                        letter_cells.extend(dots.to_string().chars());
+                    }
+                    Rule::Lowword { chars, dots, .. } | Rule::Joinword { chars, dots, .. }
+                        if chars.chars().all(|c| c.is_alphabetic()) =>
+                    {
+                        letter_cells.extend(dots.to_string().chars());
+                    }
+                    _ => (),
                 }
             }
             builder
