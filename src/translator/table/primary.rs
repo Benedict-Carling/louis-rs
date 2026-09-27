@@ -643,6 +643,22 @@ impl PrimaryTable {
             HashSet::new()
         };
 
+        let defined_chars: HashSet<char> = rules
+            .iter()
+            .filter_map(|rule| match &rule.rule {
+                Rule::Space { character, .. }
+                | Rule::Punctuation { character, .. }
+                | Rule::Digit { character, .. }
+                | Rule::Litdigit { character, .. }
+                | Rule::Letter { character, .. }
+                | Rule::Lowercase { character, .. }
+                | Rule::Uppercase { character, .. }
+                | Rule::Sign { character, .. }
+                | Rule::Math { character, .. } => Some(*character),
+                _ => None,
+            })
+            .collect();
+
         // decpoint and hyphen take precedence over other character definition rules, so insert
         // them first
         for rule in rules {
@@ -1014,6 +1030,8 @@ impl PrimaryTable {
                         builder.insert_backward_indicator_before_letter(&dots.to_string(), rule);
                     }
                 }
+                // like liblouis, a character's own definition wins over its base
+                Rule::Base { derived, .. } if defined_chars.contains(derived) => {}
                 Rule::Base { derived, base, .. } => {
                     if let Some(translation) = ctx.character_definitions().get(base).cloned() {
                         builder.insert_character(*derived, &translation, direction, rule);
@@ -2817,6 +2835,21 @@ mod tests {
             PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
                 .unwrap();
         assert_eq!(table.translate("1a1"), "⠼⠁⠁⠼⠁");
+    }
+
+    #[test]
+    fn own_definition_beats_base() {
+        let rules = [
+            parse_rule("lowercase v 1236"),
+            parse_rule("base uppercase V v"),
+            parse_rule("letter V 1236f"),
+            parse_rule("capsletter 46"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("Vv"), "⠨\u{f4027}⠧");
     }
 
     #[test]

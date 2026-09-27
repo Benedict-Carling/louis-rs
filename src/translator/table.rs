@@ -221,7 +221,9 @@ impl TableContext {
                     name,
                 } => {
                     if let Some(translation) = character_definitions.get(base).cloned() {
-                        character_definitions.insert(*derived, &translation);
+                        if character_definitions.get(derived).is_none() {
+                            character_definitions.insert(*derived, &translation);
+                        }
                         character_classes.insert(CharacterClass::from(name.as_str()), *derived);
                         // Base-derived uppercase/lowercase characters are letters too,
                         // matching what the `uppercase`/`lowercase` opcodes do directly.
