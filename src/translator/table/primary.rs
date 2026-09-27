@@ -142,6 +142,7 @@ pub struct PrimaryTable {
     /// Forward-only: the standing-alone check for `word` and `contraction` rules.
     sequences: Option<Sequences>,
     case: CaseClasses,
+    capsletter_defined: bool,
 }
 
 /// A builder for [`PrimaryTable`]
@@ -170,6 +171,7 @@ struct PrimaryTableBuilder {
     backward_digit_overrides: HashMap<char, ResolvedTranslation>,
     compbrl_triggers: Vec<String>,
     sequences: Option<Sequences>,
+    capsletter_defined: bool,
 }
 
 impl PrimaryTableBuilder {
@@ -202,6 +204,7 @@ impl PrimaryTableBuilder {
             backward_digit_overrides: HashMap::new(),
             compbrl_triggers: Vec::new(),
             sequences: None,
+            capsletter_defined: false,
         }
     }
 
@@ -382,6 +385,7 @@ impl PrimaryTableBuilder {
             direction,
             fallback_definitions: ctx.character_definitions().clone(),
             case: CaseClasses::from_context(ctx),
+            capsletter_defined: self.capsletter_defined,
             trie: self.trie,
             comp6_trie: self.comp6_trie,
             nocross_trie: self.nocross_trie,
@@ -673,6 +677,7 @@ impl PrimaryTable {
                     builder.numeric_constrainer.numericmodechars(chars);
                 }
                 Rule::Capsletter { dots, .. } => {
+                    builder.capsletter_defined = true;
                     builder
                         .uppercase_indicator
                         .capsletter(&dots.to_string(), rule);
@@ -1658,10 +1663,35 @@ impl PrimaryTable {
             }
             _ => true,
         };
+        // liblouis's typebuf: the emphasis classes of each character, plus a capitals bit
+        // when the table defines capsletter
+        let classes: Vec<&str> = options
+            .emphasis()
+            .iter()
+            .map(|s| s.class.as_str())
+            .collect();
+        let typebuf: Vec<u64> = (0..input_chars.len())
+            .map(|pos| {
+                let caps = self.capsletter_defined && self.case.is_uppercase(input_chars[pos]);
+                options
+                    .emphasis()
+                    .iter()
+                    .filter(|span| span.range.contains(&pos))
+                    .filter_map(|span| classes.iter().position(|c| *c == span.class))
+                    .fold(caps as u64, |bits, i| bits | 2 << i.min(62))
+            })
+            .collect();
         let valid_match = |t: &ResolvedTranslation, pos: usize| {
-            self.direction == Direction::Backward
+            if self.direction == Direction::Backward
                 || matches!(t.rule(), Some(Rule::Context { .. }))
-                || self.case.valid_match(&input_chars, pos, t.length())
+            {
+                return true;
+            }
+            let end = (pos + t.length()).min(typebuf.len());
+            let first = typebuf.get(pos).copied().unwrap_or(0);
+            let same_typeform =
+                first & 1 != 0 || typebuf[pos.min(end)..end].iter().all(|k| k & !first == 0);
+            same_typeform && self.case.valid_match(&input_chars, pos, t.length())
         };
         // where liblouis's emphasisBuffer (caps included) marks a begin, end, word or symbol
         let emphasis_at = |caps_only: bool| -> Vec<bool> {
@@ -2607,6 +2637,32 @@ mod tests {
                 .unwrap();
         assert_eq!(table.translate("ab"), "⠏");
         assert_eq!(table.translate("aB"), "⠁⠠⠃");
+    }
+
+    #[test]
+    fn rule_must_not_reach_into_a_typeform_its_first_character_lacks() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("base uppercase A a"),
+            parse_rule("base uppercase B b"),
+            parse_rule("capsletter 6"),
+            parse_rule("always ab 1234"),
+            parse_rule("always abb 123456"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        let italic_b =
+            TranslationOptions::default().with_emphasis(vec![EmphasisSpan::new("italic", 1..2)]);
+        assert_eq!(table.translate_with_options("ab", &italic_b), "⠁⠃");
+        let italic_a =
+            TranslationOptions::default().with_emphasis(vec![EmphasisSpan::new("italic", 0..1)]);
+        assert_eq!(table.translate_with_options("ab", &italic_a), "⠏");
+        // a capital first letter lifts the check
+        assert_eq!(table.translate("Abb"), "⠠⠿");
+        assert_eq!(table.translate("aBb"), "⠁⠠⠃⠃");
     }
 
     #[test]

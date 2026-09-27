@@ -31,6 +31,10 @@ impl CaseClasses {
         )
     }
 
+    pub fn is_uppercase(&self, c: char) -> bool {
+        self.uppercase.contains(&c)
+    }
+
     fn attributes(&self, c: char) -> (bool, bool, bool) {
         (
             self.letters.contains(&c),
