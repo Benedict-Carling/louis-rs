@@ -25,6 +25,7 @@ use crate::{
             Constrainers, HyphenationConstrainerBuilder, NumericConstrainerBuilder,
             PositionConstraints, PunctuationConstrainerBuilder,
         },
+        sequence::{Sequences, whole_word_boundaries},
         table::TableContext,
         translation::TranslationSubset,
         trie::{Transition, Trie},
@@ -137,6 +138,8 @@ pub struct PrimaryTable {
     ///
     /// [`Constraint::PreferDigit`]: crate::translator::position_constraints::Constraint::PreferDigit
     backward_digit_overrides: HashMap<char, ResolvedTranslation>,
+    /// Forward-only: the standing-alone check for `word` and `contraction` rules.
+    sequences: Option<Sequences>,
 }
 
 /// A builder for [`PrimaryTable`]
@@ -164,6 +167,7 @@ struct PrimaryTableBuilder {
     punctuation_constrainer: PunctuationConstrainerBuilder,
     backward_digit_overrides: HashMap<char, ResolvedTranslation>,
     compbrl_triggers: Vec<String>,
+    sequences: Option<Sequences>,
 }
 
 impl PrimaryTableBuilder {
@@ -195,7 +199,12 @@ impl PrimaryTableBuilder {
             punctuation_constrainer: PunctuationConstrainerBuilder::new(),
             backward_digit_overrides: HashMap::new(),
             compbrl_triggers: Vec::new(),
+            sequences: None,
         }
+    }
+
+    fn whole_word_boundaries(&self) -> (Transition, Option<Transition>) {
+        whole_word_boundaries(self.sequences.as_ref())
     }
 
     fn get_trie_mut(&mut self, rule: &AnchoredRule) -> &mut Trie {
@@ -350,14 +359,14 @@ impl PrimaryTableBuilder {
             self.emphasis_indicator.build(ctx).map(Indicator::Emphasis),
             self.numeric_indicator.build().map(Indicator::Numeric),
             self.lettersign_indicator
-                .build(ctx)
+                .build(ctx, self.sequences.clone())
                 .map(Indicator::LetterSign),
             self.uppercase_indicator
                 .build(ctx)
                 .map(Indicator::Uppercase),
             self.mode_indicator.build(ctx).map(Indicator::Mode),
             self.nocontract_indicator
-                .build(ctx)
+                .build(ctx, self.sequences.clone())
                 .map(Indicator::NoContract),
         ]
         .into_iter()
@@ -411,6 +420,7 @@ impl PrimaryTableBuilder {
                 character_classes: ctx.character_classes.clone(),
             }),
             backward_digit_overrides: self.backward_digit_overrides,
+            sequences: self.sequences,
         }
     }
 }
@@ -457,6 +467,9 @@ impl PrimaryTable {
             Direction::Backward => ctx.dots_classes().clone(),
         };
         let mut builder = PrimaryTableBuilder::new(trie_ctx);
+        if direction == Direction::Forward {
+            builder.sequences = Sequences::new(ctx);
+        }
 
         // In literary braille tables, digit and litdigit serve distinct roles:
         //
@@ -845,17 +858,12 @@ impl PrimaryTable {
                         let dots = ctx
                             .character_definitions()
                             .braille_to_unicode(&Braille::Implicit, chars)?;
+                        let (start, end) = builder.whole_word_boundaries();
                         builder.get_trie_mut(rule).insert(
                             chars,
                             &dots,
-                            Some(Transition::Start(vec![
-                                CharacterClass::Space,
-                                CharacterClass::Punctuation,
-                            ])),
-                            Some(Transition::End(vec![
-                                CharacterClass::Space,
-                                CharacterClass::Punctuation,
-                            ])),
+                            Some(start),
+                            end,
                             direction,
                             rule.precedence(),
                             vec![],
@@ -994,17 +1002,12 @@ impl PrimaryTable {
                         .character_definitions()
                         .braille_to_unicode(dots, chars)?;
                     let class_constraints = Self::resolve_class_constraints(ctx, with_classes);
+                    let (start, end) = builder.whole_word_boundaries();
                     builder.get_trie_mut(rule).insert(
                         chars,
                         &dots,
-                        Some(Transition::Start(vec![
-                            CharacterClass::Space,
-                            CharacterClass::Punctuation,
-                        ])),
-                        Some(Transition::End(vec![
-                            CharacterClass::Space,
-                            CharacterClass::Punctuation,
-                        ])),
+                        Some(start),
+                        end,
                         direction,
                         rule.precedence(),
                         class_constraints,
@@ -1606,6 +1609,18 @@ impl PrimaryTable {
 
         let indications = self.indicators.precompute(input, &enriched_spans);
         let constraints = self.constrainers.precompute(input, &enriched_spans);
+        let input_chars: Vec<char> = match self.sequences {
+            Some(_) => input.chars().collect(),
+            None => Vec::new(),
+        };
+        let stands_alone = |t: &ResolvedTranslation, pos: usize| match &self.sequences {
+            Some(sequences)
+                if matches!(t.rule(), Some(Rule::Word { .. } | Rule::Contraction { .. })) =>
+            {
+                sequences.in_sequence(&input_chars, pos, t.length())
+            }
+            _ => true,
+        };
 
         loop {
             if last_indications_pos != Some(char_pos) {
@@ -1621,6 +1636,7 @@ impl PrimaryTable {
             let nocross_candidate = self
                 .nocross_candidates(chars.as_str(), prev, char_pos, &constraints)
                 .into_iter()
+                .filter(|t| stands_alone(t, char_pos))
                 .max_by_key(|t| t.rank());
 
             // given an input query the trie for matching translations. Then split off the
@@ -1656,7 +1672,7 @@ impl PrimaryTable {
             candidates.retain(|t| match t.rule() {
                 Some(Rule::Prepunc { .. }) => constraints.prepunc_ok_at(char_pos),
                 Some(Rule::Postpunc { .. }) => constraints.postpunc_ok_at(char_pos),
-                _ => true,
+                _ => stands_alone(t, char_pos),
             });
 
             // Backward numeric mode: prefer the digit reading of a cell shared with a
@@ -2037,6 +2053,38 @@ mod tests {
         assert_eq!(table.translate("foobar foo"), "⠉⠂⠁⠐⠀⠉"); // bar should not be contracted
         assert_eq!(table.translate("foobar. foo"), "⠉⠂⠁⠐⠠⠀⠉"); // bar should not be contracted
         assert_eq!(table.translate("foo bar foo"), "⠉⠀⠑⠀⠉"); // bar should be contracted
+    }
+
+    #[test]
+    fn word_in_sequence() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("punctuation ! 235"),
+            parse_rule("punctuation ( 5-126"),
+            parse_rule("punctuation ) 5-345"),
+            parse_rule("punctuation - 36"),
+            parse_rule("punctuation ' 3"),
+            parse_rule("lowercase s 234"),
+            parse_rule("space \\s 0"),
+            parse_rule("seqdelimiter -"),
+            parse_rule("seqbeforechars ("),
+            parse_rule("seqafterchars )'"),
+            parse_rule("seqafterpattern 's"),
+            parse_rule("word ab 1456"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("ab"), "⠹");
+        assert_eq!(table.translate("(ab)"), "⠐⠣⠹⠐⠜");
+        assert_eq!(table.translate("-ab-"), "⠤⠹⠤");
+        assert_eq!(table.translate("ab's"), "⠹⠄⠎");
+        // punctuation that is not a sequence character keeps the word from standing alone
+        assert_eq!(table.translate("!ab"), "⠖⠁⠃");
+        assert_eq!(table.translate("ab("), "⠁⠃⠐⠣");
+        assert_eq!(table.translate("ab'b"), "⠁⠃⠄⠃");
     }
 
     #[test]

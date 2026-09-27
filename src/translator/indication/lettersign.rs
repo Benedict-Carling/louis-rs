@@ -20,8 +20,8 @@ use std::collections::HashSet;
 
 use crate::parser::CharacterClass;
 use crate::translator::TranslationStage;
+use crate::translator::sequence::{Sequences, whole_word_boundaries};
 use crate::translator::table::TableContext;
-use crate::translator::trie::Transition;
 use crate::{
     parser::{AnchoredRule, Direction, Precedence},
     translator::{ResolvedTranslation, trie::Trie},
@@ -53,7 +53,7 @@ impl IndicatorBuilder {
     }
 
     /// Build an [`Indicator`]
-    pub fn build(self, ctx: &TableContext) -> Option<Indicator> {
+    pub fn build(self, ctx: &TableContext, sequences: Option<Sequences>) -> Option<Indicator> {
         if self.lettersign.is_none() {
             if !self.contractions.is_empty() {
                 warn!("Table contains contractions but no letsign");
@@ -67,13 +67,13 @@ impl IndicatorBuilder {
 
         let cc = ctx.character_classes();
         let mut trie = Trie::new().with_context(cc.clone());
-        let word_boundary = vec![CharacterClass::Space, CharacterClass::Punctuation];
+        let (start, end) = whole_word_boundaries(sequences.as_ref());
         for (contraction, _origin) in self.contractions {
             trie.insert(
                 &contraction,
                 &lettersign,
-                Some(Transition::Start(word_boundary.clone())),
-                Some(Transition::End(word_boundary.clone())),
+                Some(start.clone()),
+                end.clone(),
                 Direction::Forward,
                 Precedence::Default,
                 vec![],
@@ -101,6 +101,7 @@ impl IndicatorBuilder {
 
         Some(Indicator {
             contractions: trie,
+            sequences,
             start_translation,
             letter_chars,
             space_chars,
@@ -134,6 +135,7 @@ impl IndicatorBuilder {
 #[derive(Debug, Clone)]
 pub struct Indicator {
     contractions: Trie,
+    sequences: Option<Sequences>,
     start_translation: ResolvedTranslation,
     /// Characters that are considered letters (Letter + Uppercase + Lowercase classes).
     letter_chars: HashSet<char>,
@@ -196,7 +198,7 @@ impl Indicator {
             let mut char_pos = 0;
             for (byte_pos, c) in input.char_indices() {
                 if !self.noletsign_chars.contains(&c)
-                    && self.next(&input[byte_pos..], prev).is_some()
+                    && self.contraction_at(&input[byte_pos..], prev, &chars, char_pos)
                 {
                     fire.insert(char_pos);
                 }
@@ -213,14 +215,15 @@ impl Indicator {
         result
     }
 
-    pub fn next(&self, s: &str, prev: Option<char>) -> Option<ResolvedTranslation> {
-        let translations = self.contractions.find_translations(s, prev);
-        if !translations.is_empty() {
-            let translation = translations.first().unwrap();
-            Some(translation.clone().with_input("").with_weight(1))
-        } else {
-            None
-        }
+    fn contraction_at(&self, s: &str, prev: Option<char>, chars: &[char], pos: usize) -> bool {
+        self.contractions
+            .find_translations(s, prev)
+            .iter()
+            .any(|t| {
+                self.sequences
+                    .as_ref()
+                    .is_none_or(|seq| seq.in_sequence(chars, pos, t.length()))
+            })
     }
 }
 
@@ -260,22 +263,16 @@ mod tests {
             (CharacterClass::Space, &[' ']),
         ]);
         let ctx = TableContext::new(cc, CharacterClasses::default(), Default::default());
-        builder.build(&ctx).unwrap()
+        builder.build(&ctx, None).unwrap()
     }
 
     #[test]
     fn contraction_indicator() {
         let indicator = build_indicator(&['a', 'b', 'c', 'd'], &[], Some("ab"));
-        assert_eq!(indicator.next("aa", None), None);
+        assert!(indicator.precompute("aa").is_empty());
         assert_eq!(
-            indicator.next("ab", None),
-            Some(ResolvedTranslation::new(
-                "",
-                "⠠",
-                1,
-                TranslationStage::Main,
-                rule("letsign 6")
-            ))
+            pairs(&indicator.precompute("ab")),
+            vec![(0, "⠠".to_string())]
         );
     }
 
@@ -311,7 +308,7 @@ mod tests {
             (CharacterClass::Space, &[' ']),
         ]);
         let ctx = TableContext::new(cc, CharacterClasses::default(), Default::default());
-        let indicator = builder.build(&ctx).unwrap();
+        let indicator = builder.build(&ctx, None).unwrap();
 
         // 'i' is listed in noletsign: never gets a letsign, even isolated after a
         // non-space, non-letter character.
@@ -331,7 +328,7 @@ mod tests {
         builder.noletsign("a");
         let cc = CharacterClasses::new(&[(CharacterClass::Letter, &['a', 'b'])]);
         let ctx = TableContext::new(cc, CharacterClasses::default(), Default::default());
-        let indicator = builder.build(&ctx).unwrap();
+        let indicator = builder.build(&ctx, None).unwrap();
 
         // "ab" is a contraction, but 'a' is listed in noletsign, so no letsign fires.
         assert_eq!(pairs(&indicator.precompute("ab")), vec![]);
@@ -359,7 +356,7 @@ mod tests {
             (CharacterClass::Space, &[' ']),
         ]);
         let ctx = TableContext::new(cc, CharacterClasses::default(), Default::default());
-        let indicator = builder.build(&ctx).unwrap();
+        let indicator = builder.build(&ctx, None).unwrap();
 
         // noletsignafter '2' suppresses the letsign for "3b2" -- '2' follows the letter
         assert_eq!(pairs(&indicator.precompute("3b2")), vec![]);
@@ -378,7 +375,7 @@ mod tests {
         builder.contraction("cd", &rule("contraction cd"));
         let cc = CharacterClasses::new(&[(CharacterClass::Letter, &['a', 'b', 'c', 'd'])]);
         let ctx = TableContext::new(cc, CharacterClasses::default(), Default::default());
-        let indicator = builder.build(&ctx).unwrap();
+        let indicator = builder.build(&ctx, None).unwrap();
 
         assert_eq!(pairs(&indicator.precompute("aa")), vec![]);
         assert_eq!(
