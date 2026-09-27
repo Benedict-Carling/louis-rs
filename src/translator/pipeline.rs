@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use crate::{
     Direction,
+    emphasis::EmphasisSpan,
     parser::{AnchoredRule, BrailleChars, CharacterClass, Constraints, HasDirection, Rule},
     translator::{
         PositionMap, ResolvedTranslation, TranslationError, TranslationOptions, TranslationStage,
@@ -73,6 +74,38 @@ fn with_grouping_characters(rules: &[AnchoredRule]) -> Vec<AnchoredRule> {
         }
     }
     expanded
+}
+
+/// The emphasis of the text a stage put out: liblouis gives every character the typeform of
+/// the input character its step started at
+fn remap_emphasis(spans: &[EmphasisSpan], steps: &[ResolvedTranslation]) -> Vec<EmphasisSpan> {
+    if spans.is_empty() {
+        return Vec::new();
+    }
+    let mut sources = Vec::new();
+    let mut input_offset = 0;
+    for step in steps {
+        sources.extend(std::iter::repeat_n(
+            input_offset,
+            step.output().chars().count(),
+        ));
+        input_offset += step.input().chars().count();
+    }
+    let mut remapped: Vec<EmphasisSpan> = Vec::new();
+    for span in spans {
+        for (k, source) in sources.iter().enumerate() {
+            if !span.range.contains(source) {
+                continue;
+            }
+            match remapped.last_mut() {
+                Some(last) if last.class == span.class && last.range.end == k => {
+                    last.range.end = k + 1
+                }
+                _ => remapped.push(EmphasisSpan::new(span.class.clone(), k..k + 1)),
+            }
+        }
+    }
+    remapped
 }
 
 #[derive(Debug)]
@@ -203,9 +236,14 @@ impl TranslationPipeline {
         options: &TranslationOptions,
     ) -> Vec<Vec<ResolvedTranslation>> {
         let mut input = input.to_string();
+        let mut options = options.clone();
         let mut result: Vec<Vec<ResolvedTranslation>> = Vec::new();
         for step in &self.steps {
-            let translations = step.trace(&input, options);
+            let translations = step.trace(&input, &options);
+            if matches!(step, Transformation::Pre(_)) {
+                let emphasis = remap_emphasis(options.emphasis(), &translations);
+                options = options.with_emphasis(emphasis);
+            }
             input = translations.iter().map(|t| t.output()).collect();
             result.push(translations);
         }
@@ -222,8 +260,16 @@ impl TranslationPipeline {
 
     pub fn translate_with_options(&self, input: &str, options: &TranslationOptions) -> String {
         let mut result = input.to_string();
+        let mut options = options.clone();
         for step in &self.steps {
-            result = step.translate_with_options(&result, options);
+            if matches!(step, Transformation::Pre(_)) {
+                let translations = step.trace(&result, &options);
+                let emphasis = remap_emphasis(options.emphasis(), &translations);
+                options = options.with_emphasis(emphasis);
+                result = translations.iter().map(|t| t.output()).collect();
+            } else {
+                result = step.translate_with_options(&result, &options);
+            }
         }
         result
     }
@@ -384,6 +430,23 @@ mod tests {
         // `*@136` copies the accent out of the bracket and consumes the whole match,
         // so the @135 and @13456 cells around it are replaced, not kept
         assert_eq!(pipeline.translate("oύ"), "⠐⠥");
+    }
+
+    #[test]
+    fn emphasis_follows_the_corrected_text() {
+        let steps = [
+            ResolvedTranslation::new("foo", "foobar", 3, TranslationStage::Pre, None),
+            ResolvedTranslation::new(" ", " ", 1, TranslationStage::Pre, None),
+            ResolvedTranslation::new("b", "b", 1, TranslationStage::Pre, None),
+        ];
+        assert_eq!(
+            remap_emphasis(&[EmphasisSpan::new("italic", 3..5)], &steps),
+            [EmphasisSpan::new("italic", 6..8)]
+        );
+        assert_eq!(
+            remap_emphasis(&[EmphasisSpan::new("bold", 0..1)], &steps),
+            [EmphasisSpan::new("bold", 0..6)]
+        );
     }
 
     #[test]
