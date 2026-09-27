@@ -35,6 +35,9 @@ pub enum Constraint {
     /// class) that the word's hyphenation dictionary marks as a valid break point.
     /// Consulted to decide whether a `nocross` rule may cross this gap.
     HyphenationBreak,
+    /// This character and the next are both letters, in forward translation. A `nocross`
+    /// rule is only checked for breaks within the word it starts in.
+    LetterGap,
     /// A `prepunc` rule may fire on the punctuation character at this position, in
     /// forward translation.
     PrepuncOk,
@@ -59,6 +62,17 @@ impl PositionConstraints {
             .is_some_and(|f| f.contains(Constraint::DontContract))
     }
 
+    /// Translate `range` in computer braille, as liblouis's `compbrlAtCursor` does for the
+    /// word under the cursor.
+    pub fn with_comp6(mut self, range: std::ops::Range<usize>) -> Self {
+        for pos in range {
+            if let Some(constraints) = self.0.get_mut(pos) {
+                constraints.insert(Constraint::UseComp6);
+            }
+        }
+        self
+    }
+
     pub fn use_comp6_at(&self, pos: usize) -> bool {
         self.0
             .get(pos)
@@ -69,6 +83,12 @@ impl PositionConstraints {
         self.0
             .get(pos)
             .is_some_and(|f| f.contains(Constraint::HyphenationBreak))
+    }
+
+    pub fn letter_gap_at(&self, pos: usize) -> bool {
+        self.0
+            .get(pos)
+            .is_some_and(|f| f.contains(Constraint::LetterGap))
     }
 
     pub fn prepunc_ok_at(&self, pos: usize) -> bool {
@@ -163,13 +183,24 @@ impl HyphenationConstrainer {
         constraints
     }
 
-    /// Marks the breaks of the word spanning `chars[start..end]` at their
-    /// absolute positions in `constraints`.
+    /// Marks the gaps of the word spanning `chars[start..end]` at their absolute positions
+    /// in `constraints`, lowercasing it first as liblouis's `hyphenateWord` does.
     fn mark_word(&self, constraints: &mut [Constraints], chars: &[char], start: usize, end: usize) {
-        let word: String = chars[start..end].iter().collect();
-        for (i, is_break) in self.hyphenator.break_points(&word).into_iter().enumerate() {
-            if is_break {
-                constraints[start + i].insert(Constraint::HyphenationBreak);
+        let word: Vec<char> = chars[start..end]
+            .iter()
+            .map(|&c| {
+                let mut lower = c.to_lowercase();
+                match (lower.next(), lower.next()) {
+                    (Some(l), None) => l,
+                    _ => c,
+                }
+            })
+            .collect();
+        let hyphens = self.hyphenator.hyphens(&word);
+        for pos in start..end - 1 {
+            constraints[pos].insert(Constraint::LetterGap);
+            if hyphens[pos + 1 - start] % 2 == 1 {
+                constraints[pos].insert(Constraint::HyphenationBreak);
             }
         }
     }
@@ -249,7 +280,6 @@ impl ComputerBrailleConstrainer {
     }
 }
 
-/// Returns true if `chars[pos..]` starts with `pattern`.
 /// A single analysis pass that contributes to [`PositionConstraints`].
 #[derive(Debug, Clone)]
 pub enum Constrainer {
