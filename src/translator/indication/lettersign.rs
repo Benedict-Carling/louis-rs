@@ -9,12 +9,12 @@
 //! lettersign translation at that position.
 //!
 //! In addition, the indicator fires for any isolated letter (not followed by another letter)
-//! whose preceding character is neither a space nor a letter — for example, a letter at string
-//! start before punctuation (`b:`), or a Tamil consonant followed by a vowel sign or virama.
-//! Letters preceded by a space (word boundary) or by another letter (tail of a letter run) do not fire.
+//! that does not follow a letter, as liblouis's `insertLetterSign` does — for example a
+//! letter standing alone as a word, or a Tamil consonant followed by a vowel sign or virama.
 //! The `noletsignafter` and `noletsignbefore` opcodes list characters adjacent to a letter that
 //! suppress the indicator. The `noletsign` opcode lists letters that must never themselves be
-//! preceded by a letter sign, regardless of context.
+//! preceded by a letter sign, regardless of context; tables also get every letter that is a
+//! `word` or `largesign` by itself.
 
 use std::collections::HashSet;
 

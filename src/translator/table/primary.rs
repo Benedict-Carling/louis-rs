@@ -6,8 +6,8 @@ use crate::{
     Direction,
     emphasis::EmphasisSpan,
     parser::{
-        AnchoredRule, Braille, BrailleChars, CharacterClass, CharacterClasses, HasNocross,
-        HasPrecedence, WithClass, WithMatch,
+        AnchoredRule, Braille, BrailleChars, CharacterClass, CharacterClasses, HasDirection,
+        HasNocross, HasPrecedence, WithClass, WithMatch,
     },
     translator::{
         CharacterDefinition, ClassConstraint, ResolvedTranslation, Rule, TranslationError,
@@ -186,9 +186,10 @@ struct PrimaryTableBuilder {
 impl PrimaryTableBuilder {
     /// finalizeTable: a letter with a single-letter `word` or `largesign` rule never takes
     /// the letter sign.
-    fn noletsign_if_single_letter(&mut self, chars: &str, ctx: &TableContext) {
+    fn noletsign_if_single_letter(&mut self, rule: &AnchoredRule, chars: &str, ctx: &TableContext) {
         let mut letters = chars.chars();
-        if let (Some(c), None) = (letters.next(), letters.next())
+        if rule.is_direction(Direction::Forward)
+            && let (Some(c), None) = (letters.next(), letters.next())
             && ctx
                 .character_classes()
                 .get(&CharacterClass::Letter)
@@ -1032,7 +1033,7 @@ impl PrimaryTable {
                     builder.compbrl_triggers.push(chars.clone());
                 }
                 Rule::Largesign { chars, dots } => {
-                    builder.noletsign_if_single_letter(chars, ctx);
+                    builder.noletsign_if_single_letter(rule, chars, ctx);
                     builder.get_trie_mut(rule).insert(
                         chars,
                         &dots.to_string(),
@@ -1051,7 +1052,7 @@ impl PrimaryTable {
                     with_classes,
                     ..
                 } => {
-                    builder.noletsign_if_single_letter(chars, ctx);
+                    builder.noletsign_if_single_letter(rule, chars, ctx);
                     let dots = ctx
                         .character_definitions()
                         .braille_to_unicode(dots, chars)?;
@@ -1325,7 +1326,7 @@ impl PrimaryTable {
                         CharacterClass::Space,
                         CharacterClass::Punctuation,
                     ])),
-                    // the rest of liblouis's forward check is in `join_following_spaces`
+                    // the rest of liblouis's forward check is in `joins_ahead`
                     Some(Transition::End(match direction {
                         Direction::Forward => vec![CharacterClass::Space],
                         Direction::Backward => {
@@ -1661,28 +1662,6 @@ impl PrimaryTable {
             .collect()
     }
 
-    /// liblouis's `joinword`: valid only when spaces and then a letter follow
-    /// (`onlyLettersAhead`). The spaces count towards its weight; the translation loop
-    /// swallows them once it is chosen.
-    fn join_following_spaces(
-        &self,
-        t: ResolvedTranslation,
-        chars: &[char],
-        pos: usize,
-    ) -> Option<ResolvedTranslation> {
-        let end = pos + t.length();
-        let spaces = chars[end.min(chars.len())..]
-            .iter()
-            .take_while(|c| self.space_chars.contains(c))
-            .count();
-        let next = chars.get(end + spaces)?;
-        if spaces == 0 || !self.letter_or_litdigit_chars.contains(next) {
-            return None;
-        }
-        let weight = t.weight() + spaces + 1;
-        Some(t.with_weight(weight))
-    }
-
     /// liblouis's `markSyllables`: each `syllable` match, and everything after it up to the
     /// next one, gets one of two alternating marks, so no rule can span a syllable boundary.
     fn syllable_marks(&self, chars: &[char]) -> Vec<u64> {
@@ -1941,27 +1920,30 @@ impl PrimaryTable {
             // definition (`character_translations`), matching liblouis.
             candidates.retain(|t| valid_match(t, char_pos) && emphasis_allows(t, char_pos));
 
-            if self.direction == Direction::Forward {
-                candidates = candidates
-                    .into_iter()
-                    .filter_map(|t| match t.rule() {
-                        Some(Rule::Joinword { .. }) => {
-                            self.join_following_spaces(t, &input_chars, char_pos)
-                        }
-                        _ => Some(t),
-                    })
-                    .collect();
-            }
-
             candidates.retain(|t| match t.rule() {
                 _ if self.backward.is_some() => true,
-                Some(Rule::Joinnum { .. }) => {
-                    self.number_follows(&chars.as_str()[t.input().len()..])
+                Some(Rule::Joinword { .. } | Rule::Joinnum { .. })
+                    if self.direction == Direction::Forward =>
+                {
+                    self.joins_ahead(t, chars.as_str())
                 }
                 Some(Rule::Prepunc { .. }) => constraints.prepunc_ok_at(char_pos),
                 Some(Rule::Postpunc { .. }) => constraints.postpunc_ok_at(char_pos),
                 _ => stands_alone(t, char_pos),
             });
+            // the word a joinword or joinnum joins onto is one more condition it checks
+            if self.direction == Direction::Forward {
+                candidates = candidates
+                    .into_iter()
+                    .map(|t| match t.rule() {
+                        Some(Rule::Joinword { .. } | Rule::Joinnum { .. }) => {
+                            let weight = t.weight() + 1;
+                            t.with_weight(weight)
+                        }
+                        _ => t,
+                    })
+                    .collect();
+            }
 
             if self.direction == Direction::Forward {
                 candidates.retain(selectable);
@@ -2083,45 +2065,24 @@ impl PrimaryTable {
                 translations.push(translation);
                 delayed_translations = self.update_offsets(delayed_translations, t.length());
                 delayed_translations.extend(self.match_candidates_within(consumed, t.length()));
-                // liblouis' joinnum swallows the spaces between it and the number
-                if matches!(t.rule(), Some(Rule::Joinnum { .. })) {
-                    while let Some(c) = chars.clone().next()
-                        && self.space_chars.contains(&c)
+                // liblouis drops the spaces after a joinword or joinnum
+                if self.direction == Direction::Forward
+                    && matches!(t.rule(), Some(Rule::Joinword { .. } | Rule::Joinnum { .. }))
+                {
+                    while let Some(space) = chars.clone().next()
+                        && self.space_chars.contains(&space)
                     {
                         chars.next();
+                        prev = Some(space);
                         char_pos += 1;
                         translations.push(ResolvedTranslation::new(
-                            &c.to_string(),
+                            &space.to_string(),
                             "",
                             1,
                             TranslationStage::Main,
-                            t.origin(),
-                        ));
-                        delayed_translations = self.update_offsets(delayed_translations, 1);
-                    }
-                }
-
-                if self.direction == Direction::Forward
-                    && matches!(t.rule(), Some(Rule::Joinword { .. }))
-                {
-                    let spaces: String = chars
-                        .as_str()
-                        .chars()
-                        .take_while(|c| self.space_chars.contains(c))
-                        .collect();
-                    let n = spaces.chars().count();
-                    if n > 0 {
-                        chars.nth(n - 1);
-                        prev = spaces.chars().last();
-                        char_pos += n;
-                        translations.push(ResolvedTranslation::new(
-                            &spaces,
-                            "",
-                            n,
-                            TranslationStage::Main,
                             None,
                         ));
-                        delayed_translations = self.update_offsets(delayed_translations, n);
+                        delayed_translations = self.update_offsets(delayed_translations, 1);
                     }
                 }
 
@@ -2171,11 +2132,20 @@ impl PrimaryTable {
         translations
     }
 
-    /// Whether the first character after the spaces at the start of `rest` is a digit
-    fn number_follows(&self, rest: &str) -> bool {
-        rest.chars()
-            .find(|c| !self.space_chars.contains(c))
-            .is_some_and(|c| self.digit_chars.contains(&c))
+    /// liblouis's forward check for `joinword` (`onlyLettersAhead`) and `joinnum`: the
+    /// match is followed by spaces and then by a letter or litdigit, or a digit for `joinnum`.
+    fn joins_ahead(&self, t: &ResolvedTranslation, input: &str) -> bool {
+        let mut rest = input.chars().skip(t.length()).peekable();
+        if !rest.peek().is_some_and(|c| self.space_chars.contains(c)) {
+            return false;
+        }
+        let Some(next) = rest.find(|c| !self.space_chars.contains(c)) else {
+            return false;
+        };
+        match t.rule() {
+            Some(Rule::Joinnum { .. }) => self.digit_chars.contains(&next),
+            _ => self.letter_or_litdigit_chars.contains(&next),
+        }
     }
 
     fn handle_undefined_char(&self, ch: char) -> String {
@@ -2887,6 +2857,64 @@ mod tests {
         assert_eq!(table.translate("cd"), "⠠⠉⠙");
         assert_eq!(table.translate("abcd"), "⠁⠃⠉⠙");
         assert_eq!(table.translate("ef"), "⠑⠋");
+    }
+
+    fn forward_table(rules: &[&str]) -> PrimaryTable {
+        let rules: Vec<AnchoredRule> = rules.iter().map(|r| parse_rule(r)).collect();
+        let context = TableContext::compile(&rules).unwrap();
+        PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context).unwrap()
+    }
+
+    #[test]
+    fn joinnum_joins_onto_a_following_number() {
+        let table = forward_table(&[
+            "space \\s 0",
+            "digit 1 1",
+            "digit 2 12",
+            "litdigit 1 1",
+            "litdigit 2 12",
+            "lowercase a 1",
+            "numsign 3456",
+            "math + 235",
+            "joinnum + 56-235",
+        ]);
+        assert_eq!(table.translate("1 + 2"), "⠼⠁⠀⠰⠖⠼⠃");
+        assert_eq!(table.translate("1 + a"), "⠼⠁⠀⠖⠀⠁");
+        assert_eq!(table.translate("+"), "⠖");
+    }
+
+    #[test]
+    fn joinword_joins_onto_a_following_word() {
+        let table = forward_table(&[
+            "space \\s 0",
+            "lowercase c 14",
+            "lowercase e 15",
+            "lowercase h 125",
+            "lowercase t 2345",
+            "punctuation . 256",
+            "joinword the 2346",
+            "word the 2346",
+        ]);
+        assert_eq!(table.translate("the cet"), "⠮⠉⠑⠞");
+        assert_eq!(table.translate("the"), "⠮");
+        assert_eq!(table.translate("the. cet"), "⠮⠲⠀⠉⠑⠞");
+    }
+
+    #[test]
+    fn single_letter_word_takes_no_letsign() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase u 136"),
+            parse_rule("letsign 56"),
+            parse_rule("word u 136"),
+            parse_rule("nofor word a 1"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("u"), "⠥");
+        assert_eq!(table.translate("a"), "⠰⠁");
     }
 
     #[test]

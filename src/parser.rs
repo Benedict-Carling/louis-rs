@@ -952,6 +952,9 @@ impl std::fmt::Display for Rule {
             Rule::Display {
                 character, dots, ..
             } => write!(f, "display {} {}", character, dots),
+            Rule::Joinword { chars, dots, .. } => write!(f, "joinword {} {}", chars, dots),
+            Rule::Joinnum { chars, dots, .. } => write!(f, "joinnum {} {}", chars, dots),
+            Rule::Lowword { chars, dots, .. } => write!(f, "lowword {} {}", chars, dots),
             _ => todo!(),
         }
     }
