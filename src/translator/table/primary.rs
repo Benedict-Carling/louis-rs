@@ -177,6 +177,20 @@ struct PrimaryTableBuilder {
 }
 
 impl PrimaryTableBuilder {
+    /// finalizeTable: a letter with a single-letter `word` or `largesign` rule never takes
+    /// the letter sign.
+    fn noletsign_if_single_letter(&mut self, chars: &str, ctx: &TableContext) {
+        let mut letters = chars.chars();
+        if let (Some(c), None) = (letters.next(), letters.next())
+            && ctx
+                .character_classes()
+                .get(&CharacterClass::Letter)
+                .is_some_and(|letters| letters.contains(&c))
+        {
+            self.lettersign_indicator.noletsign(chars);
+        }
+    }
+
     /// `trie_ctx` must be the character classes to resolve `Transition`/`ClassConstraint`
     /// boundary checks against: text classes for forward translation, dots classes for
     /// backward. The tries need it from construction on, since `Trie::insert` resolves those
@@ -1017,6 +1031,7 @@ impl PrimaryTable {
                     builder.compbrl_triggers.push(chars.clone());
                 }
                 Rule::Largesign { chars, dots } => {
+                    builder.noletsign_if_single_letter(chars, ctx);
                     builder.get_trie_mut(rule).insert(
                         chars,
                         &dots.to_string(),
@@ -1035,6 +1050,7 @@ impl PrimaryTable {
                     with_classes,
                     ..
                 } => {
+                    builder.noletsign_if_single_letter(chars, ctx);
                     let dots = ctx
                         .character_definitions()
                         .braille_to_unicode(dots, chars)?;
@@ -2771,6 +2787,26 @@ mod tests {
         assert_eq!(table.translate("a  b"), "⠁⠂⠃");
         assert_eq!(table.translate("a ."), "⠁⠐⠀⠲");
         assert_eq!(table.translate("a"), "⠁⠐");
+    }
+
+    #[test]
+    fn single_letter_word_rule_means_no_letter_sign() {
+        let rules = [
+            parse_rule("lowercase i 24"),
+            parse_rule("lowercase b 12"),
+            parse_rule("punctuation : 25"),
+            parse_rule("letsign 56"),
+            parse_rule("word i 24"),
+            parse_rule("contraction ib"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate(":i"), "⠒⠊");
+        assert_eq!(table.translate(":b"), "⠒⠰⠃");
+        // the letter sign before a contraction ignores noletsign
+        assert_eq!(table.translate("ib"), "⠰⠊⠃");
     }
 
     #[test]
