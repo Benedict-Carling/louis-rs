@@ -973,6 +973,23 @@ impl PrimaryTable {
                         rule,
                     );
                 }
+                // liblouis has no backward single-cell `repeated` rule: it would be too ambiguous
+                Rule::Repeated { chars, dots, .. }
+                    if !(direction == Direction::Backward && dots.len() == 1) =>
+                {
+                    let dots = dots.to_string();
+                    builder.get_trie_mut(rule).insert(
+                        chars,
+                        &dots,
+                        None,
+                        None,
+                        direction,
+                        rule.precedence(),
+                        vec![],
+                        TranslationStage::Main,
+                        rule,
+                    );
+                }
                 // A syllable is an unconditional substitution, like `always`. However it also
                 // restricts other contractions from crossing a syllable's boundaries, which is
                 // not implemented here.
@@ -2095,6 +2112,32 @@ impl PrimaryTable {
                 translations.push(translation);
                 delayed_translations = self.update_offsets(delayed_translations, t.length());
                 delayed_translations.extend(self.match_candidates_within(consumed, t.length()));
+                // liblouis skips the repetitions that follow a `repeated` rule
+                if self.direction == Direction::Forward
+                    && matches!(t.rule(), Some(Rule::Repeated { .. }))
+                {
+                    let repeat: Vec<char> = t.input().to_lowercase().chars().collect();
+                    while !repeat.is_empty()
+                        && chars
+                            .clone()
+                            .take(repeat.len())
+                            .flat_map(char::to_lowercase)
+                            .eq(repeat.iter().copied())
+                    {
+                        let skipped: String = chars.by_ref().take(repeat.len()).collect();
+                        prev = skipped.chars().last();
+                        char_pos += repeat.len();
+                        translations.push(ResolvedTranslation::new(
+                            &skipped,
+                            "",
+                            repeat.len(),
+                            TranslationStage::Main,
+                            None,
+                        ));
+                        delayed_translations =
+                            self.update_offsets(delayed_translations, repeat.len());
+                    }
+                }
                 // liblouis drops the spaces after a joinword or joinnum
                 if self.direction == Direction::Forward
                     && matches!(t.rule(), Some(Rule::Joinword { .. } | Rule::Joinnum { .. }))
