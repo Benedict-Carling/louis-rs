@@ -1906,7 +1906,12 @@ impl PrimaryTable {
                 }
             }
             context_due = true;
-            if last_indications_pos != Some(char_pos) {
+            // liblouis puts out the word under the cursor without indicators
+            if last_indications_pos != Some(char_pos)
+                && !cursor_word
+                    .as_ref()
+                    .is_some_and(|word| word.contains(&char_pos))
+            {
                 translations.extend(indications.translations_at(char_pos));
                 last_indications_pos = Some(char_pos);
             }
