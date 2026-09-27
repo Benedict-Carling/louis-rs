@@ -369,6 +369,7 @@ impl ContextPatternsBuilder {
     pub fn build(self) -> ContextPatterns {
         ContextPatterns {
             regexps: self.regexps,
+            direction: self.direction,
         }
     }
 }
@@ -376,6 +377,7 @@ impl ContextPatternsBuilder {
 #[derive(Debug)]
 pub struct ContextPatterns {
     regexps: Vec<Pattern>,
+    direction: Direction,
 }
 
 impl ContextPatterns {
@@ -401,7 +403,16 @@ impl ContextPatterns {
                     let length = t.length().checked_sub(n)?;
                     Some(t.with_length(length))
                 } else {
-                    (t.offset() >= n).then(|| t.decrement_offset(n))
+                    if t.offset() >= n {
+                        Some(t.decrement_offset(n))
+                    } else if self.direction == Direction::Backward {
+                        // liblouis's back_passDoTest lets the replacement start before the
+                        // match, and the cells before the match come out a second time
+                        let length = (t.offset() + t.length()).checked_sub(n)?;
+                        (length > 0).then(|| t.with_offset(0).with_length(length))
+                    } else {
+                        None
+                    }
                 }
             })
             .collect()
@@ -966,6 +977,30 @@ mod tests {
         // does not fire when the preceding character isn't a digit, or there is none
         assert!(patterns.find("b", "b", &env).is_empty());
         assert!(patterns.find("", "ab", &env).is_empty());
+    }
+
+    #[test]
+    fn backward_lookback_may_replace_before_the_match() {
+        // liblouis's back_passDoTest has no check that the replacement starts at or after
+        // the match, so the cell stepped back over comes out a second time
+        let env = Environment::new();
+        let tests = test::Parser::new(r#"_1["ab"]"#).tests().unwrap();
+        let action = action::Parser::new(r#""X""#).actions().unwrap();
+        let origin = origin(r#"pass2 _1["ab"] "X""#);
+        let mut builder = ContextPatternsBuilder::new().for_direction(Direction::Backward);
+        builder
+            .insert(
+                &tests,
+                &action,
+                &origin,
+                TranslationStage::Post1,
+                &TableContext::default(),
+            )
+            .unwrap();
+        let patterns = builder.build();
+        let found = patterns.find("a", "b", &env);
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].offset(), found[0].length()), (0, 1));
     }
 
     #[test]
