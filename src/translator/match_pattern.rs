@@ -37,7 +37,13 @@ impl Regexp {
             Pattern::Group(patterns) => {
                 Regexp::Group(Box::new(Regexp::from_patterns(patterns, ctx)))
             }
-            Pattern::Negate(pattern) => Regexp::from_pattern(pattern, ctx).negate(),
+            // liblouis negates only the attribute test: a character must still be there
+            Pattern::Negate(pattern) => match pattern.as_ref() {
+                Pattern::AttributesOrBoundary(hash_set, _) => {
+                    Regexp::from_attributes(hash_set, ctx).negate()
+                }
+                pattern => Regexp::from_pattern(pattern, ctx).negate(),
+            },
             Pattern::Optional(pattern) => {
                 Regexp::Optional(Box::new(Regexp::from_pattern(pattern, ctx)))
             }

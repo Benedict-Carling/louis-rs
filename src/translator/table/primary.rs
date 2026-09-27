@@ -2323,6 +2323,23 @@ mod tests {
     }
 
     #[test]
+    fn match_negated_attribute_or_boundary() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 2"),
+            parse_rule("space \\s 0"),
+            parse_rule("match !%[^_] b - 3"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("ab"), "⠁⠄");
+        assert_eq!(table.translate("b"), "⠂");
+        assert_eq!(table.translate("a b"), "⠁⠀⠂");
+    }
+
+    #[test]
     fn match_with_set() {
         let rules = [
             parse_rule("lowercase f 3"),
