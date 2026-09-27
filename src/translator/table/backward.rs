@@ -207,7 +207,7 @@ impl BackwardSelector {
                 }
                 Rule::Sign { dots, .. } => (&[CharacterClass::Sign], dots),
                 Rule::Math { dots, .. } => (&[CharacterClass::Math], dots),
-                Rule::Attribute { name, chars } => {
+                Rule::Attribute { name, chars } | Rule::Class { name, chars } => {
                     let class = CharacterClass::from(name.as_str());
                     for c in chars.chars() {
                         dots_classes.insert_associated_dot(

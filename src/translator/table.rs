@@ -280,7 +280,7 @@ impl TableContext {
                         }
                     }
                 }
-                Rule::Attribute { name, chars } => {
+                Rule::Attribute { name, chars } | Rule::Class { name, chars } => {
                     let class = CharacterClass::from(name.as_str());
                     for c in chars.chars() {
                         character_classes.insert(class.clone(), c);
@@ -419,6 +419,17 @@ mod tests {
 
     fn parse_rule(source: &str) -> AnchoredRule {
         RuleParser::new(source).rule().unwrap().into()
+    }
+
+    #[test]
+    fn class_is_an_alias_of_attribute() {
+        let context = TableContext::compile(&[parse_rule("class foo ab")]).unwrap();
+        assert_eq!(
+            context
+                .character_classes
+                .get(&CharacterClass::UserDefined("foo".to_string())),
+            Some(HashSet::from(['a', 'b']))
+        );
     }
 
     #[test]
