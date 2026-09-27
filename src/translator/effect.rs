@@ -22,6 +22,7 @@ impl Effect {
     }
 }
 
+#[derive(Clone)]
 pub struct Environment(HashMap<u8, u8>);
 
 impl Environment {

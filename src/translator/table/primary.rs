@@ -149,6 +149,9 @@ pub struct PrimaryTable {
     capsletter_defined: bool,
     syllables: Vec<Vec<char>>,
     letter_or_litdigit_chars: HashSet<char>,
+    /// Space and seqdelimiter characters, where liblouis's current word starts and its
+    /// no-contraction mode ends
+    word_delimiters: HashSet<char>,
 }
 
 /// A builder for [`PrimaryTable`]
@@ -380,6 +383,10 @@ impl PrimaryTableBuilder {
         PrimaryTable {
             undefined: self.undefined,
             space_chars: class(CharacterClass::Space),
+            word_delimiters: [CharacterClass::Space, CharacterClass::Seqdelimiter]
+                .into_iter()
+                .flat_map(class)
+                .collect(),
             digit_chars: class(CharacterClass::Digit),
             character_translations: self.character_translations,
             direction,
@@ -1036,6 +1043,19 @@ impl PrimaryTable {
                     builder.get_trie_mut(rule).insert(
                         chars,
                         &other.to_string(),
+                        None,
+                        None,
+                        direction,
+                        rule.precedence(),
+                        vec![],
+                        TranslationStage::Main,
+                        rule,
+                    );
+                }
+                Rule::Nocont { chars } if direction == Direction::Forward => {
+                    builder.get_trie_mut(rule).insert(
+                        chars,
+                        "",
                         None,
                         None,
                         direction,
@@ -1879,8 +1899,46 @@ impl PrimaryTable {
         // a `context` rule liblouis files among its pass rules, due at the current position
         let mut forced: Option<ResolvedTranslation> = None;
         let mut forced_begun_before = false;
+        // liblouis's lastWord: the state at the start of the current word, which a nocont
+        // rule goes back to before translating the word without contractions
+        struct WordStart<'a> {
+            char_pos: usize,
+            translations: usize,
+            chars: std::str::Chars<'a>,
+            prev: Option<char>,
+            delayed: Vec<ResolvedTranslation>,
+            env: Environment,
+            forced: Option<ResolvedTranslation>,
+            forced_begun_before: bool,
+        }
+        let mut word: Option<WordStart> = None;
+        let mut nocont = false;
 
         loop {
+            if self.direction == Direction::Forward {
+                let delimiter = |pos: usize| {
+                    input_chars
+                        .get(pos)
+                        .is_some_and(|c| self.word_delimiters.contains(c))
+                };
+                if delimiter(char_pos) {
+                    nocont = false;
+                }
+                if (char_pos == 0 || delimiter(char_pos - 1))
+                    && word.as_ref().is_none_or(|w| w.char_pos != char_pos)
+                {
+                    word = Some(WordStart {
+                        char_pos,
+                        translations: translations.len(),
+                        chars: chars.clone(),
+                        prev,
+                        delayed: delayed_translations.clone(),
+                        env: env.clone(),
+                        forced: forced.clone(),
+                        forced_begun_before,
+                    });
+                }
+            }
             starts.insert(char_pos);
             let mut pending_indications = Vec::new();
             if last_indications_pos != Some(char_pos) {
@@ -1897,7 +1955,7 @@ impl PrimaryTable {
 
             // First check for nocross candidates
             // the checks of liblouis's `for_selectRule` that depend on indication state
-            let dont_contract = constraints.dont_contract_at(char_pos);
+            let dont_contract = constraints.dont_contract_at(char_pos) || nocont;
             let selectable =
                 |t: &ResolvedTranslation| !(dont_contract && t.rule().is_some_and(is_contraction));
 
@@ -2103,6 +2161,24 @@ impl PrimaryTable {
                 delayed_translations = self.update_offsets(delayed_translations, nocross.length());
                 delayed_translations
                     .extend(self.match_candidates_within(consumed, nocross.length()));
+            } else if let Some(t) = candidate
+                && matches!(t.rule(), Some(Rule::Nocont { .. }))
+            {
+                // translate the word again from its start, without contractions
+                if let Some(w) = &word {
+                    translations.truncate(w.translations);
+                    chars = w.chars.clone();
+                    char_pos = w.char_pos;
+                    prev = w.prev;
+                    delayed_translations = w.delayed.clone();
+                    env = w.env.clone();
+                    forced = w.forced.clone();
+                    forced_begun_before = w.forced_begun_before;
+                    seen.clear();
+                    stalled_rank = None;
+                    last_indications_pos = None;
+                }
+                nocont = true;
             } else if let Some(t) = candidate {
                 // an endnum rule takes back the letter sign inserted before it (liblouis's
                 // CTO_EndNum case in translateString)
@@ -3883,6 +3959,23 @@ mod tests {
         assert_eq!(table.translate("xab-abx"), "⠭⠸⠁⠃⠿⠭");
         assert_eq!(table.translate("ab-ba"), "⠁⠸⠃⠿⠁");
         assert_eq!(table.translate("ab-aa"), "⠁⠃⠤⠁⠁");
+    }
+
+    #[test]
+    fn nocont_translates_its_word_without_contractions() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase k 13"),
+            parse_rule("space \\s 0"),
+            parse_rule("always ab 3456"),
+            parse_rule("nocont k"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("ab abk ab"), "⠼⠀⠁⠃⠅⠀⠼");
     }
 
     #[test]
