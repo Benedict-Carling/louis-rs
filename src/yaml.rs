@@ -645,4 +645,30 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.is_success()));
     }
+
+    #[test]
+    fn display_mode_maps_characters_to_dots() {
+        let yaml = "table: |\n  display _ 456\n  letter a 1\nflags: {testmode: display}\ntests:\n  - - a_b\n    - ⠁⠸⠀\n  - - a\n    - ⠃\n";
+        let results = run("display_mode", yaml).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_success());
+        assert_eq!(
+            results[1],
+            TestResult::Failure(FailureReason::Translation {
+                input: "a".to_string(),
+                expected: "⠃".to_string(),
+                actual: "⠁".to_string(),
+                direction: Direction::Forward,
+            })
+        );
+    }
+
+    #[test]
+    fn display_mode_runs_every_table() {
+        let yaml = "table: |\n  letter a 1\ntable: |\n  letter a 2\nflags: {testmode: display}\ntests:\n  - - a\n    - ⠁\n";
+        let results = run("display_mode_tables", yaml).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_success());
+        assert!(results[1].is_translation_failure());
+    }
 }

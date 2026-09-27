@@ -104,6 +104,88 @@ impl DisplayTable {
     }
 }
 
+/// The braille cell each character is shown as, the reverse of a [`DisplayTable`], as
+/// liblouis's `lou_charToDots` reads it off a table.
+///
+/// Besides `display` rules, every character definition with a single cell and both
+/// characters of a `grouping` contribute a mapping, so a translation table that includes
+/// no display table still has one.
+#[derive(Debug)]
+pub struct CharToDots {
+    mappings: HashMap<char, char>,
+}
+
+impl CharToDots {
+    const BLANK: char = '\u{2800}';
+
+    pub fn compile(rules: &[AnchoredRule]) -> CharToDots {
+        let mut mappings = HashMap::new();
+        let mut add = |character: char, dots: char| {
+            // ucBrl output only has room for dots 1 to 8
+            let cell = char::from_u32(0x2800 | (dots as u32 & 0xff)).unwrap();
+            if cfg!(feature = "backwards_compatibility") {
+                mappings.entry(character).or_insert(cell);
+            } else {
+                mappings.insert(character, cell);
+            }
+        };
+        for rule in rules {
+            match &rule.rule {
+                Rule::Display {
+                    character, dots, ..
+                } => add(*character, dots.to_unicode()),
+                Rule::Space {
+                    character, dots, ..
+                }
+                | Rule::Punctuation {
+                    character, dots, ..
+                }
+                | Rule::Digit {
+                    character, dots, ..
+                }
+                | Rule::Letter {
+                    character, dots, ..
+                }
+                | Rule::Lowercase {
+                    character, dots, ..
+                }
+                | Rule::Uppercase {
+                    character, dots, ..
+                }
+                | Rule::Litdigit {
+                    character, dots, ..
+                }
+                | Rule::Sign {
+                    character, dots, ..
+                }
+                | Rule::Math {
+                    character, dots, ..
+                } if dots.len() == 1 => add(*character, dots.iter().next().unwrap().to_unicode()),
+                Rule::Grouping {
+                    chars, left, right, ..
+                } => {
+                    let mut chars = chars.chars();
+                    if let (Some(open), Some(close)) = (chars.next(), chars.next()) {
+                        add(open, left.to_unicode());
+                        add(close, right.to_unicode());
+                    }
+                }
+                _ => (),
+            }
+        }
+        CharToDots { mappings }
+    }
+
+    /// The cells `input` is shown as, one per character, with a blank cell for a
+    /// character the table has no mapping for.
+    pub fn dots(&self, input: &str) -> String {
+        input
+            .chars()
+            .map(|c| *self.mappings.get(&c).unwrap_or(&Self::BLANK))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +207,44 @@ mod tests {
         assert_eq!(display_table.translate("⠀"), " ");
         assert_eq!(display_table.translate(""), "");
         assert_eq!(display_table.translate("x"), "x"); // unknown chars are translated to themselves
+    }
+
+    #[test]
+    fn char_to_dots_from_display_rules() {
+        let rules = [parse_rule("display a 1"), parse_rule("display \\s 0")];
+        let table = CharToDots::compile(&rules);
+        assert_eq!(table.dots("a a"), "⠁⠀⠁");
+        assert_eq!(table.dots(""), "");
+        assert_eq!(table.dots("x"), "⠀"); // unknown chars get a blank cell
+    }
+
+    #[test]
+    fn char_to_dots_from_character_definitions() {
+        let rules = [
+            parse_rule("letter a 1"),
+            parse_rule("digit 1 2"),
+            parse_rule("punctuation . 256"),
+            parse_rule("sign % 46-356"),
+            parse_rule("grouping parens () 2356,2356"),
+        ];
+        let table = CharToDots::compile(&rules);
+        assert_eq!(table.dots("a1."), "⠁⠂⠲");
+        assert_eq!(table.dots("%"), "⠀"); // only single-cell definitions map
+        assert_eq!(table.dots("()"), "⠶⠶");
+    }
+
+    #[test]
+    #[cfg(feature = "backwards_compatibility")]
+    fn char_to_dots_first_rule_wins() {
+        let rules = [parse_rule("display a 2"), parse_rule("letter a 1")];
+        assert_eq!(CharToDots::compile(&rules).dots("a"), "⠂");
+    }
+
+    #[test]
+    fn char_to_dots_keeps_eight_dots_and_drops_virtual_ones() {
+        let rules = [parse_rule("display a 78"), parse_rule("display b 19")];
+        let table = CharToDots::compile(&rules);
+        assert_eq!(table.dots("ab"), "⣀⠁");
     }
 
     #[test]

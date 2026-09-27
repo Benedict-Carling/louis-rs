@@ -166,11 +166,11 @@ Two cross-cutting items have no single file behind them:
   `match_pattern.rs` and all three are no-ops in `context_pattern.rs`; the
   `syllable` opcode's cross-boundary restriction is unimplemented. *(M)*
 
-## Forty-two blocks that never run
+## Forty-four blocks that never run
 
 A YAML file is a sequence of blocks, each with its own table. A block whose table
 won't load is reported on stderr and skipped, and the rest of the file still runs.
-Forty-two blocks across twelve files are skipped this way, so those tests report
+Forty-four blocks across thirteen files are skipped this way, so those tests report
 neither passes nor failures — the one genuine unknown in this document, and the
 cheapest work in it.
 
@@ -178,21 +178,25 @@ cheapest work in it.
 |-------------------------------------------|-------:|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------|
 | `multipass-vs-match_common.uti` not found |     25 | The include sits next to the YAML file rather than on `LOUIS_TABLE_PATH`. One missing fixture takes out every block of `multipass-vs-match.yaml`. | S    |
 | Parser gaps                               |      6 | An `InvalidAction` and an `EmptyTest` in each of `multipass-forward.yaml` and `multipass-backward.yaml`, plus an `OpcodeExpected` and a surrogate-pair escape.                                          | S    |
-| Ambiguous metadata queries                |      7 | `language=grc,region=en` matches two tables and `system=cmn-traditional` three. `lou_findTable` scores its candidates and always lands on one; we intersect and insist on exactly one.                  | M    |
+| Ambiguous metadata queries                |      9 | `language=grc,region=en` and `language=de,grade=0` match two tables and `system=cmn-traditional` three. `lou_findTable` scores its candidates and always lands on one; we intersect and insist on exactly one.                  | M    |
 | Hyphenation dictionaries                  |      2 | `hyph_en_US.dic` rejected for its ISO-8859-1 encoding; `hyphenation.dic` not found.                                                                                                                     | S    |
 | `macro.utb` not found                     |      1 | Deliberate non-goal.                                                                                                                                                                                    | —    |
 | A query matching no table at all          |      1 | `language=grc,region=es` finds nothing on the search path. Possibly a bug in the spec rather than in us.                                                                                                | S    |
 
-Ten files report zero tests. Seven because every one of their blocks is skipped for
+Nine files report zero tests. Seven because every one of their blocks is skipped for
 a reason above: `multipass-vs-match.yaml`, `macro.yaml`, `grc-international-es.yaml`,
 `ja-kantenji.yaml`, `face-with-tears-of-joy.yaml`, `hyphenation.yaml` and
-`hyphenation_nocross_harness.yaml`.
+`hyphenation_nocross_harness.yaml`. `no_8dot_harness.yaml` has no tests left upstream;
+they moved to `no.yaml`.
 
-The other three are a separate problem: the `hyphenate`, `hyphenateBraille` and
-`display` test modes fall through a catch-all arm in `src/test.rs` and silently report
-nothing at all, and `de-eurobrl6.yaml`, `hu-hu-g1-hyph_harness.yaml` and
-`no_8dot_harness.yaml` consist only of such tests. `issue-332.yaml` has its
+The last is a separate problem: the `hyphenate` and `hyphenateBraille` test modes fall
+through a catch-all arm in `src/test.rs` and silently report nothing at all, and
+`hu-hu-g1-hyph_harness.yaml` consists only of such tests. `issue-332.yaml` has its
 `hyphenate` block skipped the same way while its remaining 19 tests all fail. *(S)*
+
+The `display` test mode runs. Of `de-eurobrl6.yaml`'s three blocks, two are held back
+by the ambiguous `{language: de, grade: 0}` query above; with the queries pinned to
+`de-g0.utb`, `de-g1.ctb` and `de-g2.ctb`, all 16 of its assertions pass.
 
 ## Missing API surface
 
@@ -209,7 +213,7 @@ nothing at all, and `de-eurobrl6.yaml`, `hu-hu-g1-hyph_harness.yaml` and
 
 Good entry points, roughly easiest first:
 
-1. **Wake up the 46 blocks that don't run.** Several independent small fixes,
+1. **Wake up the 44 blocks that don't run.** Several independent small fixes,
    listed above, and nobody knows what those tests will report. *(S each)*
 2. **The three parser gaps.** Small, concrete, and each has a failing file to check
    against. *(S)*

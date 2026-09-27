@@ -10,9 +10,10 @@ use search_path::SearchPath;
 use crate::{
     emphasis::EmphasisSpan,
     metadata,
-    parser::{self, Direction, TableError},
+    parser::{self, AnchoredRule, Direction, TableError},
     translator::{
-        self, DisplayTable, PositionMap, TranslationModes, TranslationOptions, TranslationPipeline,
+        self, CharToDots, DisplayTable, PositionMap, TranslationModes, TranslationOptions,
+        TranslationPipeline,
     },
 };
 
@@ -184,13 +185,9 @@ impl<'a> TestMatrix<'a> {
         Ok(DisplayTable::compile(&display_rules, direction))
     }
 
-    fn translation_table(
-        &self,
-        table: &Table,
-        direction: Direction,
-    ) -> Result<TranslationPipeline, TestError> {
+    fn rules(table: &Table) -> Result<Vec<AnchoredRule>, TestError> {
         let search_path = SearchPath::new_or("LOUIS_TABLE_PATH", ".");
-        let rules = match table {
+        Ok(match table {
             Table::Simple(path) => parser::table_expanded_in(path.as_path(), &search_path)?,
             Table::List(paths) => {
                 let mut rules = Vec::new();
@@ -220,7 +217,15 @@ impl<'a> TestMatrix<'a> {
                     }
                 }
             }
-        };
+        })
+    }
+
+    fn translation_table(
+        &self,
+        table: &Table,
+        direction: Direction,
+    ) -> Result<TranslationPipeline, TestError> {
+        let rules = Self::rules(table)?;
         // the display table is a pipeline stage on the braille side, so the pipeline
         // applies it in the right place for `direction` and it composes into the positions
         Ok(TranslationPipeline::compile(&rules, direction)?
@@ -279,6 +284,12 @@ impl<'a> TestMatrix<'a> {
                                 .collect::<Vec<_>>(),
                         );
                     }
+                }
+            }
+            TestMode::Display => {
+                for table in self.tables {
+                    let table = CharToDots::compile(&Self::rules(table)?);
+                    results.extend(self.tests.iter().map(|test| test.check_display(&table)));
                 }
             }
             _ => (), // FIXME: not yet implemented
@@ -367,15 +378,30 @@ impl Test {
             options = options.with_cursor_pos(cursor);
         }
         let (translated, positions) = table.translate_with_positions(&self.input, &options);
-        let matched = translated == self.expected;
-        if matched {
+        let position_mismatch = self.position_mismatch(&positions, direction);
+        self.verdict(translated, direction, position_mismatch)
+    }
+
+    /// Check the test in `display` mode: map each character of `input` to the cell the
+    /// table shows it as, the way liblouis's `lou_charToDots` does.
+    fn check_display(&self, table: &CharToDots) -> TestResult {
+        self.verdict(table.dots(&self.input), Direction::Forward, None)
+    }
+
+    fn verdict(
+        &self,
+        translated: String,
+        direction: Direction,
+        position_mismatch: Option<PositionMismatch>,
+    ) -> TestResult {
+        if translated == self.expected {
             if self.xfail.is_failure(direction) {
                 TestResult::UnexpectedSuccess {
                     input: self.input.to_string(),
                     direction,
                 }
             } else {
-                match self.position_mismatch(&positions, direction) {
+                match position_mismatch {
                     None => TestResult::Success,
                     Some(mismatch) => TestResult::Failure(FailureReason::Position(mismatch)),
                 }

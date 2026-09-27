@@ -5,7 +5,7 @@ use std::collections::HashMap;
 pub use options::{TranslationMode, TranslationModes, TranslationOptions};
 pub use pipeline::TranslationPipeline;
 pub use positions::PositionMap;
-pub use table::display::DisplayTable;
+pub use table::display::{CharToDots, DisplayTable};
 pub use translation::{ResolvedTranslation, TranslationStage};
 pub use trie::ClassConstraint;
 
