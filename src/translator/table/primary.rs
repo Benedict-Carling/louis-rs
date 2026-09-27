@@ -660,15 +660,13 @@ impl PrimaryTable {
                     builder.numeric_indicator.numericnocontchars(chars);
                     builder.numeric_constrainer.uses_numeric_mode();
                 }
-                Rule::Midendnumericmodechars { .. } => {
+                Rule::Midendnumericmodechars { chars } => {
+                    builder.numeric_indicator.midendnumericmodechars(chars);
                     builder.numeric_constrainer.uses_numeric_mode();
                 }
                 Rule::Numericmodechars { chars } => {
                     builder.numeric_indicator.numericmodechars(chars);
                     builder.numeric_constrainer.numericmodechars(chars);
-                }
-                Rule::Midendnumericmodechars { chars } => {
-                    builder.numeric_indicator.midendnumericmodechars(chars);
                 }
                 Rule::Capsletter { dots, .. } => {
                     builder
