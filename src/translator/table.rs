@@ -65,6 +65,11 @@ impl TableContext {
         &self.character_dots
     }
 
+    /// Each character's dots by the rule liblouis takes as its definition
+    pub fn definitions(&self) -> &CharacterDefinition {
+        self.character_dots.definitions()
+    }
+
     /// This context with the character and dots classes of `other`
     pub fn with_classes_of(self, other: &TableContext) -> Self {
         Self {
@@ -335,7 +340,7 @@ impl TableContext {
             }
         }
         Ok(TableContext {
-            character_dots: Arc::new(CharacterDots::new(character_definitions.clone(), undefined)),
+            character_dots: Arc::new(CharacterDots::new(definition_rules(rules), undefined)),
             character_definitions,
             character_classes,
             dots_classes,
@@ -345,6 +350,52 @@ impl TableContext {
             direction_dots_classes: None,
         })
     }
+}
+
+/// The dots of each character by the rule liblouis takes as its definition: the first of its
+/// character definition opcodes, of which `litdigit` is none, else its base's
+fn definition_rules(rules: &[AnchoredRule]) -> CharacterDefinition {
+    let mut definitions = CharacterDefinition::new();
+    for rule in rules {
+        match &rule.rule {
+            Rule::Space {
+                character, dots, ..
+            }
+            | Rule::Punctuation {
+                character, dots, ..
+            }
+            | Rule::Digit {
+                character, dots, ..
+            }
+            | Rule::Letter {
+                character, dots, ..
+            }
+            | Rule::Lowercase {
+                character, dots, ..
+            }
+            | Rule::Uppercase {
+                character, dots, ..
+            }
+            | Rule::Sign {
+                character, dots, ..
+            }
+            | Rule::Math {
+                character, dots, ..
+            } if definitions.get(character).is_none() => {
+                definitions.insert(*character, &dots.to_string());
+            }
+            _ => (),
+        }
+    }
+    for rule in rules {
+        if let Rule::Base { derived, base, .. } = &rule.rule
+            && definitions.get(derived).is_none()
+            && let Some(dots) = definitions.get(base).cloned()
+        {
+            definitions.insert(*derived, &dots);
+        }
+    }
+    definitions
 }
 
 /// The classes a table defines beyond liblouis' predefined ones, in the order liblouis

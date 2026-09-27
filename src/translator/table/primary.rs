@@ -354,7 +354,7 @@ impl PrimaryTableBuilder {
             digit_chars: class(CharacterClass::Digit),
             character_translations: self.character_translations,
             direction,
-            fallback_definitions: ctx.character_definitions().clone(),
+            fallback_definitions: ctx.definitions().clone(),
             case: CaseClasses::from_context(ctx),
             capsletter_defined: self.capsletter_defined,
             syllables: self.syllables,
@@ -2159,9 +2159,15 @@ impl PrimaryTable {
                     delayed_translations = self.update_offsets(delayed_translations, 1);
                 } else {
                     // otherwise handle it as a undefined character
+                    let undefined = match self.direction {
+                        Direction::Forward => {
+                            undefined_char_dots(next_char, &self.fallback_definitions)
+                        }
+                        Direction::Backward => undefined_cell_text(next_char),
+                    };
                     let translation = ResolvedTranslation::new(
                         &next_char.to_string(),
-                        &undefined_char_dots(next_char, &self.fallback_definitions),
+                        &undefined,
                         1,
                         TranslationStage::Main,
                         None,
@@ -2241,51 +2247,59 @@ fn is_contraction(rule: &Rule) -> bool {
 
 /// The escape liblouis prints for a character the table does not define, in the table's dots
 pub(crate) fn undefined_char_dots(ch: char, definitions: &CharacterDefinition) -> String {
-    ch.escape_unicode()
-        .to_string()
-        .replace(r"\u", r"\x")
-        .replace(['{', '}'], "")
+    let code = ch as u32;
+    let escape = match code {
+        0..=0x7f => ch.to_string(),
+        0x80..=0xffff => format!("\\x{code:04x}"),
+        0x10000..=0xfffff => format!("\\y{code:05x}"),
+        _ => format!("\\z{code:08x}"),
+    };
+    format!("'{escape}'")
         .chars()
-        .map(|c| {
-            if let Some(t) = definitions.get(&c) {
-                t.clone()
-            } else {
-                fallback(c).to_string()
-            }
+        .map(|c| match definitions.get(&c) {
+            Some(dots) if dots.chars().count() == 1 => dots.clone(),
+            _ => fallback(c).to_string(),
         })
         .collect()
 }
 
-/// Map a char to dots according to the North American Braille Computer Code (NABCC)
-///
-/// A fallback mapping for character to braille in case the table does
-/// not provide a mapping. This is used as a last resort when printing
-/// unicode escapes for undefined characters when the table does not
-/// define the character mappings that are needed. Only the characters
-/// that [`undefined_char_dots`] can produce are mapped.
-fn fallback(ch: char) -> BrailleChars {
-    let dots = match ch {
-        '0' => "356",
-        '1' => "2",
-        '2' => "23",
-        '3' => "25",
-        '4' => "256",
-        '5' => "26",
-        '6' => "235",
-        '7' => "2356",
-        '8' => "236",
-        '9' => "35",
-        'a' => "1",
-        'b' => "12",
-        'c' => "14",
-        'd' => "145",
-        'e' => "15",
-        'f' => "124",
-        '\\' => "1256",
-        'x' => "1346",
-        _ => unreachable!("no NABCC fallback for {ch:?}"),
+/// The dot numbers liblouis' back-translation prints for a cell no rule covers
+fn undefined_cell_text(cell: char) -> String {
+    let dots = (cell as u32).wrapping_sub(0x2800);
+    let numbers: String = (0..8)
+        .filter(|dot| dots & (1 << dot) != 0)
+        .map(|dot| char::from(b'1' + dot as u8))
+        .collect();
+    let numbers = if numbers.is_empty() {
+        "0".to_string()
+    } else {
+        numbers
     };
-    BrailleChars::try_from(dots).expect("NABCC dot pattern is valid")
+    format!("\\{numbers}/")
+}
+
+/// Map a char to dots according to the North American Braille Computer Code (NABCC), as
+/// liblouis' `_lou_charToFallbackDots` does for the characters of an undefined character's
+/// escape that the table does not define
+fn fallback(ch: char) -> char {
+    // the dots of 0x20 to 0x5f, each a bit pattern with dot 1 as the lowest bit
+    const DOTS: [u8; 64] = [
+        0x00, 0x2e, 0x10, 0x3c, 0x2b, 0x29, 0x2f, 0x04, 0x37, 0x3e, 0x21, 0x2c, 0x20, 0x24, 0x28,
+        0x0c, 0x34, 0x02, 0x06, 0x12, 0x32, 0x22, 0x16, 0x36, 0x26, 0x14, 0x31, 0x30, 0x23, 0x3f,
+        0x1c, 0x39, 0x08, 0x01, 0x03, 0x09, 0x19, 0x11, 0x0b, 0x1b, 0x13, 0x0a, 0x1a, 0x05, 0x07,
+        0x0d, 0x1d, 0x15, 0x0f, 0x1f, 0x17, 0x0e, 0x1e, 0x25, 0x27, 0x3a, 0x2d, 0x3d, 0x35, 0x2a,
+        0x33, 0x3b, 0x18, 0x38,
+    ];
+    let c = if ch.is_ascii() { ch as u8 } else { b'?' };
+    let (c, extra) = match c {
+        0x7f.. => (c & !0x20, 0x40),
+        0x60.. => (c & !0x20, 0),
+        0x5f => (c, 0),
+        0x40.. => (c, 0x40),
+        0x20.. => (c, 0),
+        _ => (c | 0x40, 0xc0),
+    };
+    char::from_u32(0x2800 + u32::from(DOTS[usize::from(c - 0x20)] | extra)).unwrap()
 }
 
 fn is_emphasis_indicator(rule: Option<&Rule>, caps_only: bool) -> bool {
@@ -2325,14 +2339,28 @@ mod tests {
     use crate::parser::{RuleParser, expand_includes};
 
     #[test]
-    fn fallback_covers_every_escaped_char() {
-        // undefined_char_dots emits `\x` plus lowercase hex digits, so
-        // fallback must map all of them without hitting the unreachable arm
-        for c in r"\x0123456789abcdef".chars() {
-            assert_eq!(fallback(c).len(), 1);
-        }
-        assert_eq!(fallback('a').to_string(), "\u{2801}"); // dot 1
-        assert_eq!(fallback('9').to_string(), "\u{2814}"); // dots 35, not 25
+    fn fallback_is_nabcc() {
+        assert_eq!(fallback('a'), '\u{2801}'); // dot 1
+        assert_eq!(fallback('9'), '\u{2814}'); // dots 35, not 25
+        assert_eq!(fallback('\''), '\u{2804}'); // dot 3
+        assert_eq!(fallback('A'), '\u{2841}'); // dots 17
+        assert_eq!(fallback('é'), fallback('?'));
+    }
+
+    #[test]
+    fn undefined_cell_text_is_its_dots() {
+        assert_eq!(undefined_cell_text('⡁'), "\\17/");
+        assert_eq!(undefined_cell_text('⠀'), "\\0/");
+    }
+
+    #[test]
+    fn undefined_char_escape() {
+        let mut definitions = CharacterDefinition::new();
+        definitions.insert('x', "⠭");
+        assert_eq!(
+            undefined_char_dots('\u{5be}', &definitions),
+            "⠄\u{2873}⠭⠴⠢⠃⠑⠄"
+        );
     }
 
     fn parse_rule(source: &str) -> AnchoredRule {
@@ -2358,7 +2386,7 @@ mod tests {
                 .unwrap();
         assert_eq!(table.translate("foobar"), "⠇⠸");
         assert_eq!(table.translate("  "), "⠀⠀");
-        assert_eq!(table.translate("🐂"), "⠳⠭⠂⠋⠲⠴⠆");
+        assert_eq!(table.translate("🐂"), "⠄⡳⠽⠂⠋⠲⠴⠆⠄");
     }
 
     #[test]

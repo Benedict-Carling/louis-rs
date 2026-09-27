@@ -77,6 +77,10 @@ impl CharacterDots {
         }
     }
 
+    pub fn definitions(&self) -> &CharacterDefinition {
+        &self.definitions
+    }
+
     pub fn put(&self, input: &str) -> String {
         input
             .chars()
