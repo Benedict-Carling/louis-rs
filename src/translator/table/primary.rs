@@ -1277,22 +1277,20 @@ impl PrimaryTable {
                     TranslationStage::Main,
                     rule,
                 ),
-                Rule::Joinnum { chars, dots, .. } if direction == Direction::Forward => {
-                    builder.get_trie_mut(rule).insert(
-                        chars,
-                        &dots.to_string(),
-                        Some(Transition::Start(vec![
-                            CharacterClass::Space,
-                            CharacterClass::Punctuation,
-                        ])),
-                        Some(Transition::End(vec![CharacterClass::Space])),
-                        direction,
-                        rule.precedence(),
-                        vec![],
-                        TranslationStage::Main,
-                        rule,
-                    )
-                }
+                Rule::Joinnum { chars, dots, .. } => builder.get_trie_mut(rule).insert(
+                    chars,
+                    &dots.to_string(),
+                    Some(Transition::Start(vec![
+                        CharacterClass::Space,
+                        CharacterClass::Punctuation,
+                    ])),
+                    Some(Transition::End(vec![CharacterClass::Space])),
+                    direction,
+                    rule.precedence(),
+                    vec![],
+                    TranslationStage::Main,
+                    rule,
+                ),
                 Rule::Midnum { chars, dots, .. } => {
                     builder.numeric_indicator.runs().midnum(chars);
                     builder.get_trie_mut(rule).insert(
@@ -1961,6 +1959,20 @@ impl PrimaryTable {
                     None => t.clone(),
                 };
                 translations.push(translation);
+                // liblouis puts a space after a joinword or joinnum it back-translates, if
+                // there is more input to map it to
+                if self.direction == Direction::Backward
+                    && matches!(t.rule(), Some(Rule::Joinword { .. } | Rule::Joinnum { .. }))
+                    && char_pos < input_chars.len()
+                {
+                    translations.push(ResolvedTranslation::new(
+                        "",
+                        " ",
+                        0,
+                        TranslationStage::Main,
+                        None,
+                    ));
+                }
                 delayed_translations = self.update_offsets(delayed_translations, t.length());
                 delayed_translations.extend(self.match_candidates_within(consumed, t.length()));
                 // liblouis drops the spaces after a joinword or joinnum
@@ -3244,6 +3256,18 @@ mod tests {
         ]);
         assert_eq!(table.translate("⠰⠃⠤⠃"), "b-b");
         assert_eq!(table.translate("⠰⠃⠀⠃"), "b but");
+    }
+
+    #[test]
+    fn backward_joinnum_puts_a_space_after_it() {
+        let table = backward_table(&[
+            parse_rule("space \\s 0"),
+            parse_rule("sign § 346"),
+            parse_rule("digit 4 145"),
+            parse_rule("joinnum § 346"),
+        ]);
+        assert_eq!(table.translate("⠬⠙"), "§ 4");
+        assert_eq!(table.translate("⠬"), "§");
     }
 
     #[test]
