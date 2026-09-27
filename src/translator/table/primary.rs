@@ -20,6 +20,7 @@ use crate::{
             numeric, uppercase,
         },
         match_pattern::{MatchPatterns, MatchPatternsBuilder},
+        pass::ContextRules,
         position_constraints::{
             ComputerBrailleConstrainer, Constrainer, Constrainers, DontContractConstrainerBuilder,
             HyphenationConstrainerBuilder, PositionConstraints, PunctuationConstrainerBuilder,
@@ -130,6 +131,8 @@ pub struct PrimaryTable {
     comp6_trie: Trie,
     match_patterns: MatchPatterns,
     context_patterns: ContextPatterns,
+    /// The `context` rules going forward, run by the pass engine
+    context_rules: ContextRules,
     /// All the nocross translation rules are stored in a separate trie
     prepunc_trie: Trie,
     postpunc_trie: Trie,
@@ -397,6 +400,7 @@ impl PrimaryTableBuilder {
             postpunc_trie: self.postpunc_trie,
             match_patterns: self.match_patterns.build(),
             context_patterns: self.context_patterns.build(),
+            context_rules: ContextRules::default(),
             indicators: Indicators::new(indicators),
             constrainers: Constrainers::new(
                 [
@@ -1477,7 +1481,7 @@ impl PrimaryTable {
                         ctx.character_classes(),
                     );
                 }
-                Rule::Context { test, action, .. } => {
+                Rule::Context { test, action, .. } if direction == Direction::Backward => {
                     builder.context_patterns.insert(
                         test,
                         action,
@@ -1554,7 +1558,11 @@ impl PrimaryTable {
                 builder.trie.single_char_alternatives(),
             ));
         }
-        Ok(builder.build(direction, ctx))
+        let mut table = builder.build(direction, ctx);
+        if direction == Direction::Forward {
+            table.context_rules = ContextRules::compile(rules, ctx)?;
+        }
+        Ok(table)
     }
 
     /// liblouis sets the attributes of characters and cells from every definition in a table,
@@ -1865,6 +1873,8 @@ impl PrimaryTable {
         let mut backward_state = backward::State::default();
         // a `context` rule liblouis files among its pass rules, due at the current position
         let mut forced: Option<ResolvedTranslation> = None;
+        // liblouis tries no context rule where one just applied without moving on
+        let mut context_stalled_at: Option<usize> = None;
 
         loop {
             if last_indications_pos != Some(char_pos) {
@@ -1908,7 +1918,21 @@ impl PrimaryTable {
             // then search for context patterns. Unless they have empty pre patterns they will all
             // have an offset. Split those off.
             let (mut context_candidates, mut context_delayed) =
-                self.context_candidates(chars.as_str(), &env, at_start);
+                if self.direction == Direction::Forward {
+                    let put = |c: char| match self.character_translations.get(&c) {
+                        Some(t) => t.output(),
+                        None => self.handle_undefined_char(c, options),
+                    };
+                    let candidates = if context_stalled_at == Some(char_pos) {
+                        Vec::new()
+                    } else {
+                        self.context_rules
+                            .candidates(&input_chars, char_pos, &env, &put)
+                    };
+                    (candidates, Vec::new())
+                } else {
+                    self.context_candidates(chars.as_str(), &env, at_start)
+                };
             if self.direction == Direction::Forward {
                 let is_pass_rule = |t: &ResolvedTranslation| {
                     t.rule()
@@ -2050,6 +2074,9 @@ impl PrimaryTable {
                     // if there is a zero-length translation candiate we run the risk of an infinite
                     // loop, so remember the current translation so we only apply it once
                     seen.insert(TranslationSubset::from(t));
+                    if matches!(t.rule(), Some(Rule::Context { .. })) {
+                        context_stalled_at = Some(char_pos);
+                    }
                 } else {
                     seen.clear();
                     // move the iterator forward by the number of characters in the translation
@@ -2066,7 +2093,7 @@ impl PrimaryTable {
                     }
                     None => t.clone(),
                 };
-                translations.push(translation);
+                translations.extend(translation.into_steps());
                 delayed_translations = self.update_offsets(delayed_translations, t.length());
                 delayed_translations.extend(self.match_candidates_within(consumed, t.length()));
                 // liblouis skips the repetitions that follow a `repeated` rule
@@ -3708,6 +3735,52 @@ mod tests {
                 .unwrap();
         assert_eq!(table.translate("abc"), "⠁⠂");
         assert_eq!(table.translate("cabc"), "⠉⠁⠂");
+    }
+
+    fn context_table(rules: &[&str]) -> PrimaryTable {
+        let rules: Vec<_> = rules.iter().map(|r| parse_rule(r)).collect();
+        let context = TableContext::compile(&rules).unwrap();
+        PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context).unwrap()
+    }
+
+    /// A `context` rule consumes and copies what its test covers before the replacement,
+    /// rather than looking back at it, so it fires again at the next match
+    #[test]
+    fn context_rule_copies_what_comes_before_the_replacement() {
+        let table = context_table(&[
+            "lowercase a 1",
+            "lowercase b 12",
+            "lowercase c 14",
+            "punctuation . 46",
+            "context \".\"[]$l @6",
+        ]);
+        assert_eq!(table.translate("a.b.c"), "⠁⠨⠠⠃⠨⠠⠉");
+    }
+
+    /// A negated attribute test takes one character without the attribute
+    #[test]
+    fn context_negated_attribute_takes_a_character() {
+        let table = context_table(&[
+            "lowercase a 1",
+            "lowercase b 12",
+            "sign ; 46",
+            "context !$l[\"b\"] @3456",
+        ]);
+        assert_eq!(table.translate(";b"), "⠨⠼");
+        assert_eq!(table.translate("ab"), "⠁⠃");
+    }
+
+    /// liblouis tries no context rule where one has just applied without moving on
+    #[test]
+    fn context_rules_do_not_stack_at_one_position() {
+        let table = context_table(&[
+            "lowercase a 1",
+            "attribute up A",
+            "base uppercase A a",
+            "context []%up @6",
+            "context #1=0[]%up @46",
+        ]);
+        assert_eq!(table.translate("A").chars().count(), 2);
     }
 
     /// `compbrlAtCursor` spells out the word under the cursor character by character,

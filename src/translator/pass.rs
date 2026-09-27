@@ -11,6 +11,7 @@ use crate::parser::{
     Action, ActionInstruction, AnchoredRule, Attribute, CharacterClass, CharacterClasses,
     Quantifier, Test, TestInstruction,
 };
+use crate::translator::effect::{Effect, Environment};
 use crate::translator::swap::Swapper;
 use crate::translator::table::TableContext;
 use crate::translator::{ResolvedTranslation, TranslationError, TranslationStage};
@@ -67,15 +68,30 @@ impl Variables {
         self.0.get(&var).copied().unwrap_or(0)
     }
 
-    fn holds(&self, var: u8, op: &Operator, operand: u8) -> bool {
-        let (value, operand) = (self.get(var), u16::from(operand));
-        match op {
-            Operator::Eq => value == operand,
-            Operator::Lt => value < operand,
-            Operator::Gt => value > operand,
-            Operator::LtEq => value <= operand,
-            Operator::GtEq => value >= operand,
+    fn run(&mut self, act: &Act) {
+        match act {
+            Act::Assign { var, value } => {
+                self.0.insert(*var, u16::from(*value));
+            }
+            Act::Increment(var) => {
+                self.0.insert(*var, self.get(*var).wrapping_add(1));
+            }
+            Act::Decrement(var) => {
+                self.0.insert(*var, self.get(*var).saturating_sub(1));
+            }
+            _ => {}
         }
+    }
+}
+
+fn holds(value: u16, op: &Operator, operand: u8) -> bool {
+    let operand = u16::from(operand);
+    match op {
+        Operator::Eq => value == operand,
+        Operator::Lt => value < operand,
+        Operator::Gt => value > operand,
+        Operator::LtEq => value <= operand,
+        Operator::GtEq => value >= operand,
     }
 }
 
@@ -294,7 +310,12 @@ impl PassRule {
     }
 
     /// liblouis's `passDoTest`
-    fn test_forward(&self, input: &[char], start: usize, vars: &Variables) -> Option<Match> {
+    fn test_forward(
+        &self,
+        input: &[char],
+        start: usize,
+        vars: &dyn Fn(u8) -> u16,
+    ) -> Option<Match> {
         let len = input.len() as isize;
         let mut pos = start as isize;
         let mut not = false;
@@ -372,7 +393,7 @@ impl PassRule {
                 }
                 Op::Variable { var, op, operand } => {
                     conditions += 1;
-                    vars.holds(*var, op, *operand)
+                    holds(vars(*var), op, *operand)
                 }
             };
             lowest = lowest.min(pos);
@@ -405,7 +426,12 @@ impl PassRule {
 
     /// liblouis's `back_passDoTest`, which, unlike the forward test, applies a negation of an
     /// attribute test to the whole test rather than to each character, and knows no grouping
-    fn test_backward(&self, input: &[char], start: usize, vars: &Variables) -> Option<Match> {
+    fn test_backward(
+        &self,
+        input: &[char],
+        start: usize,
+        vars: &dyn Fn(u8) -> u16,
+    ) -> Option<Match> {
         let len = input.len() as isize;
         let mut pos = start as isize;
         let mut not = false;
@@ -482,7 +508,7 @@ impl PassRule {
                 Op::Group(_) => return None,
                 Op::Variable { var, op, operand } => {
                     conditions += 1;
-                    vars.holds(*var, op, *operand)
+                    holds(vars(*var), op, *operand)
                 }
             };
             lowest = lowest.min(pos);
@@ -516,8 +542,8 @@ impl PassRule {
         &self,
         input: &[char],
         m: Match,
-        vars: &mut Variables,
         stage: TranslationStage,
+        copy: &dyn Fn(char) -> String,
     ) -> (Vec<ResolvedTranslation>, usize) {
         let copies = self.action.iter().any(|act| matches!(act, Act::Copy));
         let new_pos = if copies { m.end_match } else { m.end_replace }.max(m.start_match);
@@ -541,7 +567,7 @@ impl PassRule {
             }
         } else {
             for c in &input[m.start_match..region.start] {
-                translations.push(translation(&[*c], &c.to_string()));
+                translations.push(translation(&[*c], &copy(*c)));
             }
         }
         // liblouis maps what `*` and a swap produce char by char, and everything else to the
@@ -565,19 +591,8 @@ impl PassRule {
                 Act::Output(s) if per_char => translations.push(translation(&[], s)),
                 Act::Output(s) => output.push_str(s),
                 Act::Swap(swapper) => region_chars(&|c| swapper.replacement(c).map(str::to_string)),
-                Act::Copy => region_chars(&|c| Some(c.to_string())),
-                Act::Omit => {}
-                Act::Assign { var, value } => {
-                    vars.0.insert(*var, u16::from(*value));
-                }
-                Act::Increment(var) => {
-                    let value = vars.get(*var).wrapping_add(1);
-                    vars.0.insert(*var, value);
-                }
-                Act::Decrement(var) => {
-                    let value = vars.get(*var).saturating_sub(1);
-                    vars.0.insert(*var, value);
-                }
+                Act::Copy => region_chars(&|c| Some(copy(c))),
+                Act::Omit | Act::Assign { .. } | Act::Increment(_) | Act::Decrement(_) => {}
             }
         }
         if per_char {
@@ -667,7 +682,12 @@ impl PassRules {
     /// characters first and takes the first whose test holds. Among rules that tie on that it
     /// takes the one defined first; here the one moving on further, then the one that looked at
     /// more, wins instead.
-    fn select(&self, input: &[char], pos: usize, vars: &Variables) -> Option<(&PassRule, Match)> {
+    fn select(
+        &self,
+        input: &[char],
+        pos: usize,
+        vars: &dyn Fn(u8) -> u16,
+    ) -> Option<(&PassRule, Match)> {
         self.rules
             .iter()
             .filter_map(|rule| {
@@ -688,14 +708,15 @@ impl PassRules {
         let mut advanced = true;
         while pos < input.len() {
             let selected = if advanced {
-                self.select(&input, pos, &vars)
+                self.select(&input, pos, &|var| vars.get(var))
             } else {
                 None
             };
             advanced = true;
             match selected {
                 Some((rule, m)) => {
-                    let (applied, new_pos) = rule.apply(&input, m, &mut vars, self.stage);
+                    let (applied, new_pos) = rule.apply(&input, m, self.stage, &|c| c.to_string());
+                    rule.action.iter().for_each(|act| vars.run(act));
                     translations.extend(applied);
                     advanced = new_pos > pos;
                     pos = new_pos;
@@ -708,5 +729,77 @@ impl PassRules {
             }
         }
         translations
+    }
+}
+
+/// The `context` rules, which liblouis runs with its pass engine within the main pass
+#[derive(Debug, Default)]
+pub struct ContextRules {
+    rules: Vec<PassRule>,
+}
+
+impl ContextRules {
+    pub fn compile(rules: &[AnchoredRule], ctx: &TableContext) -> Result<Self, TranslationError> {
+        let compiler = Compiler {
+            ctx,
+            classes: ctx.character_classes(),
+            dots: false,
+        };
+        let mut compiled = Vec::new();
+        for rule in rules {
+            if let crate::parser::Rule::Context { test, action, .. } = &rule.rule {
+                compiled.push(PassRule::compile(test, action, rule, &compiler)?);
+            }
+        }
+        Ok(Self { rules: compiled })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    /// A translation for every rule whose test holds at `pos` of the whole `input`. The
+    /// characters a rule copies are translated by `put`, and its variable actions come as
+    /// effects.
+    pub fn candidates(
+        &self,
+        input: &[char],
+        pos: usize,
+        env: &Environment,
+        put: &dyn Fn(char) -> String,
+    ) -> Vec<ResolvedTranslation> {
+        let vars = |var: u8| env.get(var).map_or(0, |value| u16::from(*value));
+        self.rules
+            .iter()
+            .filter_map(|rule| {
+                let m = rule.test_forward(input, pos, &vars)?;
+                let (parts, new_pos) = rule.apply(input, m, TranslationStage::Main, put);
+                let consumed: String = input[pos..new_pos].iter().collect();
+                let output: String = parts.iter().map(|t| t.output()).collect();
+                let effects = rule
+                    .action
+                    .iter()
+                    .filter_map(|act| match act {
+                        Act::Assign { var, value } => Some(Effect::new(*var, *value)),
+                        Act::Increment(var) => Some(Effect::increment(*var)),
+                        Act::Decrement(var) => Some(Effect::decrement(*var)),
+                        _ => None,
+                    })
+                    .collect();
+                let translation = ResolvedTranslation::new(
+                    &consumed,
+                    &output,
+                    rule.consumed(&m) + m.context,
+                    TranslationStage::Main,
+                    rule.origin.clone(),
+                )
+                .with_effects(effects);
+                Some(if parts.len() > 1 {
+                    translation.with_parts(parts)
+                } else {
+                    translation
+                })
+            })
+            .collect()
     }
 }
