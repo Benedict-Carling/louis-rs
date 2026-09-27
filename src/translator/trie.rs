@@ -1,6 +1,6 @@
 //! Store and find simple translation rules using a prefix tree ([Trie](https://en.wikipedia.org/wiki/Trie))
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::{
     parser::{AnchoredRule, CharacterClass, CharacterClasses, Direction, Precedence},
@@ -61,6 +61,49 @@ pub enum Transition {
     /// Non-consuming lookahead: the character immediately after the match must be in one of
     /// these classes. Inserted at the end of the path (after character transitions).
     End(Vec<CharacterClass>),
+    /// Non-consuming lookahead for backward translation: whether the word ends after the
+    /// match, as decided by [`WordEnd::is_end_word`].
+    EndOfWord(bool),
+}
+
+/// What liblouis' `isEndWord` (`lou_backTranslateString.c`) needs to know about the cells
+/// that follow a backward match to decide whether the word ends there.
+#[derive(Debug, Default, Clone)]
+pub struct WordEnd {
+    /// Cells with the space attribute
+    pub space: HashSet<char>,
+    /// Cells with the letter attribute
+    pub letter: HashSet<char>,
+    /// Cells that a single-cell rule translates to more than one character, which
+    /// continue the word (`begword` and `midword` excepted, liblouis#360)
+    pub continuation: HashSet<char>,
+    /// Cells of single-cell `postpunc` rules
+    pub postpunc: HashSet<char>,
+    /// Cells of single-cell `hyphen` rules
+    pub hyphen: HashSet<char>,
+}
+
+impl WordEnd {
+    /// Scans the cells after a match up to the next space: a letter continues the word, a
+    /// hyphen ends it, and a cell that is not a letter continues it only if it is a
+    /// continuation cell and no `postpunc` cell.
+    pub fn is_end_word(&self, rest: &str) -> bool {
+        for c in rest.chars() {
+            if self.space.contains(&c) {
+                return true;
+            }
+            if self.letter.contains(&c) {
+                return false;
+            }
+            if self.hyphen.contains(&c) {
+                return true;
+            }
+            if self.continuation.contains(&c) && !self.postpunc.contains(&c) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// The resolved, trie-internal counterpart of [`Transition`] plus the character transitions
@@ -70,6 +113,7 @@ enum ResolvedTransition {
     Character(char),
     Start(ResolvedClasses),
     End(ResolvedClasses),
+    EndOfWord(bool),
 }
 
 /// A class-based constraint attached to a rule via the liblouis `before`/`after` keywords.
@@ -119,6 +163,10 @@ pub struct Trie {
     /// `StartClass`/`EndClass` constraint checks. Set to text classes for forward translation,
     /// braille classes for backward.
     ctx: CharacterClasses,
+    /// Classes for the lookbehind checks, when they differ from `ctx`: backward translation
+    /// looks behind at the text produced so far, like liblouis' `back_setBefore`.
+    start_ctx: Option<CharacterClasses>,
+    word_end: WordEnd,
     /// When true, character transitions are matched on the exact character instead of
     /// being lowercased first. Needed for `comp6`, where `comp6 a 1` and `comp6 A 17`
     /// are independent rules.
@@ -130,12 +178,29 @@ impl Trie {
         Trie {
             root: TrieNode::default(),
             ctx: CharacterClasses::default(),
+            start_ctx: None,
+            word_end: WordEnd::default(),
             case_sensitive: false,
         }
     }
 
     pub fn with_context(self, ctx: CharacterClasses) -> Self {
         Trie { ctx, ..self }
+    }
+
+    pub fn with_start_context(self, start_ctx: CharacterClasses) -> Self {
+        Trie {
+            start_ctx: Some(start_ctx),
+            ..self
+        }
+    }
+
+    pub fn set_word_end(&mut self, word_end: WordEnd) {
+        self.word_end = word_end;
+    }
+
+    fn start_ctx(&self) -> &CharacterClasses {
+        self.start_ctx.as_ref().unwrap_or(&self.ctx)
     }
 
     pub fn case_sensitive(self) -> Self {
@@ -148,11 +213,12 @@ impl Trie {
     fn resolve_transition(&self, transition: Transition) -> ResolvedTransition {
         match transition {
             Transition::Start(classes) => {
-                ResolvedTransition::Start(ResolvedClasses::resolve(&self.ctx, &classes))
+                ResolvedTransition::Start(ResolvedClasses::resolve(self.start_ctx(), &classes))
             }
             Transition::End(classes) => {
                 ResolvedTransition::End(ResolvedClasses::resolve(&self.ctx, &classes))
             }
+            Transition::EndOfWord(end) => ResolvedTransition::EndOfWord(end),
         }
     }
     pub fn insert_char(
@@ -215,7 +281,10 @@ impl Trie {
         for constraint in &class_constraints {
             if let ClassConstraint::Start(class) = constraint {
                 length += 1;
-                let resolved = ResolvedClasses::resolve(&self.ctx, &[class.clone()]);
+                let resolved = ResolvedClasses::resolve(
+                    self.start_ctx.as_ref().unwrap_or(&self.ctx),
+                    &[class.clone()],
+                );
                 current_node = current_node
                     .transitions
                     .entry(ResolvedTransition::Start(resolved))
@@ -324,6 +393,12 @@ impl Trie {
                 }
                 ResolvedTransition::End(resolved) => {
                     if resolved.matches(c) {
+                        matching_rules
+                            .extend(self.find_translations_from_node(input, prev, child_node));
+                    }
+                }
+                ResolvedTransition::EndOfWord(end) => {
+                    if self.word_end.is_end_word(input) == *end {
                         matching_rules
                             .extend(self.find_translations_from_node(input, prev, child_node));
                     }
@@ -830,5 +905,24 @@ mod tests {
         );
         assert_eq!(trie.find_translations("foo", Some(' ')), empty);
         assert_eq!(trie.find_translations("foo", None), empty);
+    }
+
+    #[test]
+    fn is_end_word() {
+        let word_end = WordEnd {
+            space: HashSet::from([' ']),
+            letter: HashSet::from(['a']),
+            continuation: HashSet::from(['c', 'p']),
+            postpunc: HashSet::from(['p']),
+            hyphen: HashSet::from(['-']),
+        };
+        assert!(word_end.is_end_word(""));
+        assert!(word_end.is_end_word(" a"));
+        assert!(!word_end.is_end_word("a"));
+        assert!(!word_end.is_end_word(".a"));
+        assert!(word_end.is_end_word(". a"));
+        assert!(!word_end.is_end_word("c"));
+        assert!(word_end.is_end_word("p"));
+        assert!(word_end.is_end_word("-a"));
     }
 }

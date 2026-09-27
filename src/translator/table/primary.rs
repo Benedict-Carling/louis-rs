@@ -20,15 +20,14 @@ use crate::{
         },
         match_pattern::{MatchPatterns, MatchPatternsBuilder},
         position_constraints::{
-            BackwardCapsConstrainerBuilder, BackwardNoContractConstrainerBuilder,
-            BackwardNumericConstrainerBuilder, ComputerBrailleConstrainer, Constrainer,
-            Constrainers, HyphenationConstrainerBuilder, NumericConstrainerBuilder,
-            PositionConstraints, PunctuationConstrainerBuilder,
+            BackwardCapsConstrainerBuilder, BackwardNumericConstrainerBuilder,
+            ComputerBrailleConstrainer, Constrainer, Constrainers, HyphenationConstrainerBuilder,
+            NumericConstrainerBuilder, PositionConstraints, PunctuationConstrainerBuilder,
         },
         sequence::{Sequences, whole_word_boundaries},
         table::TableContext,
         translation::TranslationSubset,
-        trie::{Transition, Trie},
+        trie::{Transition, Trie, WordEnd},
     },
 };
 
@@ -162,12 +161,51 @@ struct PrimaryTableBuilder {
     numeric_constrainer: NumericConstrainerBuilder,
     backward_caps_constrainer: BackwardCapsConstrainerBuilder,
     backward_numeric_constrainer: BackwardNumericConstrainerBuilder,
-    backward_nocontract_constrainer: BackwardNoContractConstrainerBuilder,
     hyphenation_constrainer: HyphenationConstrainerBuilder,
     punctuation_constrainer: PunctuationConstrainerBuilder,
     backward_digit_overrides: HashMap<char, ResolvedTranslation>,
     compbrl_triggers: Vec<String>,
     sequences: Option<Sequences>,
+}
+
+/// liblouis' back-translation `noContractMode`
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum NoContract {
+    Off,
+    /// After a `letsign`, `nocontractsign` or `nonumsign`, while only letters follow
+    Active,
+    /// The scope met something other than a letter, up to the next space
+    Lapsed,
+}
+
+impl NoContract {
+    fn after(self, translation: &ResolvedTranslation) -> Self {
+        match translation.rule() {
+            Some(Rule::Letsign { .. } | Rule::Nocontractsign { .. } | Rule::Nonumsign { .. })
+                if translation.output().is_empty() =>
+            {
+                NoContract::Active
+            }
+            _ if translation.output().is_empty() => self,
+            Some(Rule::Space { .. }) => NoContract::Off,
+            Some(Rule::Letter { .. } | Rule::Lowercase { .. } | Rule::Uppercase { .. }) => self,
+            _ if self == NoContract::Active => NoContract::Lapsed,
+            _ => self,
+        }
+    }
+}
+
+/// The lookahead of a word-family rule: `forward` when translating forward, `backward`
+/// when back-translating, where liblouis checks the cells that follow instead.
+fn end_for(
+    direction: Direction,
+    forward: Option<Transition>,
+    backward: Option<Transition>,
+) -> Option<Transition> {
+    match direction {
+        Direction::Forward => forward,
+        Direction::Backward => backward,
+    }
 }
 
 impl PrimaryTableBuilder {
@@ -194,7 +232,6 @@ impl PrimaryTableBuilder {
             numeric_constrainer: NumericConstrainerBuilder::new(),
             backward_caps_constrainer: BackwardCapsConstrainerBuilder::new(),
             backward_numeric_constrainer: BackwardNumericConstrainerBuilder::new(),
-            backward_nocontract_constrainer: BackwardNoContractConstrainerBuilder::new(),
             hyphenation_constrainer: HyphenationConstrainerBuilder::new(),
             punctuation_constrainer: PunctuationConstrainerBuilder::new(),
             backward_digit_overrides: HashMap::new(),
@@ -401,9 +438,6 @@ impl PrimaryTableBuilder {
                     self.backward_numeric_constrainer
                         .build()
                         .map(Constrainer::BackwardNumeric),
-                    self.backward_nocontract_constrainer
-                        .build()
-                        .map(Constrainer::BackwardNoContract),
                     // liblouis's `nocross`/hyphenation-based syllable-break check is a
                     // forward-translation-only mechanism (lou_backTranslateString.c never
                     // consults it); a nocross rule is always an unrestricted candidate
@@ -459,6 +493,81 @@ impl PrimaryTable {
             .collect()
     }
 
+    /// The cell attributes and single-cell rules liblouis' `isEndWord` consults.
+    fn word_end(rules: &[AnchoredRule], ctx: &TableContext) -> Result<WordEnd, TranslationError> {
+        let mut word_end = WordEnd {
+            space: ctx
+                .dots_classes()
+                .get(&CharacterClass::Space)
+                .unwrap_or_default()
+                .into_iter()
+                .chain([' ', '⠀'])
+                .collect(),
+            ..WordEnd::default()
+        };
+        let single_cell = |dots: String| -> Option<char> {
+            let mut cells = dots.chars();
+            match (cells.next(), cells.next()) {
+                (Some(cell), None) => Some(cell),
+                _ => None,
+            }
+        };
+        let defs = ctx.character_definitions();
+        for rule in rules {
+            let (chars, dots) = match &rule.rule {
+                Rule::Letter { dots, .. }
+                | Rule::Lowercase { dots, .. }
+                | Rule::Uppercase { dots, .. } => {
+                    if let Some(cell) = single_cell(dots.to_string()) {
+                        word_end.letter.insert(cell);
+                    }
+                    continue;
+                }
+                Rule::Hyphen { dots, .. } => {
+                    if let Some(cell) = single_cell(dots.to_string()) {
+                        word_end.hyphen.insert(cell);
+                    }
+                    continue;
+                }
+                Rule::Postpunc { dots, .. } => {
+                    if let Some(cell) = single_cell(dots.to_string()) {
+                        word_end.postpunc.insert(cell);
+                    }
+                    continue;
+                }
+                Rule::Always { chars, dots, .. }
+                | Rule::Word { chars, dots, .. }
+                | Rule::Syllable { chars, dots, .. }
+                | Rule::Sufword { chars, dots, .. }
+                | Rule::Prfword { chars, dots, .. }
+                | Rule::Begmidword { chars, dots, .. }
+                | Rule::Midendword { chars, dots, .. }
+                | Rule::Endword { chars, dots, .. }
+                | Rule::Partword { chars, dots, .. }
+                | Rule::Endnum { chars, dots, .. } => {
+                    (chars, defs.braille_to_unicode(dots, chars)?)
+                }
+                Rule::Repeated { chars, dots, .. }
+                | Rule::Repword { chars, dots, .. }
+                | Rule::Rependword { chars, dots, .. }
+                | Rule::Largesign { chars, dots, .. }
+                | Rule::Joinword { chars, dots, .. }
+                | Rule::Lowword { chars, dots, .. }
+                | Rule::Prepunc { chars, dots, .. }
+                | Rule::Begnum { chars, dots, .. }
+                | Rule::Midnum { chars, dots, .. }
+                | Rule::Joinnum { chars, dots, .. } => (chars, dots.to_string()),
+                _ => continue,
+            };
+            if chars.chars().count() > 1
+                && let Some(cell) = single_cell(dots)
+            {
+                word_end.continuation.insert(cell);
+            }
+        }
+        Ok(word_end)
+    }
+
     pub fn compile(
         rules: &[AnchoredRule],
         direction: Direction,
@@ -475,6 +584,12 @@ impl PrimaryTable {
             Direction::Backward => ctx.dots_classes().clone(),
         };
         let mut builder = PrimaryTableBuilder::new(trie_ctx);
+        if direction == Direction::Backward {
+            let text = ctx.character_classes().clone();
+            builder.trie = builder.trie.with_start_context(text.clone());
+            builder.comp6_trie = builder.comp6_trie.with_start_context(text.clone());
+            builder.nocross_trie = builder.nocross_trie.with_start_context(text);
+        }
         if direction == Direction::Forward {
             builder.sequences = Sequences::new(ctx);
         }
@@ -651,9 +766,6 @@ impl PrimaryTable {
                         builder
                             .backward_numeric_constrainer
                             .nonumsign(&dots.to_string());
-                        builder
-                            .backward_nocontract_constrainer
-                            .indicator(&dots.to_string());
                     }
                 }
                 Rule::Numericnocontchars { chars } => {
@@ -852,9 +964,6 @@ impl PrimaryTable {
                         )
                     {
                         builder.insert_backward_indicator_before_letter(&dots.to_string(), rule);
-                        builder
-                            .backward_nocontract_constrainer
-                            .indicator(&dots.to_string());
                     }
                 }
                 Rule::Noletsign { chars } => {
@@ -903,9 +1012,6 @@ impl PrimaryTable {
                         )
                     {
                         builder.insert_backward_indicator_before_letter(&dots.to_string(), rule);
-                        builder
-                            .backward_nocontract_constrainer
-                            .indicator(&dots.to_string());
                     }
                 }
                 Rule::Base { derived, base, .. } => {
@@ -1044,7 +1150,7 @@ impl PrimaryTable {
                         chars,
                         &dots,
                         Some(start),
-                        end,
+                        end_for(direction, end, Some(Transition::EndOfWord(true))),
                         direction,
                         rule.precedence(),
                         class_constraints,
@@ -1069,7 +1175,11 @@ impl PrimaryTable {
                             CharacterClass::Space,
                             CharacterClass::Punctuation,
                         ])),
-                        Some(Transition::End(vec![CharacterClass::Letter])),
+                        end_for(
+                            direction,
+                            Some(Transition::End(vec![CharacterClass::Letter])),
+                            Some(Transition::EndOfWord(false)),
+                        ),
                         direction,
                         rule.precedence(),
                         class_constraints,
@@ -1091,7 +1201,11 @@ impl PrimaryTable {
                         chars,
                         &dots,
                         Some(Transition::Start(vec![CharacterClass::Letter])),
-                        Some(Transition::End(vec![CharacterClass::Letter])),
+                        end_for(
+                            direction,
+                            Some(Transition::End(vec![CharacterClass::Letter])),
+                            Some(Transition::EndOfWord(false)),
+                        ),
                         direction,
                         rule.precedence(),
                         class_constraints,
@@ -1128,7 +1242,11 @@ impl PrimaryTable {
                         chars,
                         &dots,
                         None,
-                        Some(Transition::End(vec![CharacterClass::Letter])),
+                        end_for(
+                            direction,
+                            Some(Transition::End(vec![CharacterClass::Letter])),
+                            Some(Transition::EndOfWord(false)),
+                        ),
                         direction,
                         rule.precedence(),
                         class_constraints,
@@ -1150,11 +1268,15 @@ impl PrimaryTable {
                         chars,
                         &dots,
                         Some(Transition::Start(vec![CharacterClass::Letter])),
-                        Some(Transition::End(vec![
-                            CharacterClass::Letter,
-                            CharacterClass::Space,
-                            CharacterClass::Punctuation,
-                        ])),
+                        end_for(
+                            direction,
+                            Some(Transition::End(vec![
+                                CharacterClass::Letter,
+                                CharacterClass::Space,
+                                CharacterClass::Punctuation,
+                            ])),
+                            None,
+                        ),
                         direction,
                         rule.precedence(),
                         class_constraints,
@@ -1176,10 +1298,14 @@ impl PrimaryTable {
                         chars,
                         &dots,
                         Some(Transition::Start(vec![CharacterClass::Letter])),
-                        Some(Transition::End(vec![
-                            CharacterClass::Space,
-                            CharacterClass::Punctuation,
-                        ])),
+                        end_for(
+                            direction,
+                            Some(Transition::End(vec![
+                                CharacterClass::Space,
+                                CharacterClass::Punctuation,
+                            ])),
+                            Some(Transition::EndOfWord(true)),
+                        ),
                         direction,
                         rule.precedence(),
                         class_constraints,
@@ -1206,10 +1332,14 @@ impl PrimaryTable {
                             CharacterClass::Space,
                             CharacterClass::Punctuation,
                         ])),
-                        Some(Transition::End(vec![
-                            CharacterClass::Space,
-                            CharacterClass::Punctuation,
-                        ])),
+                        end_for(
+                            direction,
+                            Some(Transition::End(vec![
+                                CharacterClass::Space,
+                                CharacterClass::Punctuation,
+                            ])),
+                            Some(Transition::EndOfWord(true)),
+                        ),
                         direction,
                         rule.precedence(),
                         class_constraints.clone(),
@@ -1220,10 +1350,14 @@ impl PrimaryTable {
                         chars,
                         &dots,
                         Some(Transition::Start(vec![CharacterClass::Letter])),
-                        Some(Transition::End(vec![
-                            CharacterClass::Space,
-                            CharacterClass::Punctuation,
-                        ])),
+                        end_for(
+                            direction,
+                            Some(Transition::End(vec![
+                                CharacterClass::Space,
+                                CharacterClass::Punctuation,
+                            ])),
+                            Some(Transition::EndOfWord(true)),
+                        ),
                         direction,
                         rule.precedence(),
                         class_constraints,
@@ -1250,10 +1384,14 @@ impl PrimaryTable {
                             CharacterClass::Space,
                             CharacterClass::Punctuation,
                         ])),
-                        Some(Transition::End(vec![
-                            CharacterClass::Space,
-                            CharacterClass::Punctuation,
-                        ])),
+                        end_for(
+                            direction,
+                            Some(Transition::End(vec![
+                                CharacterClass::Space,
+                                CharacterClass::Punctuation,
+                            ])),
+                            None,
+                        ),
                         direction,
                         rule.precedence(),
                         class_constraints.clone(),
@@ -1267,7 +1405,11 @@ impl PrimaryTable {
                             CharacterClass::Space,
                             CharacterClass::Punctuation,
                         ])),
-                        Some(Transition::End(vec![CharacterClass::Letter])),
+                        end_for(
+                            direction,
+                            Some(Transition::End(vec![CharacterClass::Letter])),
+                            None,
+                        ),
                         direction,
                         rule.precedence(),
                         class_constraints,
@@ -1293,7 +1435,11 @@ impl PrimaryTable {
                             CharacterClass::Space,
                             CharacterClass::Punctuation,
                         ])),
-                        Some(Transition::End(vec![CharacterClass::Letter])),
+                        end_for(
+                            direction,
+                            Some(Transition::End(vec![CharacterClass::Letter])),
+                            Some(Transition::EndOfWord(false)),
+                        ),
                         direction,
                         rule.precedence(),
                         class_constraints,
@@ -1330,7 +1476,14 @@ impl PrimaryTable {
                         CharacterClass::Space,
                         CharacterClass::Punctuation,
                     ])),
-                    Some(Transition::End(vec![CharacterClass::Digit])),
+                    end_for(
+                        direction,
+                        Some(Transition::End(vec![CharacterClass::Digit])),
+                        Some(Transition::End(vec![
+                            CharacterClass::Litdigit,
+                            CharacterClass::Sign,
+                        ])),
+                    ),
                     direction,
                     rule.precedence(),
                     vec![],
@@ -1344,7 +1497,11 @@ impl PrimaryTable {
                         chars,
                         &dots.to_string(),
                         Some(Transition::Start(vec![CharacterClass::Digit])),
-                        Some(Transition::End(vec![CharacterClass::Digit])),
+                        end_for(
+                            direction,
+                            Some(Transition::End(vec![CharacterClass::Digit])),
+                            Some(Transition::End(vec![CharacterClass::Litdigit])),
+                        ),
                         direction,
                         rule.precedence(),
                         vec![],
@@ -1513,12 +1670,8 @@ impl PrimaryTable {
             builder
                 .backward_numeric_constrainer
                 .letter_cells(letter_cells.clone());
-            builder
-                .backward_caps_constrainer
-                .letter_cells(letter_cells.clone());
-            builder
-                .backward_nocontract_constrainer
-                .letter_cells(letter_cells);
+            builder.backward_caps_constrainer.letter_cells(letter_cells);
+
             let mut digit_cells = ctx
                 .dots_classes()
                 .get(&CharacterClass::Digit)
@@ -1531,6 +1684,12 @@ impl PrimaryTable {
             builder
                 .backward_numeric_constrainer
                 .digit_cells(digit_cells);
+        }
+        if direction == Direction::Backward {
+            let word_end = Self::word_end(rules, ctx)?;
+            builder.trie.set_word_end(word_end.clone());
+            builder.comp6_trie.set_word_end(word_end.clone());
+            builder.nocross_trie.set_word_end(word_end);
         }
         Ok(builder.build(direction, ctx))
     }
@@ -1657,6 +1816,8 @@ impl PrimaryTable {
         // the loop at the same char_pos without advancing, so indications must only be
         // emitted the first time a given position is visited, not on every re-entry.
         let mut last_indications_pos: Option<usize> = None;
+        let mut no_contract = NoContract::Off;
+        let is_backward = self.direction == Direction::Backward;
 
         // Enrich spans with compbrl-detected regions.
         let enriched_spans = match &self.compbrl_scanner {
@@ -1683,6 +1844,15 @@ impl PrimaryTable {
             if last_indications_pos != Some(char_pos) {
                 translations.extend(indications.translations_at(char_pos));
                 last_indications_pos = Some(char_pos);
+            }
+
+            // back-translation looks behind at the text produced so far, like liblouis'
+            // `back_setBefore`
+            if is_backward {
+                prev = translations
+                    .iter()
+                    .rev()
+                    .find_map(|t| t.output().chars().last());
             }
 
             // whether we're about to match starting at the true beginning of the whole input,
@@ -1753,19 +1923,13 @@ impl PrimaryTable {
 
             // Backward no-contract mode: a letsign/nocontractsign/nonumsign says the
             // cells that follow spell out letters, so the word-family rules must not
-            // claim them. Only these four opcodes are suppressed -- liblouis leaves
-            // `always`, `partword` and the mid-word opcodes eligible.
-            if self.direction == Direction::Backward && constraints.no_contract_at(char_pos) {
-                candidates.retain(|t| {
-                    !matches!(
-                        t.rule(),
-                        Some(
-                            Rule::Word { .. }
-                                | Rule::Sufword { .. }
-                                | Rule::Prfword { .. }
-                                | Rule::Begword { .. }
-                        )
-                    )
+            // claim them. liblouis leaves `always`, `partword` and the mid-word opcodes
+            // eligible, and once the scope has lapsed only the whole-word ones stay out.
+            if no_contract != NoContract::Off {
+                candidates.retain(|t| match t.rule() {
+                    Some(Rule::Word { .. } | Rule::Sufword { .. } | Rule::Prfword { .. }) => false,
+                    Some(Rule::Begword { .. }) => no_contract != NoContract::Active,
+                    _ => true,
                 });
             }
 
@@ -1781,7 +1945,6 @@ impl PrimaryTable {
             // to; `TitleCase` (capsletter) capitalizes only the first — a cell can
             // resolve to more than one character (e.g. a digraph rule), and capsletter
             // marks a single capitalized letter, not a whole capitalized word.
-            let is_backward = self.direction == Direction::Backward;
             let uppercase_here = is_backward && constraints.uppercase_at(char_pos);
             let titlecase_here = is_backward && constraints.titlecase_at(char_pos);
             let uppercase_if_needed =
@@ -1816,6 +1979,9 @@ impl PrimaryTable {
             {
                 let translation = nocross.clone();
                 let translation = uppercase_if_needed(translation);
+                if is_backward {
+                    no_contract = no_contract.after(&translation);
+                }
                 let consumed = chars.as_str();
                 // move the iterator forward by the number of characters in the translation
                 chars.nth(nocross.length() - 1);
@@ -1841,6 +2007,9 @@ impl PrimaryTable {
                 // there is a matching translation rule
                 let translation = t.clone();
                 let translation = uppercase_if_needed(translation);
+                if is_backward {
+                    no_contract = no_contract.after(&translation);
+                }
                 translations.push(translation);
                 delayed_translations = self.update_offsets(delayed_translations, t.length());
                 delayed_translations.extend(self.match_candidates_within(consumed, t.length()));
@@ -1854,6 +2023,9 @@ impl PrimaryTable {
             } else if let Some(next_char) = chars.next() {
                 prev = Some(next_char);
                 char_pos += 1;
+                if no_contract == NoContract::Active {
+                    no_contract = NoContract::Lapsed;
+                }
                 // no translation rule found
                 if let Some(translation) = self.character_translations.get(&next_char) {
                     translations.push(translation.clone());
@@ -2729,6 +2901,61 @@ mod tests {
         .unwrap();
         assert_eq!(table.translate("⠼⠁"), "1");
         assert_eq!(table.translate("⠁"), "a");
+    }
+
+    fn backward_table(rules: &[AnchoredRule]) -> PrimaryTable {
+        let context = TableContext::compile(rules).unwrap();
+        PrimaryTable::compile(rules, Direction::Backward, TranslationStage::Main, &context).unwrap()
+    }
+
+    #[test]
+    fn backward_word_after_capsletter() {
+        let rules = [
+            parse_rule("lowercase d 145"),
+            parse_rule("lowercase u 136"),
+            parse_rule("space \\s 0"),
+            parse_rule("capsletter 6"),
+            parse_rule("word du 145"),
+        ];
+        let table = backward_table(&rules);
+        assert_eq!(table.translate("⠠⠙⠀⠙"), "Du du");
+    }
+
+    #[test]
+    fn backward_word_needs_the_word_to_end() {
+        // the cells after a match continue the word if they are letters or carry a
+        // contraction, like liblouis' `isEndWord`
+        let rules = [
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase u 136"),
+            parse_rule("lowercase t 2345"),
+            parse_rule("lowercase e 15"),
+            parse_rule("lowercase a 1"),
+            parse_rule("punctuation , 2"),
+            parse_rule("word but 12"),
+            parse_rule("always ea 2"),
+        ];
+        let table = backward_table(&rules);
+        assert_eq!(table.translate("⠃"), "but");
+        assert_eq!(table.translate("⠃⠂⠁"), "beaa");
+        assert_eq!(table.translate("⠃⠂"), "bea");
+    }
+
+    #[test]
+    fn backward_letsign_scope_lapses_at_a_non_letter() {
+        // after the letsign the word rule stays out for the rest of the word, even past
+        // the hyphen that ends the letter run; the next word is contracted again
+        let rules = [
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase u 136"),
+            parse_rule("lowercase t 2345"),
+            parse_rule("space \\s 0"),
+            parse_rule("hyphen - 36"),
+            parse_rule("letsign 56"),
+            parse_rule("word but 12"),
+        ];
+        let table = backward_table(&rules);
+        assert_eq!(table.translate("⠰⠃⠤⠃⠀⠃"), "b-b but");
     }
 
     #[test]
