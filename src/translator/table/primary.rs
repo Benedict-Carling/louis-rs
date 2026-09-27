@@ -143,6 +143,8 @@ pub struct PrimaryTable {
     sequences: Option<Sequences>,
     case: CaseClasses,
     capsletter_defined: bool,
+    space_chars: HashSet<char>,
+    letter_or_litdigit_chars: HashSet<char>,
 }
 
 /// A builder for [`PrimaryTable`]
@@ -386,6 +388,15 @@ impl PrimaryTableBuilder {
             fallback_definitions: ctx.character_definitions().clone(),
             case: CaseClasses::from_context(ctx),
             capsletter_defined: self.capsletter_defined,
+            space_chars: ctx
+                .character_classes()
+                .get(&CharacterClass::Space)
+                .unwrap_or_default(),
+            letter_or_litdigit_chars: [CharacterClass::Letter, CharacterClass::Litdigit]
+                .iter()
+                .filter_map(|class| ctx.character_classes().get(class))
+                .flatten()
+                .collect(),
             trie: self.trie,
             comp6_trie: self.comp6_trie,
             nocross_trie: self.nocross_trie,
@@ -1290,13 +1301,33 @@ impl PrimaryTable {
                         rule,
                     );
                 }
-                Rule::Joinword { chars, dots, .. } | Rule::Lowword { chars, dots, .. } => {
+                Rule::Joinword { chars, dots, .. } => builder.get_trie_mut(rule).insert(
+                    chars,
+                    &dots.to_string(),
+                    Some(Transition::Start(vec![
+                        CharacterClass::Space,
+                        CharacterClass::Punctuation,
+                    ])),
+                    // the rest of liblouis's forward check is in `join_following_spaces`
+                    Some(Transition::End(match direction {
+                        Direction::Forward => vec![CharacterClass::Space],
+                        Direction::Backward => {
+                            vec![CharacterClass::Space, CharacterClass::Punctuation]
+                        }
+                    })),
+                    direction,
+                    rule.precedence(),
+                    vec![],
+                    TranslationStage::Main,
+                    rule,
+                ),
+                Rule::Lowword { chars, dots, .. } => {
                     builder.get_trie_mut(rule).insert(
                         chars,
                         &dots.to_string(),
-                        // FIXME: joinword, lowword, prepunc and postpunc need more
-                        // advanced scaning of the input. Just checking for before and
-                        // after classes as below is too simplistic
+                        // FIXME: lowword, prepunc and postpunc need more advanced scaning of
+                        // the input. Just checking for before and after classes as below is
+                        // too simplistic
                         Some(Transition::Start(vec![
                             CharacterClass::Space,
                             CharacterClass::Punctuation,
@@ -1582,6 +1613,28 @@ impl PrimaryTable {
             .collect()
     }
 
+    /// liblouis's `joinword`: valid only when spaces and then a letter follow
+    /// (`onlyLettersAhead`). The spaces count towards its weight; the translation loop
+    /// swallows them once it is chosen.
+    fn join_following_spaces(
+        &self,
+        t: ResolvedTranslation,
+        chars: &[char],
+        pos: usize,
+    ) -> Option<ResolvedTranslation> {
+        let end = pos + t.length();
+        let spaces = chars[end.min(chars.len())..]
+            .iter()
+            .take_while(|c| self.space_chars.contains(c))
+            .count();
+        let next = chars.get(end + spaces)?;
+        if spaces == 0 || !self.letter_or_litdigit_chars.contains(next) {
+            return None;
+        }
+        let weight = t.weight() + spaces + 1;
+        Some(t.with_weight(weight))
+    }
+
     fn match_candidates(
         &self,
         input: &str,
@@ -1780,6 +1833,18 @@ impl PrimaryTable {
             // definition (`character_translations`), matching liblouis.
             candidates.retain(|t| valid_match(t, char_pos) && emphasis_allows(t, char_pos));
 
+            if self.direction == Direction::Forward {
+                candidates = candidates
+                    .into_iter()
+                    .filter_map(|t| match t.rule() {
+                        Some(Rule::Joinword { .. }) => {
+                            self.join_following_spaces(t, &input_chars, char_pos)
+                        }
+                        _ => Some(t),
+                    })
+                    .collect();
+            }
+
             candidates.retain(|t| match t.rule() {
                 Some(Rule::Prepunc { .. }) => constraints.prepunc_ok_at(char_pos),
                 Some(Rule::Postpunc { .. }) => constraints.postpunc_ok_at(char_pos),
@@ -1898,6 +1963,30 @@ impl PrimaryTable {
                 translations.push(translation);
                 delayed_translations = self.update_offsets(delayed_translations, t.length());
                 delayed_translations.extend(self.match_candidates_within(consumed, t.length()));
+
+                if self.direction == Direction::Forward
+                    && matches!(t.rule(), Some(Rule::Joinword { .. }))
+                {
+                    let spaces: String = chars
+                        .as_str()
+                        .chars()
+                        .take_while(|c| self.space_chars.contains(c))
+                        .collect();
+                    let n = spaces.chars().count();
+                    if n > 0 {
+                        chars.nth(n - 1);
+                        prev = spaces.chars().last();
+                        char_pos += n;
+                        translations.push(ResolvedTranslation::new(
+                            &spaces,
+                            "",
+                            n,
+                            TranslationStage::Main,
+                            None,
+                        ));
+                        delayed_translations = self.update_offsets(delayed_translations, n);
+                    }
+                }
 
                 // update the environment if needed
                 if !t.effects().is_empty() {
@@ -2663,6 +2752,25 @@ mod tests {
         // a capital first letter lifts the check
         assert_eq!(table.translate("Abb"), "⠠⠿");
         assert_eq!(table.translate("aBb"), "⠁⠠⠃⠃");
+    }
+
+    #[test]
+    fn joinword_swallows_the_spaces_before_a_word() {
+        let rules = [
+            parse_rule("space \\s 0"),
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("punctuation . 256"),
+            parse_rule("joinword a 1-2"),
+            parse_rule("word a 1-5"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("a  b"), "⠁⠂⠃");
+        assert_eq!(table.translate("a ."), "⠁⠐⠀⠲");
+        assert_eq!(table.translate("a"), "⠁⠐");
     }
 
     #[test]
