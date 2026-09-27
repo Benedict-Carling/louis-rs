@@ -1929,9 +1929,35 @@ impl PrimaryTable {
                 candidates.push(digit_translation.clone());
             }
 
-            // inside a numeric run, suppress multi-character contractions
+            // liblouis's dontContract refuses these opcodes whatever their length
             if constraints.dont_contract_at(char_pos) {
-                candidates.retain(|t| t.length() <= 1);
+                candidates.retain(|t| {
+                    !matches!(
+                        t.rule(),
+                        Some(
+                            Rule::Always { .. }
+                                | Rule::Syllable { .. }
+                                | Rule::Repeated { .. }
+                                | Rule::Repword { .. }
+                                | Rule::Rependword { .. }
+                                | Rule::Nocont { .. }
+                                | Rule::Largesign { .. }
+                                | Rule::Word { .. }
+                                | Rule::Partword { .. }
+                                | Rule::Joinnum { .. }
+                                | Rule::Lowword { .. }
+                                | Rule::Joinword { .. }
+                                | Rule::Sufword { .. }
+                                | Rule::Prfword { .. }
+                                | Rule::Begword { .. }
+                                | Rule::Begmidword { .. }
+                                | Rule::Midword { .. }
+                                | Rule::Midendword { .. }
+                                | Rule::Endword { .. }
+                                | Rule::Match { .. }
+                        )
+                    )
+                });
             }
 
             // Backward no-contract mode: a letsign/nocontractsign/nonumsign says the
@@ -2894,6 +2920,28 @@ mod tests {
                 .unwrap();
         assert_eq!(table.translate("in"), "⠔");
         assert_eq!(table.translate("in."), "⠊⠝⠲");
+    }
+
+    #[test]
+    fn number_refuses_single_letter_always_rules_after_it() {
+        let rules = [
+            parse_rule("space \\s 0"),
+            parse_rule("lowercase a 1"),
+            parse_rule("litdigit 1 1"),
+            parse_rule("punctuation . 256"),
+            parse_rule("numsign 3456"),
+            parse_rule("numericmodechars ."),
+            parse_rule("nocontractsign 56"),
+            parse_rule("nonumsign 56"),
+            parse_rule("always a 6"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("a"), "⠠");
+        assert_eq!(table.translate("1a"), "⠼⠁⠁");
+        assert_eq!(table.translate("1 a"), "⠼⠁⠀⠠");
     }
 
     #[test]
