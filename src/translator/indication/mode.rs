@@ -13,11 +13,12 @@
 //! `begcapsword`/... family in [`uppercase`](super::uppercase) — see
 //! [`class_indicator`](super::class_indicator) for how a run becomes a letter, word, or
 //! passage indicator. The one thing specific to this module is [`IndicatorBuilder::build`]
-//! deciding, per attribute name, what bounds a mode word: a `digit` run is its own word;
-//! any other custom class is bounded by `letter`, like uppercase minus the
-//! `capsmodechars` transparency (no generic opcode for that).
+//! deciding, per attribute name, what bounds a mode word: for `digit` the digits and
+//! the characters they are based on, across numeric mode characters; any other custom
+//! class is bounded by `letter`, like uppercase minus the `capsmodechars` transparency
+//! (no generic opcode for that).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     parser::{AnchoredRule, CharacterClass, Position},
@@ -30,13 +31,42 @@ use super::class_indicator::ClassIndicator;
 #[derive(Debug)]
 pub struct IndicatorBuilder {
     classes: HashMap<String, ClassIndicator>,
+    /// `base` rules as (derived, base) pairs
+    bases: Vec<(char, char)>,
+    /// `numericmodechars` and `midendnumericmodechars`
+    numeric_mode_chars: HashSet<char>,
 }
 
 impl IndicatorBuilder {
     pub fn new() -> Self {
         Self {
             classes: HashMap::new(),
+            bases: Vec::new(),
+            numeric_mode_chars: HashSet::new(),
         }
+    }
+
+    pub fn base(&mut self, derived: char, base: char) {
+        self.bases.push((derived, base));
+    }
+
+    pub fn numeric_mode_chars(&mut self, chars: impl IntoIterator<Item = char>) {
+        self.numeric_mode_chars.extend(chars);
+    }
+
+    /// The characters that can end a mode inside a word: those that belong to it, and
+    /// the base characters of those (liblouis's `isEmphasizable`). Other characters
+    /// derived from the same base, like the capitals of letters doubling as digits,
+    /// cancel the mode instead (`resetsEmphMode`), which takes the end indicator away.
+    fn emphasizable(&self, active: &HashSet<char>) -> HashSet<char> {
+        let mut chars = active.clone();
+        chars.extend(
+            self.bases
+                .iter()
+                .filter(|(derived, _)| active.contains(derived))
+                .map(|&(_, base)| base),
+        );
+        chars
     }
 
     fn class_mut(&mut self, name: &str) -> &mut ClassIndicator {
@@ -83,9 +113,8 @@ impl IndicatorBuilder {
         self.class_mut(name).lenmodephrase(len);
     }
 
-    pub fn build(self, ctx: &TableContext) -> Option<Indicator> {
-        let classes: Vec<ClassIndicator> = self
-            .classes
+    pub fn build(mut self, ctx: &TableContext) -> Option<Indicator> {
+        let classes: Vec<ClassIndicator> = std::mem::take(&mut self.classes)
             .into_iter()
             .map(|(name, mut indicator)| {
                 indicator.set_character_classes(ctx.character_classes().clone());
@@ -93,19 +122,30 @@ impl IndicatorBuilder {
                     .character_classes()
                     .get(&CharacterClass::from(name.as_str()))
                     .unwrap_or_default();
-                // "digit" is self-bounded (liblouis hardcodes this; a digit run is its own
-                // word). Everything else is letter-bounded, like uppercase minus the
-                // capsmodechars carve-out (no generic opcode for it). See class_indicator's
-                // module doc.
-                let letter_chars = if name == "digit" {
-                    active_chars.clone()
+                // liblouis ends a mode inside a word at a character that shares a base
+                // with one of the mode, and treats the characters that don't cancel the
+                // mode (`resetsEmphMode`) as part of the word. For `digit` those are the
+                // digits and numeric mode characters, so a digit run followed by a letter
+                // only needs closing when the letter doubles as a digit. Everything else
+                // is letter-bounded, like uppercase minus the capsmodechars carve-out
+                // (no generic opcode for it). See class_indicator's module doc.
+                if name == "digit" {
+                    let letter_chars = self.emphasizable(&active_chars);
+                    let mut word_chars = self.numeric_mode_chars.clone();
+                    for class in [CharacterClass::Digit, CharacterClass::Litdigit] {
+                        word_chars.extend(ctx.character_classes().get(&class).unwrap_or_default());
+                    }
+                    indicator
+                        .mode_characters(word_chars.difference(&letter_chars).copied().collect());
+                    indicator.letter_characters(letter_chars);
                 } else {
-                    ctx.character_classes()
-                        .get(&CharacterClass::Letter)
-                        .unwrap_or_default()
-                };
+                    indicator.letter_characters(
+                        ctx.character_classes()
+                            .get(&CharacterClass::Letter)
+                            .unwrap_or_default(),
+                    );
+                }
                 indicator.active_characters(active_chars);
-                indicator.letter_characters(letter_chars);
                 indicator
             })
             .filter(|indicator| indicator.is_indicating())
@@ -178,6 +218,42 @@ mod tests {
         let result = indicator.precompute("123 ");
         assert_eq!(outputs_at(&result, 0), vec!["⠼"]);
         assert!(outputs_at(&result, 3).is_empty());
+    }
+
+    #[test]
+    fn endmodeword_before_the_base_of_a_digit() {
+        // see the generic mode block of liblouis/tests/yaml/numericmode.yaml
+        let mut b = IndicatorBuilder::new();
+        b.begmodeword("digit", "⠼", &rule("begmodeword digit 3456"));
+        b.endmodeword("digit", "⠰", &rule("endmodeword digit 56"));
+        b.base('1', 'a');
+        b.base('A', 'a');
+        b.numeric_mode_chars(['-']);
+        let cc = CharacterClasses::new(&[
+            (CharacterClass::Digit, &['1']),
+            (CharacterClass::Letter, &['a', 't', 'A']),
+            (CharacterClass::Space, &[' ']),
+        ]);
+        let ctx = TableContext::new(cc, CharacterClasses::default(), Default::default());
+        let indicator = b.build(&ctx).unwrap();
+
+        for (input, end) in [
+            ("1a", Some(1)),
+            ("1-a", Some(2)),
+            ("1t", None),
+            ("1A", None),
+        ] {
+            let result = indicator.precompute(input);
+            assert_eq!(outputs_at(&result, 0), vec!["⠼"], "{input}");
+            let ends: Vec<usize> = result
+                .iter()
+                .filter(|(_, t)| t.output() == "⠰")
+                .map(|(pos, _)| *pos)
+                .collect();
+            assert_eq!(ends, end.into_iter().collect::<Vec<_>>(), "{input}");
+        }
+        let result = indicator.precompute("1-1");
+        assert_eq!(result.len(), 1);
     }
 
     #[test]

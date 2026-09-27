@@ -350,6 +350,13 @@ impl PrimaryTableBuilder {
 
     fn build(mut self, direction: Direction, ctx: &TableContext) -> PrimaryTable {
         let triggers = self.compbrl_triggers;
+        let numeric_mode_chars: Vec<char> = self
+            .numeric_indicator
+            .runs()
+            .continuation_chars()
+            .copied()
+            .collect();
+        self.mode_indicator.numeric_mode_chars(numeric_mode_chars);
         let dont_contract_constrainer = self
             .dont_contract_constrainer
             .build(self.numeric_indicator.runs().clone());
@@ -911,6 +918,7 @@ impl PrimaryTable {
                     }
                 }
                 Rule::Base { derived, base, .. } => {
+                    builder.mode_indicator.base(*derived, *base);
                     if let Some(translation) = ctx.character_definitions().get(base).cloned() {
                         builder.insert_character(*derived, &translation, direction, rule);
                     } else {

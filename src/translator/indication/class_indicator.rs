@@ -7,8 +7,8 @@
 //! - [`letter_characters`](ClassIndicator::letter_characters) — what bounds a mode word,
 //!   i.e. what a run can extend across without an explicit `endmode`-family close.
 //!   Uppercase is bounded by `letter` (plus [`mode_characters`](ClassIndicator::mode_characters),
-//!   e.g. a hyphen, as a transparent gap); `digit` is bounded by itself, so its
-//!   `endmode`/`endmodeword` structurally can never fire; any other custom class is
+//!   e.g. a hyphen, as a transparent gap); `digit` by digits and the base characters of
+//!   digits, with the numeric mode characters as the gap; any other custom class is
 //!   bounded by `letter`, like uppercase without the transparency carve-out.
 //!
 //! [`mode::IndicatorBuilder::build`](super::mode::IndicatorBuilder::build) picks the
