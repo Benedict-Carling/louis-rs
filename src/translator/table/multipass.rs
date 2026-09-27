@@ -4,7 +4,7 @@ use crate::translator::effect::Environment;
 use crate::translator::table::TableContext;
 use crate::{
     Direction,
-    parser::{AnchoredRule, Rule},
+    parser::{AnchoredRule, Rule, TestInstruction},
     translator::{TranslationError, TranslationStage},
 };
 
@@ -65,105 +65,113 @@ impl MultipassTable {
         self.trace(input).iter().map(|t| t.output()).collect()
     }
 
-    fn translation_candidates(
-        &self,
-        input: &str,
-        _prev: Option<char>,
-        env: &Environment,
-        at_start: bool,
-    ) -> (Vec<ResolvedTranslation>, Vec<ResolvedTranslation>) {
-        self.patterns
-            .find(input, env, at_start)
-            .into_iter()
-            .partition(|t| t.offset() == 0)
-    }
-
-    fn update_offsets(
-        &self,
-        translations: Vec<ResolvedTranslation>,
-        decrement: usize,
-    ) -> Vec<ResolvedTranslation> {
-        translations
-            .into_iter()
-            // drop translations where the offet is smaller than the decrement
-            .filter(|t| t.offset() >= decrement)
-            .map(|t| t.decrement_offset(decrement))
-            .collect()
-    }
-
-    fn partition_delayed_translations(
-        &self,
-        delayed: Vec<ResolvedTranslation>,
-    ) -> (Vec<ResolvedTranslation>, Vec<ResolvedTranslation>) {
-        delayed.into_iter().partition(|t| t.offset() == 0)
-    }
-
+    /// liblouis's `translatePass`: at each position the rule whose test starts there with the
+    /// most literal characters applies; the characters before its replacement are copied
     pub fn trace(&self, input: &str) -> Vec<ResolvedTranslation> {
         let mut translations: Vec<ResolvedTranslation> = Vec::new();
-        let mut delayed_translations: Vec<ResolvedTranslation> = Vec::new();
+        // rules found with a leading lookback, and how far ahead their test starts
+        let mut looking_back: Vec<(usize, ResolvedTranslation)> = Vec::new();
+        // the rule that applies once the characters before its replacement are copied
+        let mut forced: Option<ResolvedTranslation> = None;
         let mut env = Environment::new();
         let mut chars = input.chars();
-        let mut prev: Option<char> = None;
         // liblouis copies the next character unchanged after a rule that did not advance
         let mut advanced = true;
+        let mut copied = false;
 
         loop {
-            // given an input query the patterns for matching translations. Then split off the
-            // translations that are delayed, i.e. have an offset because they have a pre-pattern
-            let at_start = chars.as_str().len() == input.len();
-            let (mut candidates, delayed) =
-                self.translation_candidates(chars.as_str(), prev, &env, at_start);
-            delayed_translations.extend(delayed);
-
-            // move delayed_translations with zero offset into candidates
-            let (current, delayed) = self.partition_delayed_translations(delayed_translations);
-            delayed_translations = delayed;
-            candidates.extend(current);
-
-            // use the longest translation
-            let candidate = candidates
-                .iter()
-                .filter(|_| advanced)
-                .cloned()
-                .max_by_key(|translation| translation.rank());
-            advanced = true;
-            if let Some(t) = candidate {
-                if t.length() == 0 {
-                    advanced = false;
-                } else {
-                    // move the iterator forward by the number of characters in the translation
-                    chars.nth(t.length() - 1);
-                    prev = t.input().chars().last();
+            if forced.is_none() {
+                let at_start = chars.as_str().len() == input.len();
+                let (mut candidates, later): (Vec<_>, Vec<_>) = self
+                    .patterns
+                    .find(chars.as_str(), &env, at_start)
+                    .into_iter()
+                    .map(|t| (leading_lookback(&t).min(t.offset()), t))
+                    .partition(|(start, _)| *start == 0);
+                looking_back.extend(later);
+                let (due, later): (Vec<_>, Vec<_>) =
+                    looking_back.drain(..).partition(|(start, _)| *start == 0);
+                looking_back = later;
+                candidates.extend(due);
+                copied = false;
+                if advanced {
+                    forced = candidates
+                        .into_iter()
+                        .map(|(_, t)| t)
+                        .max_by_key(|t| (literal_prefix(t), t.rank()));
                 }
-                // there is a matching translation rule
-                let translation = t.clone();
-                translations.push(translation);
-                delayed_translations = self.update_offsets(delayed_translations, t.length());
-
-                // update the environment if needed
-                if !t.effects().is_empty() {
+            }
+            advanced = true;
+            let step = match forced.take_if(|t| t.offset() == 0) {
+                Some(t) => {
+                    // a rule whose test started at an earlier position has advanced
+                    if t.length() == 0 && !copied {
+                        advanced = false;
+                    } else if t.length() > 0 {
+                        chars.nth(t.length() - 1);
+                    }
                     for effect in t.effects() {
                         env.apply(effect);
                     }
+                    translations.push(t.clone());
+                    t.length()
                 }
-            } else if let Some(next_char) = chars.next() {
-                prev = Some(next_char);
-                // no translation rule found, just pass the character through
-                let translation = ResolvedTranslation::new(
-                    &next_char.to_string(),
-                    &next_char.to_string(),
-                    1,
-                    self.stage,
-                    None,
-                );
-                translations.push(translation);
-                delayed_translations = self.update_offsets(delayed_translations, 1);
-            } else {
-                // the chars iterator is exhausted
-                break;
-            }
+                None => match chars.next() {
+                    Some(next_char) => {
+                        // no rule applies here, or one applies further on: copy the character
+                        translations.push(ResolvedTranslation::new(
+                            &next_char.to_string(),
+                            &next_char.to_string(),
+                            1,
+                            self.stage,
+                            None,
+                        ));
+                        forced = forced.map(|t| t.decrement_offset(1));
+                        copied = true;
+                        1
+                    }
+                    None => break,
+                },
+            };
+            looking_back = looking_back
+                .into_iter()
+                .filter(|(start, _)| *start >= step)
+                .map(|(start, t)| (start - step, t.decrement_offset(step)))
+                .collect();
         }
         translations
+    }
+}
+
+/// How far back the test's leading lookback reaches before the rule's position
+fn leading_lookback(translation: &ResolvedTranslation) -> usize {
+    match translation.rule() {
+        Some(
+            Rule::Correct { test, .. }
+            | Rule::Pass2 { test, .. }
+            | Rule::Pass3 { test, .. }
+            | Rule::Pass4 { test, .. },
+        ) => test
+            .tests()
+            .iter()
+            .map_while(|t| match t {
+                TestInstruction::Lookback { len } => Some(*len as usize),
+                _ => None,
+            })
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn literal_prefix(translation: &ResolvedTranslation) -> usize {
+    match translation.rule() {
+        Some(
+            Rule::Correct { test, .. }
+            | Rule::Pass2 { test, .. }
+            | Rule::Pass3 { test, .. }
+            | Rule::Pass4 { test, .. },
+        ) => test.literal_prefix(),
+        _ => 0,
     }
 }
 
@@ -287,6 +295,39 @@ mod tests {
             MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Post1, &ctx)
                 .unwrap();
         assert_eq!(transform.translate("⠁⠁⠂"), "⠠⠁⠄");
+    }
+
+    #[test]
+    fn literal_prefix_ranks_first() {
+        let rules = [parse_rule("pass2 $a @4"), parse_rule("pass2 @1 @2")];
+        let ctx = TableContext::default();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Post1, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("⠁"), "⠂");
+    }
+
+    #[test]
+    fn rule_starting_earlier_applies_first() {
+        let rules = [parse_rule("pass2 $a[@12] @4"), parse_rule("pass2 @12 @2")];
+        let ctx = TableContext::default();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Post1, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("⠁⠃"), "⠁⠈");
+    }
+
+    #[test]
+    fn zero_length_rule_begun_earlier_advances() {
+        let rules = [
+            parse_rule("pass2 $a[]@12 @4"),
+            parse_rule("pass2 $a[]@14 @5"),
+        ];
+        let ctx = TableContext::default();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Post1, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("⠁⠃⠉"), "⠁⠈⠃⠐⠉");
     }
 
     #[test]
