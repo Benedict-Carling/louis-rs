@@ -20,6 +20,54 @@ impl Test {
         &self.tests
     }
 
+    /// The number of characters liblouis indexes a `context` rule under: those of the first
+    /// string the test checks, less any it steps back over (`passFindCharacters`)
+    pub fn leading_chars(&self) -> usize {
+        fn walk(tests: &[TestInstruction], lookback: &mut usize) -> Option<usize> {
+            for test in tests {
+                let test = match test {
+                    TestInstruction::Negate { test } => test.as_ref(),
+                    test => test,
+                };
+                let count = match test {
+                    TestInstruction::String { s } => s.chars().count(),
+                    TestInstruction::Dots { dots } => dots.len(),
+                    TestInstruction::Replace { tests } => match walk(tests, lookback) {
+                        Some(n) => return Some(n),
+                        None => continue,
+                    },
+                    TestInstruction::Lookback { len } => {
+                        *lookback += *len as usize;
+                        continue;
+                    }
+                    TestInstruction::Attributes { quantifier, .. }
+                    | TestInstruction::Class { quantifier, .. } => {
+                        let n = match quantifier {
+                            None => 1,
+                            Some(Quantifier::Number(n)) => *n as usize,
+                            _ => return Some(0),
+                        };
+                        if n > *lookback {
+                            return Some(0);
+                        }
+                        *lookback -= n;
+                        continue;
+                    }
+                    TestInstruction::Variable { .. }
+                    | TestInstruction::AtBeginning
+                    | TestInstruction::AtEnd => continue,
+                    TestInstruction::Negate { .. } => return Some(0),
+                };
+                if count > *lookback {
+                    return Some(count - *lookback);
+                }
+                *lookback -= count;
+            }
+            None
+        }
+        walk(&self.tests, &mut 0).unwrap_or(0)
+    }
+
     fn has_replace(&self) -> bool {
         self.tests
             .iter()
@@ -652,6 +700,17 @@ mod tests {
 
     use super::braille::BrailleDot;
     use super::*;
+
+    #[test]
+    fn leading_chars() {
+        let chars = |test: &str| Parser::new(test).tests().unwrap().leading_chars();
+        assert_eq!(chars(r#""ab"["c"]"#), 2);
+        assert_eq!(chars(r#"#1=1["abc"]"#), 3);
+        assert_eq!(chars(r#"_1$l["ab"]"#), 2);
+        assert_eq!(chars(r#"_1"ab""#), 1);
+        assert_eq!(chars(r#"$l["ab"]"#), 0);
+        assert_eq!(chars("#1=1"), 0);
+    }
 
     #[test]
     fn implicit_replace_ends_before_trailing_lookback() {

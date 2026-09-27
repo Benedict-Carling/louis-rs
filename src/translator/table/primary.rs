@@ -2011,6 +2011,7 @@ impl PrimaryTable {
                         .rev()
                         .max_by_key(|t| (t.length() == 0, BackwardSelector::order(t)))
                 }
+                None if self.direction == Direction::Forward => select_forward(unseen),
                 // use the longest translation
                 None => unseen.max_by_key(|translation| translation.rank()),
             };
@@ -2146,6 +2147,33 @@ impl PrimaryTable {
             Some(Rule::Joinnum { .. }) => self.digit_chars.contains(&next),
             _ => self.letter_or_litdigit_chars.contains(&next),
         }
+    }
+}
+
+/// Pick the forward candidate as liblouis does: a `context` rule ranks by the characters it
+/// is indexed under and wins ties, and one indexed under none overrides any rule that is not
+/// a `context` rule
+fn select_forward<'a>(
+    candidates: impl Iterator<Item = &'a ResolvedTranslation>,
+) -> Option<&'a ResolvedTranslation> {
+    let leading_chars = |t: &ResolvedTranslation| match t.rule() {
+        Some(Rule::Context { test, .. }) => Some(test.leading_chars()),
+        _ => None,
+    };
+    let (indexed, unindexed): (Vec<_>, Vec<_>) = candidates
+        .map(|t| (t, leading_chars(t)))
+        .partition(|(_, chars)| *chars != Some(0));
+    let best = indexed.into_iter().max_by_key(|(t, chars)| match chars {
+        Some(n) => (t.length() == 0, *n, true, t.weight()),
+        None => (t.length() == 0, t.length(), false, t.weight()),
+    });
+    match best {
+        Some((t, Some(_))) => Some(t),
+        best => unindexed
+            .into_iter()
+            .map(|(t, _)| t)
+            .max_by_key(|t| t.rank())
+            .or(best.map(|(t, _)| t)),
     }
 }
 
@@ -3593,6 +3621,29 @@ mod tests {
         assert_eq!(table.translate("aa"), "⠁⠁");
         assert_eq!(table.translate("aa;aa"), "⠁⠁⠸⠁⠁");
         assert_eq!(table.translate("aa:aa;aa"), "⠁⠁⠇⠄⠄⠸⠁⠁");
+    }
+
+    #[test]
+    fn context_ranks_by_leading_chars() {
+        let translate = |rule: &str, input: &str| {
+            let rules = [
+                parse_rule("lowercase a 1"),
+                parse_rule("lowercase b 2"),
+                parse_rule("lowercase c 3"),
+                parse_rule("always ab 12"),
+                parse_rule(rule),
+            ];
+            let context = TableContext::compile(&rules).unwrap();
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap()
+                .translate(input)
+        };
+        // indexed under "a", it loses to the longer "ab" however much it matches
+        assert_eq!(translate("noback context \"a\"$l$l @6", "abc"), "⠃⠄");
+        // indexed under as many characters as "ab", it wins
+        assert_eq!(translate("noback context \"ab\"$l @6", "abc"), "⠠");
+        // indexed under none, it overrides "ab"
+        assert_eq!(translate("noback context $l\"b\" @6", "ab"), "⠠");
     }
 
     #[test]
