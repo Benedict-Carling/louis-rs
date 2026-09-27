@@ -197,9 +197,7 @@ impl Indicator {
             let mut prev: Option<char> = None;
             let mut char_pos = 0;
             for (byte_pos, c) in input.char_indices() {
-                if !self.noletsign_chars.contains(&c)
-                    && self.contraction_at(&input[byte_pos..], prev, &chars, char_pos)
-                {
+                if self.contraction_at(&input[byte_pos..], prev, &chars, char_pos) {
                     fire.insert(char_pos);
                 }
                 prev = Some(c);
@@ -321,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn noletsign_suppresses_contraction_letsign() {
+    fn noletsign_leaves_contraction_letsign() {
         let mut builder = IndicatorBuilder::new();
         builder.letsign("⠠", &rule("letsign 6"));
         builder.contraction("ab", &rule("contraction ab"));
@@ -330,8 +328,11 @@ mod tests {
         let ctx = TableContext::new(cc, CharacterClasses::default(), Default::default());
         let indicator = builder.build(&ctx, None).unwrap();
 
-        // "ab" is a contraction, but 'a' is listed in noletsign, so no letsign fires.
-        assert_eq!(pairs(&indicator.precompute("ab")), vec![]);
+        // liblouis's insertLetterSign only consults noletsign for plain letters
+        assert_eq!(
+            pairs(&indicator.precompute("ab")),
+            vec![(0, "⠠".to_string())]
+        );
     }
 
     #[test]
