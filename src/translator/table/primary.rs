@@ -202,8 +202,14 @@ impl PrimaryTableBuilder {
     /// boundary checks against: text classes for forward translation, dots classes for
     /// backward. The tries need it from construction on, since `Trie::insert` resolves those
     /// checks against its own context immediately rather than deferring to match time.
-    fn new(trie_ctx: CharacterClasses, direction: Direction) -> Self {
-        let trie = Trie::new().with_context(trie_ctx.clone());
+    fn new(
+        trie_ctx: CharacterClasses,
+        direction: Direction,
+        case_folding: HashMap<char, char>,
+    ) -> Self {
+        let trie = Trie::new()
+            .with_context(trie_ctx.clone())
+            .with_case_folding(case_folding.clone());
         let trie = match direction {
             Direction::Forward => trie,
             Direction::Backward => trie.keep_all(),
@@ -213,9 +219,15 @@ impl PrimaryTableBuilder {
             character_translations: CharacterTranslation::new(),
             trie,
             comp6_trie: Trie::new().with_context(trie_ctx.clone()).case_sensitive(),
-            prepunc_trie: Trie::new().with_context(trie_ctx.clone()),
-            postpunc_trie: Trie::new().with_context(trie_ctx.clone()),
-            nocross_trie: Trie::new().with_context(trie_ctx),
+            prepunc_trie: Trie::new()
+                .with_context(trie_ctx.clone())
+                .with_case_folding(case_folding.clone()),
+            postpunc_trie: Trie::new()
+                .with_context(trie_ctx.clone())
+                .with_case_folding(case_folding.clone()),
+            nocross_trie: Trie::new()
+                .with_context(trie_ctx)
+                .with_case_folding(case_folding),
             match_patterns: MatchPatternsBuilder::new(),
             context_patterns: ContextPatternsBuilder::new(),
             numeric_indicator: numeric::IndicatorBuilder::new(),
@@ -471,7 +483,7 @@ impl PrimaryTable {
             Direction::Forward => ctx.character_classes.clone(),
             Direction::Backward => ctx.dots_classes().clone(),
         };
-        let mut builder = PrimaryTableBuilder::new(trie_ctx, direction);
+        let mut builder = PrimaryTableBuilder::new(trie_ctx, direction, ctx.case_folding().clone());
         if direction == Direction::Forward {
             builder.sequences = Sequences::new(ctx);
         }
@@ -537,30 +549,8 @@ impl PrimaryTable {
             })
             .collect();
 
-        // liblouis keeps a base unless the character was defined before it
-        let mut defined_before = HashSet::new();
-        for rule in rules {
-            match &rule.rule {
-                Rule::Base {
-                    name,
-                    derived,
-                    base,
-                } if !defined_before.contains(derived) => {
-                    builder.emphasis_indicator.base(name, *derived, *base);
-                }
-                Rule::Space { character, .. }
-                | Rule::Punctuation { character, .. }
-                | Rule::Digit { character, .. }
-                | Rule::Litdigit { character, .. }
-                | Rule::Letter { character, .. }
-                | Rule::Lowercase { character, .. }
-                | Rule::Uppercase { character, .. }
-                | Rule::Sign { character, .. }
-                | Rule::Math { character, .. } => {
-                    defined_before.insert(*character);
-                }
-                _ => {}
-            }
+        for (name, derived, base) in super::kept_bases(rules) {
+            builder.emphasis_indicator.base(&name, derived, base);
         }
 
         // decpoint and hyphen take precedence over other character definition rules, so insert

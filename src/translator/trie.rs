@@ -1,6 +1,6 @@
 //! Store and find simple translation rules using a prefix tree ([Trie](https://en.wikipedia.org/wiki/Trie))
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::{
     parser::{AnchoredRule, CharacterClass, CharacterClasses, Direction, Precedence},
@@ -125,19 +125,8 @@ struct TrieNode {
 }
 
 impl TrieNode {
-    fn char_transition(&self, c: char, case_sensitive: bool) -> Option<&TrieNode> {
-        if case_sensitive {
-            self.transitions.get(&ResolvedTransition::Character(c))
-        } else if c.to_lowercase().count() != 1 {
-            // FIXME: we ignore characters that do not map to a single
-            // character lowercase character
-            None
-        } else {
-            // case insensitive character transition
-            let lowercase = c.to_lowercase().next().unwrap();
-            self.transitions
-                .get(&ResolvedTransition::Character(lowercase))
-        }
+    fn char_transition(&self, c: char) -> Option<&TrieNode> {
+        self.transitions.get(&ResolvedTransition::Character(c))
     }
 }
 
@@ -152,6 +141,9 @@ pub struct Trie {
     /// being lowercased first. Needed for `comp6`, where `comp6 a 1` and `comp6 A 17`
     /// are independent rules.
     case_sensitive: bool,
+    /// liblouis's `toLowercase`: the capitals a `base uppercase` rule derives, mapped to
+    /// their base. Rule and input characters are compared through it.
+    case_folding: HashMap<char, char>,
     /// When true, every translation is kept instead of one per path, and boundary checks
     /// are left to the caller.
     keep_all: bool,
@@ -163,6 +155,7 @@ impl Trie {
             root: TrieNode::default(),
             ctx: CharacterClasses::default(),
             case_sensitive: false,
+            case_folding: HashMap::new(),
             keep_all: false,
         }
     }
@@ -178,6 +171,21 @@ impl Trie {
 
     pub fn with_context(self, ctx: CharacterClasses) -> Self {
         Trie { ctx, ..self }
+    }
+
+    pub fn with_case_folding(self, case_folding: HashMap<char, char>) -> Self {
+        Trie {
+            case_folding,
+            ..self
+        }
+    }
+
+    fn fold(&self, c: char) -> char {
+        if self.case_sensitive {
+            c
+        } else {
+            self.case_folding.get(&c).copied().unwrap_or(c)
+        }
     }
 
     pub fn case_sensitive(self) -> Self {
@@ -247,9 +255,16 @@ impl Trie {
             "Cannot insert empty `from` string (or `to` string in case of backward translation) - this causes infinite loops when translating"
         );
 
+        // liblouis files a rule under its first two characters as written but looks it up
+        // by the input's lowercased ones, so a capital there makes the rule unreachable
+        let folded: Vec<char> = from
+            .chars()
+            .enumerate()
+            .map(|(i, c)| if i < 2 { c } else { self.fold(c) })
+            .collect();
         if self.keep_all {
             let mut node = &mut self.root;
-            for c in from.chars() {
+            for &c in &folded {
                 node = node
                     .transitions
                     .entry(ResolvedTransition::Character(c))
@@ -295,7 +310,7 @@ impl Trie {
             current_node = current_node.transitions.entry(t).or_default();
         }
 
-        for c in from.chars() {
+        for &c in &folded {
             current_node = current_node
                 .transitions
                 .entry(ResolvedTransition::Character(c))
@@ -359,7 +374,7 @@ impl Trie {
         let c = chars.next();
         if let Some(c) = c {
             let bytes = c.len_utf8();
-            if let Some(node) = node.char_transition(c, self.case_sensitive) {
+            if let Some(node) = node.char_transition(self.fold(c)) {
                 matching_rules.extend(self.find_translations_from_node(
                     &input[bytes..],
                     Some(c),
@@ -814,7 +829,7 @@ mod tests {
 
     #[test]
     fn find_translations_case_insensitive() {
-        let mut trie = Trie::new();
+        let mut trie = Trie::new().with_case_folding(HashMap::from([('F', 'f'), ('O', 'o')]));
         let rule = fake_rule();
         let foo = ResolvedTranslation::new("foo", "FOO", 3, TranslationStage::Main, rule.clone());
         trie.insert(
@@ -832,6 +847,29 @@ mod tests {
         assert_eq!(trie.find_translations("Foo", None), vec![foo.clone()]);
         assert_eq!(trie.find_translations("FOO", None), vec![foo.clone()]);
         assert_eq!(trie.find_translations("foO", None), vec![foo.clone()]);
+    }
+
+    #[test]
+    fn capitals_fold_only_through_the_case_folding() {
+        let mut trie = Trie::new().with_case_folding(HashMap::from([('O', 'o')]));
+        let rule = fake_rule();
+        for from in ["Goo", "Oox"] {
+            trie.insert(
+                from,
+                "X",
+                None,
+                None,
+                Direction::Forward,
+                Precedence::Default,
+                vec![],
+                TranslationStage::Main,
+                &rule,
+            );
+        }
+        assert_eq!(trie.find_translations("GOO", None).len(), 1);
+        assert!(trie.find_translations("goo", None).is_empty());
+        // a capital among the first two characters of a rule is never looked up
+        assert!(trie.find_translations("Oox", None).is_empty());
     }
 
     #[test]
