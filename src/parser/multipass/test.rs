@@ -36,7 +36,7 @@ impl Test {
             let len = usize::from(*len);
             let rest = &self.tests[1..];
             if rest.len() > len && rest[..len].iter().all(TestInstruction::matches_one_char) {
-                let mut tests = rest[..len].to_vec();
+                let mut tests = self.tests[..=len].to_vec();
                 tests.push(TestInstruction::Replace {
                     tests: rest[len..].to_vec(),
                 });
@@ -731,6 +731,7 @@ mod tests {
         assert!(matches!(
             test.tests().as_slice(),
             [
+                TestInstruction::Lookback { len: 1 },
                 TestInstruction::Attributes { .. },
                 TestInstruction::Replace { tests }
             ] if matches!(tests.as_slice(), [TestInstruction::Dots { .. }])
