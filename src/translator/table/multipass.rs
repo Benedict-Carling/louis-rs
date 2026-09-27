@@ -23,9 +23,9 @@ struct MultipassTableBuilder {
 }
 
 impl MultipassTableBuilder {
-    fn new() -> Self {
+    fn new(direction: Direction) -> Self {
         Self {
-            patterns: ContextPatternsBuilder::new(),
+            patterns: ContextPatternsBuilder::new().for_direction(direction),
         }
     }
 
@@ -45,7 +45,7 @@ impl MultipassTable {
         stage: TranslationStage,
         ctx: &TableContext,
     ) -> Result<Self, TranslationError> {
-        let mut builder = MultipassTableBuilder::new();
+        let mut builder = MultipassTableBuilder::new(direction);
 
         for rule in rules {
             match &rule.rule {

@@ -218,7 +218,7 @@ impl PrimaryTableBuilder {
             postpunc_trie: Trie::new().with_context(trie_ctx.clone()),
             nocross_trie: Trie::new().with_context(trie_ctx),
             match_patterns: MatchPatternsBuilder::new(),
-            context_patterns: ContextPatternsBuilder::new(),
+            context_patterns: ContextPatternsBuilder::new().for_direction(direction),
             numeric_indicator: numeric::IndicatorBuilder::new(),
             uppercase_indicator: uppercase::IndicatorBuilder::new(),
             mode_indicator: mode::IndicatorBuilder::new(),
