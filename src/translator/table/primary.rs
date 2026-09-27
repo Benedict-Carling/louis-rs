@@ -936,6 +936,9 @@ impl PrimaryTable {
                     builder
                         .computer_braille_indicator
                         .begcomp(&dots.to_string(), rule);
+                    if direction == Direction::Backward {
+                        builder.insert_backward_indicator(&dots.to_string(), rule);
+                    }
                 }
                 Rule::Endcomp { dots, .. } => {
                     builder
@@ -3268,6 +3271,16 @@ mod tests {
         ]);
         assert_eq!(table.translate("⠬⠙"), "§ 4");
         assert_eq!(table.translate("⠬"), "§");
+    }
+
+    #[test]
+    fn backward_begcomp_is_an_indicator() {
+        let table = backward_table(&[
+            parse_rule("lowercase a 1"),
+            parse_rule("punctuation ' 6"),
+            parse_rule("begcomp 6-46"),
+        ]);
+        assert_eq!(table.translate("⠠⠨⠁"), "a");
     }
 
     #[test]
