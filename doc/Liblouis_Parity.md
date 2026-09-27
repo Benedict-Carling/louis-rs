@@ -57,8 +57,11 @@ three tiers — `capsletter`, `begcapsword`/`endcapsword`, and caps passages via
 `begcaps`/`endcaps` or `begcapsphrase`/`endcapsphrase`/`lencapsphrase` — plus letter
 sign, `nocontract`, and the generic `begmode`/`endmode` family.
 
-**Emphasis.** `begemph`/`endemph` and the word/symbol tiers. liblouis's own
-`new_emph.yaml` and `en-us-emphasis_harness.yaml` pass at 100%.
+**Emphasis.** Capitals and the typeform classes share liblouis's model
+(`src/translator/indication/emphasis.rs`): `markEmphases` resolves begin/end/word/symbol
+marks per class, and the translation loop inserts them as `insertEmphasesAt` does,
+including the capital start indicator again when a zero-width rule leaves the position
+unchanged. `correct` carries the typeforms over to its output.
 
 **Computer braille** as a full pipeline feature — `comp6`, `compbrl`,
 `begcomp`/`endcomp`, and a scanner that derives computer-braille spans from
@@ -132,8 +135,7 @@ a few hundred either way on the million-assertion files.
 | `hu-hu-g1_dictionary_special_consonants`            |      11 | Four `always` rules defined twice with different dots in `hu-exceptionwords.cti`; liblouis keeps the first, a definition-order tie (table bug).                                   | —    |
 | `sw-ke-dictionary`, `sw-ke`                         |      37 | Not yet surveyed; the backward lookup that spliced in unrelated dictionary words went with the back-translation rule selection.                                                                    | M    |
 | `en-g3`, `en-ueb`                                   |    ≈600 | A literal hyphen breaks per-segment contraction in compounds — "do-it-yourself" gives `do-x-y\|rself`, not `d-x-yrf`.                                                            | M    |
-| `numericmode`, `capsword`, `mixed-case`            |    ≈110 | Forward translations match; the expectations are written in the table's own `display` characters, which we decline to infer (ADR "Don't infer `DisplayTable` entries"). Some of `mixed-case` fail in liblouis too. | —    |
-| `de-g0-detailed-specs`, `de-g1-…`                   |    ≈280 | `capsletter` vs. `begcapsword` tier selection. Needs `uppercase.rs` and `emphasis.rs` unified into one tier model — a blanket engine fix was tried and disproven.                | L    |
+| `mixed-case`                                        |       5 | liblouis fails the same five tests with the same output.                                                                                                                         | —    |
 | all other files                                     |  ≈2 500 | Roughly 100 files, each contributing well under 350.                                                                                                                             | —    |
 
 Two cross-cutting items have no single file behind them:
@@ -148,9 +150,9 @@ Two cross-cutting items have no single file behind them:
 - **Engine debt.** Regexp negation of concatenation and alternation is wrong
   (`!(e1e2)` ≠ `(!e1!e2)`); `Attribute::ByOrder` and `Any` are no-ops in
   `match_pattern.rs` and all three are no-ops in `context_pattern.rs`; the
-  `syllable` opcode's cross-boundary restriction is unimplemented. In multipass and
-  `context` tests `_N` is dropped rather than looking back, which is why `no-no-g2`'s pass4 rule
-  `_!$sp[@6@6]` rewrites `⠰⠠⠠` differently and back-translating `NVV` fails. *(M)*
+  `syllable` opcode's cross-boundary restriction is unimplemented. A `_N` is honoured
+  only at the start of a test (matched from N characters back); elsewhere it is
+  dropped. *(M)*
 
 ## Forty-four blocks that never run
 
@@ -209,11 +211,9 @@ Good entry points, roughly easiest first:
    than deep engine work — and each of the three clusters that got this treatment
    turned out to be one or two root causes rather than a long tail. *(M)*
 
-The two architectural items — match-rule candidate selection, and unifying the
-capitalization and emphasis tier models — each already have one failed attempt behind
-them, so they're poor first contributions but well documented in
-[Architecture_Decision_Records.org](Architecture_Decision_Records.org). Read the
-relevant ADR before starting; both record an approach that was tested and disproven.
+Match-rule candidate selection has one failed attempt behind it, so it's a poor first
+contribution but well documented in
+[Architecture_Decision_Records.org](Architecture_Decision_Records.org).
 
 ## Also open
 
