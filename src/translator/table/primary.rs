@@ -2119,6 +2119,19 @@ impl PrimaryTable {
                         delayed_translations = self.update_offsets(delayed_translations, 1);
                     }
                 }
+                // and puts one back after them when back-translating, if there is more to come
+                if self.direction == Direction::Backward
+                    && matches!(t.rule(), Some(Rule::Joinword { .. } | Rule::Joinnum { .. }))
+                    && !chars.as_str().is_empty()
+                {
+                    translations.push(ResolvedTranslation::new(
+                        "",
+                        " ",
+                        0,
+                        TranslationStage::Main,
+                        None,
+                    ));
+                }
 
                 // update the environment if needed
                 if !t.effects().is_empty() {
@@ -2902,6 +2915,25 @@ mod tests {
                 .unwrap();
         assert_eq!(table.translate("1a"), "⠂⠠⠁");
         assert_eq!(table.translate("1A"), "⠂⠠⠨⠁");
+    }
+
+    #[test]
+    fn a_joinword_is_followed_by_a_space_when_back_translating() {
+        let rules = [
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase y 13456"),
+            parse_rule("lowercase a 1"),
+            parse_rule("joinword by 356"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table = PrimaryTable::compile(
+            &rules,
+            Direction::Backward,
+            TranslationStage::Main,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(table.translate("⠴⠁"), "by a");
     }
 
     #[test]
