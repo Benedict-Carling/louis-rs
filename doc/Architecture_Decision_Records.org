@@ -1648,6 +1648,14 @@ callers ask for ~translations_at(pos)~ directly.
   ~prevTransOpcode~ for ~midnum~, but without the ~exactdots~ escape
   hatch), the pre-computation assumption would need to be revisited.
 
+*Update (2026-09-27):* one such dependency did turn up. ~checkNumericMode~
+runs only where a rule starts, so a character consumed inside a longer
+translation neither ends nor starts a number (no-no-g0's context rule
+for "1 " in "1 1/2"). In tables using numeric mode the translation loop
+now steps the numeric indicator as it visits positions
+(~PrecomputedIndications::translations_at~); everything else is still
+precomputed.
+
 ** Pros and Cons of the Options
 
 *** Status quo with typeform state machine added
