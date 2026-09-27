@@ -1857,6 +1857,8 @@ impl PrimaryTable {
         };
 
         let mut backward_state = backward::State::default();
+        // a `context` rule liblouis files among its pass rules, due at the current position
+        let mut forced: Option<ResolvedTranslation> = None;
 
         loop {
             if last_indications_pos != Some(char_pos) {
@@ -1899,8 +1901,25 @@ impl PrimaryTable {
 
             // then search for context patterns. Unless they have empty pre patterns they will all
             // have an offset. Split those off.
-            let (context_candidates, context_delayed) =
+            let (mut context_candidates, mut context_delayed) =
                 self.context_candidates(chars.as_str(), &env, at_start);
+            if self.direction == Direction::Forward {
+                let is_pass_rule = |t: &ResolvedTranslation| {
+                    t.rule()
+                        .is_some_and(|rule| backward::context_cells(rule) == 0)
+                };
+                let pass_rule = context_candidates
+                    .iter()
+                    .chain(&context_delayed)
+                    .filter(|t| is_pass_rule(t) && !seen.contains(&TranslationSubset::from(*t)))
+                    .max_by_key(|t| t.rank())
+                    .cloned();
+                context_candidates.retain(|t| !is_pass_rule(t));
+                context_delayed.retain(|t| !is_pass_rule(t));
+                if forced.is_none() {
+                    forced = pass_rule;
+                }
+            }
             delayed_translations.extend(context_delayed);
             // merge the candidates from the context patters with the candidates from the plain translations
             candidates.extend(context_candidates);
@@ -2015,6 +2034,15 @@ impl PrimaryTable {
                 // use the longest translation
                 None => unseen.max_by_key(|translation| translation.rank()),
             };
+            // liblouis's findForPassRule overrides the rule for_selectRule chose, and copies
+            // the characters before the replacement one by one
+            let forced_now = forced.take_if(|t| t.offset() == 0);
+            let (candidate, nocross_candidate) = match (&forced_now, &forced) {
+                (Some(t), _) => (Some(t), None),
+                (None, Some(_)) => (None, None),
+                (None, None) => (candidate, nocross_candidate),
+            };
+            forced = forced.map(|t| t.decrement_offset(1));
             // A nocross rule wins if there is no plain candidate to beat (many, e.g.
             // liblouis' `nocross always en`, have no plain counterpart at all).
             if let Some(nocross) = &nocross_candidate
@@ -3618,6 +3646,25 @@ mod tests {
         assert_eq!(table.translate("aa"), "⠁⠁");
         assert_eq!(table.translate("aa;aa"), "⠁⠁⠸⠁⠁");
         assert_eq!(table.translate("aa:aa;aa"), "⠁⠁⠇⠄⠄⠸⠁⠁");
+    }
+
+    /// A `context` rule whose test starts with no literal is one of liblouis's pass rules:
+    /// when it matches, it overrides the rule chosen at that position, even a longer one
+    #[test]
+    fn context_pass_rule_overrides_longer_rule() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase c 14"),
+            parse_rule("always abc 3456"),
+            parse_rule("context $l[\"bc\"] @2"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("abc"), "⠁⠂");
+        assert_eq!(table.translate("cabc"), "⠉⠁⠂");
     }
 
     #[test]
