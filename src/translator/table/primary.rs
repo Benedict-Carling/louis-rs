@@ -1968,7 +1968,9 @@ impl PrimaryTable {
 
             // inside a numeric run, suppress multi-character contractions
             if constraints.dont_contract_at(char_pos) {
-                candidates.retain(|t| t.length() <= 1);
+                // liblouis' `dontContract` leaves the context rules alone
+                candidates
+                    .retain(|t| t.length() <= 1 || matches!(t.rule(), Some(Rule::Context { .. })));
             }
 
             // Backward no-contract mode: a letsign/nocontractsign/nonumsign says the
@@ -2918,6 +2920,21 @@ mod tests {
         assert_eq!(table.translate("§ 1"), "⠬⠼⠁");
         assert_eq!(table.translate("§  1"), "⠬⠼⠁");
         assert_eq!(table.translate("§ a"), "⠬⠀⠁");
+    }
+
+    #[test]
+    fn context_rule_inside_a_number() {
+        let rules = [
+            parse_rule("space \\s 0"),
+            parse_rule("digit 1 1"),
+            parse_rule("numsign 3456"),
+            parse_rule("noback context [$d$s]$d @1"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("1 1"), "⠼⠁⠼⠁");
     }
 
     #[test]
