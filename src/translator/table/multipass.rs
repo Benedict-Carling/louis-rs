@@ -53,12 +53,6 @@ impl MultipassTable {
                 | Rule::Pass2 { test, action, .. }
                 | Rule::Pass3 { test, action, .. }
                 | Rule::Pass4 { test, action, .. } => {
-                    if direction == Direction::Backward && !action.consumes_input() {
-                        // Correct rules can map to an empty string, i.e. to drop some
-                        // characters. Such rules cannot be used for backtranslation (you cannot
-                        // translate the empty string to something)
-                        continue;
-                    }
                     builder.patterns.insert(test, action, rule, stage, ctx)?;
                 }
                 _ => (),
@@ -241,6 +235,20 @@ mod tests {
                 .unwrap();
         assert_eq!(transform.translate("⠃⠃"), "⠃");
         assert_eq!(transform.translate("⠃⠙⠃"), "⠃⠙⠃");
+    }
+
+    #[test]
+    fn backward_copy_rule_keeps_its_match_from_other_rules() {
+        let rules = [
+            parse_rule("nofor pass2 @2357 @f-235"),
+            parse_rule("nofor pass2 @6-2357 *"),
+        ];
+        let ctx = TableContext::default();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Backward, TranslationStage::Post1, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("⠠⡖"), "⠠⡖");
+        assert_eq!(transform.translate("⡖"), "\u{f4000}⠖");
     }
 
     #[test]
