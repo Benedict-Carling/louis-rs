@@ -237,6 +237,22 @@ mod tests {
     }
 
     #[test]
+    fn copy_rule_keeps_what_its_lookback_steps_over() {
+        let rules = [
+            parse_rule("noback pass2 _@15[@12] *"),
+            parse_rule("noback pass2 @15[@14] *"),
+            parse_rule("noback pass2 @12 @2"),
+        ];
+        let ctx = TableContext::default();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Post1, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("⠑⠃"), "⠑⠃");
+        assert_eq!(transform.translate("⠑⠉"), "⠉");
+        assert_eq!(transform.translate("⠃"), "⠂");
+    }
+
+    #[test]
     fn backward_copy_rule_keeps_its_match_from_other_rules() {
         let rules = [
             parse_rule("nofor pass2 @2357 @f-235"),
