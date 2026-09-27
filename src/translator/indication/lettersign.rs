@@ -93,8 +93,8 @@ impl IndicatorBuilder {
         .flatten()
         .collect();
 
-        let space_chars: HashSet<char> = cc
-            .get(&CharacterClass::Space)
+        let digit_chars: HashSet<char> = cc
+            .get(&CharacterClass::Digit)
             .into_iter()
             .flatten()
             .collect();
@@ -104,7 +104,7 @@ impl IndicatorBuilder {
             sequences,
             start_translation,
             letter_chars,
-            space_chars,
+            digit_chars,
             noletsign_chars: self.noletsign_chars,
             noletsignafter_chars: self.noletsignafter_chars,
             noletsignbefore_chars: self.noletsignbefore_chars,
@@ -139,8 +139,9 @@ pub struct Indicator {
     start_translation: ResolvedTranslation,
     /// Characters that are considered letters (Letter + Uppercase + Lowercase classes).
     letter_chars: HashSet<char>,
-    /// Characters that are considered spaces (Space class).
-    space_chars: HashSet<char>,
+    /// Characters of the `digit` class, after which a letter takes the letter sign even
+    /// when more letters follow.
+    digit_chars: HashSet<char>,
     /// These letters must never themselves be preceded by a letter sign.
     noletsign_chars: HashSet<char>,
     /// When one of these characters follows a single letter the letsign must NOT be inserted.
@@ -159,14 +160,9 @@ impl Indicator {
         let mut fire: HashSet<usize> = HashSet::new();
 
         // ── Isolation-based letsign ───────────────────────────────────────────
-        // Fires for a letter that is isolated (not followed by another letter)
-        // AND whose preceding character, if any, is neither a space nor a letter.
-        // This covers:
-        //   - letters at string start before punctuation (e.g. `b:`, prev=None)
-        //   - Tamil consonants followed by vowel signs or virama (prev=digit/punct)
-        //   - letters that immediately follow a digit or other non-letter, non-space char
-        // It does NOT fire when preceded by a space (word boundary: "a", "I'm")
-        // or by another letter (tail of a word: `:bc` — 'c' has prev='b').
+        // liblouis's insertLetterSign: a letter not preceded by a letter, and either not
+        // followed by one or preceded by a digit. `noletsign` letters, which include every
+        // letter with a one-letter word rule, are left alone.
         for (i, &c) in chars.iter().enumerate() {
             if !self.letter_chars.contains(&c) || self.noletsign_chars.contains(&c) {
                 continue;
@@ -184,9 +180,9 @@ impl Indicator {
             }
 
             let isolated = next.is_none_or(|n| !self.letter_chars.contains(&n));
-            let prev_is_space_or_letter = prev
-                .is_some_and(|p| self.space_chars.contains(&p) || self.letter_chars.contains(&p));
-            if isolated && !prev_is_space_or_letter {
+            let prev_is_letter = prev.is_some_and(|p| self.letter_chars.contains(&p));
+            let prev_is_digit = prev.is_some_and(|p| self.digit_chars.contains(&p));
+            if (isolated || prev_is_digit) && !prev_is_letter {
                 fire.insert(i);
             }
         }
@@ -197,9 +193,7 @@ impl Indicator {
             let mut prev: Option<char> = None;
             let mut char_pos = 0;
             for (byte_pos, c) in input.char_indices() {
-                if !self.noletsign_chars.contains(&c)
-                    && self.contraction_at(&input[byte_pos..], prev, &chars, char_pos)
-                {
+                if self.contraction_at(&input[byte_pos..], prev, &chars, char_pos) {
                     fire.insert(char_pos);
                 }
                 prev = Some(c);
@@ -277,7 +271,24 @@ mod tests {
     }
 
     #[test]
-    fn isolated_letter_fires_when_not_preceded_by_space() {
+    fn letter_after_a_digit_fires_even_before_more_letters() {
+        let mut builder = IndicatorBuilder::new();
+        builder.letsign("⠠", &rule("letsign 6"));
+        let cc = CharacterClasses::new(&[
+            (CharacterClass::Letter, &['a', 'b']),
+            (CharacterClass::Digit, &['2']),
+        ]);
+        let ctx = TableContext::new(cc, CharacterClasses::default(), Default::default());
+        let indicator = builder.build(&ctx, None).unwrap();
+        assert_eq!(
+            pairs(&indicator.precompute("2ab")),
+            vec![(1, "⠠".to_string())]
+        );
+        assert_eq!(pairs(&indicator.precompute(" ab")), vec![]);
+    }
+
+    #[test]
+    fn isolated_letter_fires() {
         let indicator = build_indicator(&['a', 'b', 'c'], &[], None);
         // isolated letter at string start (prev=None): fires
         assert_eq!(
@@ -289,9 +300,11 @@ mod tests {
             pairs(&indicator.precompute("2b")),
             vec![(1, "⠠".to_string())]
         );
-        // isolated letter preceded by space: does NOT fire
-        assert_eq!(pairs(&indicator.precompute("x b")), vec![]);
-        assert_eq!(pairs(&indicator.precompute(" b ")), vec![]);
+        // isolated letter preceded by space: fires too
+        assert_eq!(
+            pairs(&indicator.precompute(" b ")),
+            vec![(1, "⠠".to_string())]
+        );
         // letter followed by another letter (not isolated): does NOT fire
         assert_eq!(pairs(&indicator.precompute(":bc")), vec![]);
         // multi-letter word: no letsign
@@ -321,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn noletsign_suppresses_contraction_letsign() {
+    fn noletsign_does_not_suppress_contraction_letsign() {
         let mut builder = IndicatorBuilder::new();
         builder.letsign("⠠", &rule("letsign 6"));
         builder.contraction("ab", &rule("contraction ab"));
@@ -330,8 +343,11 @@ mod tests {
         let ctx = TableContext::new(cc, CharacterClasses::default(), Default::default());
         let indicator = builder.build(&ctx, None).unwrap();
 
-        // "ab" is a contraction, but 'a' is listed in noletsign, so no letsign fires.
-        assert_eq!(pairs(&indicator.precompute("ab")), vec![]);
+        // liblouis inserts the letter sign before a contraction without consulting noletsign
+        assert_eq!(
+            pairs(&indicator.precompute("ab")),
+            vec![(0, "⠠".to_string())]
+        );
     }
 
     #[test]

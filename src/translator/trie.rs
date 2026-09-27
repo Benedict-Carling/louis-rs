@@ -7,7 +7,7 @@ use crate::{
     translator::TranslationStage,
 };
 
-use super::ResolvedTranslation;
+use super::{ResolvedTranslation, Rule};
 
 /// The union of one or more character classes, pre-resolved to their actual member
 /// characters.
@@ -81,9 +81,36 @@ pub enum ClassConstraint {
     End(CharacterClass),
 }
 
+/// Character definitions count as one opcode: a cell or character has one definition.
+fn same_opcode(rule: Option<&Rule>, origin: &AnchoredRule) -> bool {
+    let is_definition = |rule: &Rule| {
+        matches!(
+            rule,
+            Rule::Space { .. }
+                | Rule::Digit { .. }
+                | Rule::Litdigit { .. }
+                | Rule::Punctuation { .. }
+                | Rule::Math { .. }
+                | Rule::Sign { .. }
+                | Rule::Letter { .. }
+                | Rule::Uppercase { .. }
+                | Rule::Lowercase { .. }
+                | Rule::Grouping { .. }
+                | Rule::Base { .. }
+        )
+    };
+    rule.is_some_and(|rule| {
+        std::mem::discriminant(rule) == std::mem::discriminant(&origin.rule)
+            || (is_definition(rule) && is_definition(&origin.rule))
+    })
+}
+
 #[derive(Default, Debug, Clone)]
 struct TrieNode {
-    translation: Option<ResolvedTranslation>,
+    /// Rules of equal precedence and different opcodes ending here. They only differ in how
+    /// the translation loop filters them (e.g. `prepunc` and `postpunc`); the one that wins
+    /// when more than one survives is last in the list.
+    translations: Vec<ResolvedTranslation>,
     // `BTreeMap` rather than `HashMap`: iteration order needs to be deterministic between runs
     // for candidates that tie on `ResolvedTranslation::rank` in `find_translations_from_node`
     // (see the ADR "Rule selection does not depend on table order"). A tie is an ill-formed
@@ -292,36 +319,28 @@ impl Trie {
             }
         }
 
-        if let Some(translation) = &current_node.translation {
-            // this node already contains a translation
-            if precedence > translation.precedence() {
-                current_node.translation = Some(ResolvedTranslation::new(
-                    from,
-                    to,
-                    length,
-                    stage,
-                    origin.clone(),
-                ));
-            } else if cfg!(feature = "backwards_compatibility") {
-                // first rule wins, so nothing to insert
-            } else {
-                // last rule wins
-                current_node.translation = Some(ResolvedTranslation::new(
-                    from,
-                    to,
-                    length,
-                    stage,
-                    origin.clone(),
-                ));
+        let translation = ResolvedTranslation::new(from, to, length, stage, origin.clone());
+        let existing = current_node.translations.first().map(|t| t.precedence());
+        let translations = &mut current_node.translations;
+        // backward translation keeps a single rule per node
+        let same = |t: &ResolvedTranslation| {
+            direction == Direction::Backward || same_opcode(t.rule(), origin)
+        };
+        match existing {
+            Some(existing) if precedence > existing => *translations = vec![translation],
+            Some(existing) if precedence < existing => {}
+            _ if cfg!(feature = "backwards_compatibility") => {
+                // first rule wins: of the same opcode, and of a tie in the translation loop,
+                // which picks the last of equally ranked candidates
+                if !translations.iter().any(same) {
+                    translations.insert(0, translation);
+                }
             }
-        } else {
-            current_node.translation = Some(ResolvedTranslation::new(
-                from,
-                to,
-                length,
-                stage,
-                origin.clone(),
-            ));
+            _ => {
+                // last rule wins
+                translations.retain(|t| !same(t));
+                translations.push(translation);
+            }
         }
     }
 
@@ -334,11 +353,8 @@ impl Trie {
         let mut matching_rules = Vec::new();
         let mut chars = input.chars();
 
-        // if this node has a translation add it to the list of matching rules
-        if let Some(ref translation) = node.translation {
-            let translation = translation.clone();
-            matching_rules.push(translation)
-        }
+        // if this node has translations add them to the list of matching rules
+        matching_rules.extend(node.translations.iter().cloned());
         matching_rules.extend(node.alternatives.iter().cloned());
         let c = chars.next();
         if let Some(c) = c {
@@ -402,6 +418,34 @@ mod tests {
     fn fake_rule() -> AnchoredRule {
         let rule = RuleParser::new("always foo 1").rule().unwrap();
         AnchoredRule::new(rule, None, 0)
+    }
+
+    #[test]
+    fn rules_of_different_opcodes_share_a_node() {
+        let mut trie = Trie::new();
+        let prepunc = AnchoredRule::new(RuleParser::new("prepunc \" 236").rule().unwrap(), None, 0);
+        let postpunc =
+            AnchoredRule::new(RuleParser::new("postpunc \" 356").rule().unwrap(), None, 0);
+        for (rule, dots) in [(&prepunc, "⠦"), (&postpunc, "⠴")] {
+            trie.insert(
+                "\"",
+                dots,
+                None,
+                None,
+                Direction::Forward,
+                Precedence::Default,
+                vec![],
+                TranslationStage::Main,
+                rule,
+            );
+        }
+        let outputs: Vec<String> = trie
+            .find_translations("\"", None)
+            .iter()
+            .map(|t| t.output())
+            .collect();
+        assert_eq!(outputs.len(), 2);
+        assert!(outputs.contains(&"⠦".to_string()) && outputs.contains(&"⠴".to_string()));
     }
 
     #[test]

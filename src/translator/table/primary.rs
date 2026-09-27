@@ -7,11 +7,12 @@ use crate::{
     emphasis::EmphasisSpan,
     parser::{
         AnchoredRule, Braille, BrailleChars, CharacterClass, CharacterClasses, HasNocross,
-        HasPrecedence, WithClass,
+        HasPrecedence, WithClass, WithMatch,
     },
     translator::{
         CharacterDefinition, ClassConstraint, ResolvedTranslation, Rule, TranslationError,
         TranslationMode, TranslationOptions, TranslationStage,
+        case::CaseClasses,
         context_pattern::{ContextPatterns, ContextPatternsBuilder},
         effect::Environment,
         indication::{
@@ -141,9 +142,10 @@ pub struct PrimaryTable {
     sequences: Option<Sequences>,
     /// Backward-only: picks among the rules the trie finds at a position.
     backward: Option<BackwardSelector>,
-    uppercase_chars: HashSet<char>,
-    lowercase_chars: HashSet<char>,
-    letter_chars: HashSet<char>,
+    case: CaseClasses,
+    capsletter_defined: bool,
+    syllables: Vec<Vec<char>>,
+    letter_or_litdigit_chars: HashSet<char>,
 }
 
 /// A builder for [`PrimaryTable`]
@@ -171,9 +173,25 @@ struct PrimaryTableBuilder {
     sequences: Option<Sequences>,
     backward: Option<BackwardSelector>,
     direction: Direction,
+    capsletter_defined: bool,
+    syllables: Vec<Vec<char>>,
 }
 
 impl PrimaryTableBuilder {
+    /// finalizeTable: a letter with a single-letter `word` or `largesign` rule never takes
+    /// the letter sign.
+    fn noletsign_if_single_letter(&mut self, chars: &str, ctx: &TableContext) {
+        let mut letters = chars.chars();
+        if let (Some(c), None) = (letters.next(), letters.next())
+            && ctx
+                .character_classes()
+                .get(&CharacterClass::Letter)
+                .is_some_and(|letters| letters.contains(&c))
+        {
+            self.lettersign_indicator.noletsign(chars);
+        }
+    }
+
     /// `trie_ctx` must be the character classes to resolve `Transition`/`ClassConstraint`
     /// boundary checks against: text classes for forward translation, dots classes for
     /// backward. The tries need it from construction on, since `Trie::insert` resolves those
@@ -207,6 +225,8 @@ impl PrimaryTableBuilder {
             sequences: None,
             backward: None,
             direction,
+            capsletter_defined: false,
+            syllables: Vec::new(),
         }
     }
 
@@ -330,6 +350,14 @@ impl PrimaryTableBuilder {
             character_translations: self.character_translations,
             direction,
             fallback_definitions: ctx.character_definitions().clone(),
+            case: CaseClasses::from_context(ctx),
+            capsletter_defined: self.capsletter_defined,
+            syllables: self.syllables,
+            letter_or_litdigit_chars: [CharacterClass::Letter, CharacterClass::Litdigit]
+                .iter()
+                .filter_map(|class| ctx.character_classes().get(class))
+                .flatten()
+                .collect(),
             trie: self.trie,
             comp6_trie: self.comp6_trie,
             nocross_trie: self.nocross_trie,
@@ -376,18 +404,6 @@ impl PrimaryTableBuilder {
             }),
             sequences: self.sequences,
             backward: self.backward,
-            uppercase_chars: ctx
-                .character_classes()
-                .get(&CharacterClass::Uppercase)
-                .unwrap_or_default(),
-            lowercase_chars: ctx
-                .character_classes()
-                .get(&CharacterClass::Lowercase)
-                .unwrap_or_default(),
-            letter_chars: ctx
-                .character_classes()
-                .get(&CharacterClass::Letter)
-                .unwrap_or_default(),
         }
     }
 }
@@ -514,7 +530,6 @@ impl PrimaryTable {
                     // character achieves this via the numeric indicator and constrainer.
                     let s = character.to_string();
                     builder.numeric_indicator.midnum(&s);
-                    builder.numeric_constrainer.midnum(&s);
                 }
                 Rule::Hyphen {
                     character, dots, ..
@@ -618,13 +633,14 @@ impl PrimaryTable {
                 }
                 Rule::Midendnumericmodechars { chars } => {
                     builder.numeric_indicator.midendnumericmodechars(chars);
-                    builder.numeric_constrainer.uses_numeric_mode();
+                    builder.numeric_constrainer.midendnumericmodechars(chars);
                 }
                 Rule::Numericmodechars { chars } => {
                     builder.numeric_indicator.numericmodechars(chars);
                     builder.numeric_constrainer.numericmodechars(chars);
                 }
                 Rule::Capsletter { dots, .. } => {
+                    builder.capsletter_defined = true;
                     builder
                         .uppercase_indicator
                         .capsletter(&dots.to_string(), rule);
@@ -925,6 +941,11 @@ impl PrimaryTable {
                 //
                 // TODO: Implement the cross-boundary restriction.
                 Rule::Syllable { chars, dots } => {
+                    if direction == Direction::Forward {
+                        builder
+                            .syllables
+                            .push(chars.to_lowercase().chars().collect());
+                    }
                     let dots = ctx
                         .character_definitions()
                         .braille_to_unicode(dots, chars)?;
@@ -974,6 +995,7 @@ impl PrimaryTable {
                     builder.compbrl_triggers.push(chars.clone());
                 }
                 Rule::Largesign { chars, dots } => {
+                    builder.noletsign_if_single_letter(chars, ctx);
                     builder.get_trie_mut(rule).insert(
                         chars,
                         &dots.to_string(),
@@ -992,6 +1014,7 @@ impl PrimaryTable {
                     with_classes,
                     ..
                 } => {
+                    builder.noletsign_if_single_letter(chars, ctx);
                     let dots = ctx
                         .character_definitions()
                         .braille_to_unicode(dots, chars)?;
@@ -1258,6 +1281,26 @@ impl PrimaryTable {
                         rule,
                     );
                 }
+                Rule::Joinword { chars, dots, .. } => builder.get_trie_mut(rule).insert(
+                    chars,
+                    &dots.to_string(),
+                    Some(Transition::Start(vec![
+                        CharacterClass::Space,
+                        CharacterClass::Punctuation,
+                    ])),
+                    // the rest of liblouis's forward check is in `join_following_spaces`
+                    Some(Transition::End(match direction {
+                        Direction::Forward => vec![CharacterClass::Space],
+                        Direction::Backward => {
+                            vec![CharacterClass::Space, CharacterClass::Punctuation]
+                        }
+                    })),
+                    direction,
+                    rule.precedence(),
+                    vec![],
+                    TranslationStage::Main,
+                    rule,
+                ),
                 Rule::Lowword { chars, dots, .. } => builder.get_trie_mut(rule).insert(
                     chars,
                     &dots.to_string(),
@@ -1269,28 +1312,6 @@ impl PrimaryTable {
                     TranslationStage::Main,
                     rule,
                 ),
-                Rule::Joinword { chars, dots, .. } => {
-                    builder.get_trie_mut(rule).insert(
-                        chars,
-                        &dots.to_string(),
-                        // FIXME: joinword, prepunc and postpunc need more advanced
-                        // scaning of the input. Just checking for before and after
-                        // classes as below is too simplistic
-                        Some(Transition::Start(vec![
-                            CharacterClass::Space,
-                            CharacterClass::Punctuation,
-                        ])),
-                        Some(Transition::End(vec![
-                            CharacterClass::Space,
-                            CharacterClass::Punctuation,
-                        ])),
-                        direction,
-                        rule.precedence(),
-                        vec![],
-                        TranslationStage::Main,
-                        rule,
-                    )
-                }
                 Rule::Begnum { chars, dots, .. } => builder.get_trie_mut(rule).insert(
                     chars,
                     &dots.to_string(),
@@ -1323,7 +1344,6 @@ impl PrimaryTable {
                 }
                 Rule::Midnum { chars, dots, .. } => {
                     builder.numeric_indicator.midnum(chars);
-                    builder.numeric_constrainer.midnum(chars);
                     builder.get_trie_mut(rule).insert(
                         chars,
                         &dots.to_string(),
@@ -1596,6 +1616,66 @@ impl PrimaryTable {
             .collect()
     }
 
+    /// liblouis's `joinword`: valid only when spaces and then a letter follow
+    /// (`onlyLettersAhead`). The spaces count towards its weight; the translation loop
+    /// swallows them once it is chosen.
+    fn join_following_spaces(
+        &self,
+        t: ResolvedTranslation,
+        chars: &[char],
+        pos: usize,
+    ) -> Option<ResolvedTranslation> {
+        let end = pos + t.length();
+        let spaces = chars[end.min(chars.len())..]
+            .iter()
+            .take_while(|c| self.space_chars.contains(c))
+            .count();
+        let next = chars.get(end + spaces)?;
+        if spaces == 0 || !self.letter_or_litdigit_chars.contains(next) {
+            return None;
+        }
+        let weight = t.weight() + spaces + 1;
+        Some(t.with_weight(weight))
+    }
+
+    /// liblouis's `markSyllables`: each `syllable` match, and everything after it up to the
+    /// next one, gets one of two alternating marks, so no rule can span a syllable boundary.
+    fn syllable_marks(&self, chars: &[char]) -> Vec<u64> {
+        const MARKS: [u64; 2] = [1 << 61, 1 << 62];
+        let mut marks = vec![0; chars.len()];
+        if self.syllables.is_empty() {
+            return marks;
+        }
+        let (mut current, mut next) = (0, 0);
+        let mut pos = 0;
+        while pos < chars.len() {
+            let len = self
+                .syllables
+                .iter()
+                .filter(|s| {
+                    s.len() <= chars.len() - pos
+                        && s.iter()
+                            .zip(&chars[pos..])
+                            .all(|(s, c)| c.to_lowercase().eq(std::iter::once(*s)))
+                })
+                .map(|s| s.len())
+                .max();
+            match len {
+                Some(len) if len > 0 => {
+                    current = MARKS[next];
+                    next = 1 - next;
+                    marks[pos..pos + len].iter_mut().for_each(|m| *m |= current);
+                    pos += len;
+                }
+                _ => {
+                    marks[pos] |= current;
+                    pos += 1;
+                }
+            }
+        }
+        marks
+    }
+
     fn match_candidates(
         &self,
         input: &str,
@@ -1669,47 +1749,6 @@ impl PrimaryTable {
         let indications = self.indicators.precompute(input, &enriched_spans);
         let constraints = self.constrainers.precompute(input, &enriched_spans);
         let input_chars: Vec<char> = input.chars().collect();
-        let caps_at: Vec<bool> = (0..=input_chars.len())
-            .map(|pos| {
-                indications
-                    .translations_at(pos)
-                    .iter()
-                    .any(|t| t.rule().is_some_and(is_caps_indicator))
-            })
-            .collect();
-        // liblouis's `validMatch` and `checkEmphasisChange`: in forward translation a rule
-        // of several characters may not span a change of case after its second character,
-        // and some opcodes may not span a caps indicator either
-        let spans_change = |t: &ResolvedTranslation, pos: usize| {
-            let len = match t.rule() {
-                Some(rule @ Rule::Context { .. }) => backward::context_cells(rule),
-                _ => t.length(),
-            };
-            if self.direction == Direction::Backward || len < 2 || pos + len > input_chars.len() {
-                return false;
-            }
-            let case = |c: &char| {
-                (
-                    self.uppercase_chars.contains(c),
-                    self.lowercase_chars.contains(c),
-                )
-            };
-            let span = &input_chars[pos..pos + len];
-            let case_change = span.windows(2).skip(1).any(|pair| {
-                let (a, b) = (case(&pair[0]), case(&pair[1]));
-                b != (false, false) && self.letter_chars.contains(&pair[0]) && a != b
-            });
-            case_change
-                || (matches!(
-                    t.rule(),
-                    Some(
-                        Rule::Always { .. }
-                            | Rule::Syllable { .. }
-                            | Rule::Word { .. }
-                            | Rule::Match { .. }
-                    )
-                ) && (pos + 1..pos + len).any(|i| caps_at[i]))
-        };
         let stands_alone = |t: &ResolvedTranslation, pos: usize| match &self.sequences {
             Some(sequences)
                 if matches!(t.rule(), Some(Rule::Word { .. } | Rule::Contraction { .. })) =>
@@ -1717,6 +1756,80 @@ impl PrimaryTable {
                 sequences.in_sequence(&input_chars, pos, t.length())
             }
             _ => true,
+        };
+        // liblouis's typebuf: the emphasis classes of each character, plus a capitals bit
+        // when the table defines capsletter
+        let classes: Vec<&str> = options
+            .emphasis()
+            .iter()
+            .map(|s| s.class.as_str())
+            .collect();
+        let syllable_marks = self.syllable_marks(&input_chars);
+        let typebuf: Vec<u64> = (0..input_chars.len())
+            .map(|pos| {
+                let caps = self.capsletter_defined && self.case.is_uppercase(input_chars[pos]);
+                options
+                    .emphasis()
+                    .iter()
+                    .filter(|span| span.range.contains(&pos))
+                    .filter_map(|span| classes.iter().position(|c| *c == span.class))
+                    .fold(caps as u64 | syllable_marks[pos], |bits, i| {
+                        bits | 2 << i.min(58)
+                    })
+            })
+            .collect();
+        let valid_match = |t: &ResolvedTranslation, pos: usize| {
+            if self.direction == Direction::Backward {
+                return true;
+            }
+            // liblouis files a context rule by the characters its test starts with
+            let len = match t.rule() {
+                Some(rule @ Rule::Context { .. }) => backward::context_cells(rule),
+                _ => t.length(),
+            };
+            let end = (pos + len).min(typebuf.len());
+            let first = typebuf.get(pos).copied().unwrap_or(0);
+            let same_typeform =
+                first & 1 != 0 || typebuf[pos.min(end)..end].iter().all(|k| k & !first == 0);
+            same_typeform && self.case.valid_match(&input_chars, pos, len)
+        };
+        // where liblouis's emphasisBuffer (caps included) marks a begin, end, word or symbol
+        let emphasis_at = |caps_only: bool| -> Vec<bool> {
+            (0..=input_chars.len())
+                .map(|pos| {
+                    indications
+                        .translations_at(pos)
+                        .iter()
+                        .any(|t| is_emphasis_indicator(t.rule(), caps_only))
+                })
+                .collect()
+        };
+        let (emphasis_at, caps_at) = (emphasis_at(false), emphasis_at(true));
+        let emphasis_allows = |t: &ResolvedTranslation, pos: usize| {
+            if self.direction == Direction::Backward {
+                return true;
+            }
+            let end = pos + t.length();
+            let at = |i: usize| emphasis_at.get(i).copied().unwrap_or(false);
+            let interior = matches!(
+                t.rule(),
+                Some(
+                    Rule::Always { .. }
+                        | Rule::Syllable { .. }
+                        | Rule::Word { .. }
+                        | Rule::Match { .. }
+                )
+            ) && (pos + 1..end).any(|i| caps_at[i]);
+            let (before, after) = match t.rule() {
+                Some(Rule::Match {
+                    matches: Some(m), ..
+                }) => (
+                    m.contains(&WithMatch::Before),
+                    m.contains(&WithMatch::After),
+                ),
+                _ => (false, false),
+            };
+            !(interior || (before && at(pos)) || (after && at(end)))
         };
 
         let mut backward_state = backward::State::default();
@@ -1735,7 +1848,11 @@ impl PrimaryTable {
             let nocross_candidate = self
                 .nocross_candidates(chars.as_str(), prev, char_pos, &constraints)
                 .into_iter()
-                .filter(|t| stands_alone(t, char_pos) && !spans_change(t, char_pos))
+                .filter(|t| {
+                    stands_alone(t, char_pos)
+                        && valid_match(t, char_pos)
+                        && emphasis_allows(t, char_pos)
+                })
                 .max_by_key(|t| t.rank());
 
             // given an input query the trie for matching translations. Then split off the
@@ -1768,9 +1885,22 @@ impl PrimaryTable {
             // boundary and gated here instead. Rejected candidates are simply dropped,
             // leaving the position to fall through to the plain punctuation character
             // definition (`character_translations`), matching liblouis.
+            candidates.retain(|t| valid_match(t, char_pos) && emphasis_allows(t, char_pos));
+
+            if self.direction == Direction::Forward {
+                candidates = candidates
+                    .into_iter()
+                    .filter_map(|t| match t.rule() {
+                        Some(Rule::Joinword { .. }) => {
+                            self.join_following_spaces(t, &input_chars, char_pos)
+                        }
+                        _ => Some(t),
+                    })
+                    .collect();
+            }
+
             candidates.retain(|t| match t.rule() {
                 _ if self.backward.is_some() => true,
-                _ if spans_change(t, char_pos) => false,
                 Some(Rule::Joinnum { .. }) => {
                     self.number_follows(&chars.as_str()[t.input().len()..])
                 }
@@ -1779,11 +1909,35 @@ impl PrimaryTable {
                 _ => stands_alone(t, char_pos),
             });
 
-            // inside a numeric run, suppress multi-character contractions
+            // liblouis's dontContract refuses these opcodes whatever their length
             if self.direction == Direction::Forward && constraints.dont_contract_at(char_pos) {
-                // liblouis' `dontContract` leaves the context rules alone
-                candidates
-                    .retain(|t| t.length() <= 1 || matches!(t.rule(), Some(Rule::Context { .. })));
+                candidates.retain(|t| {
+                    !matches!(
+                        t.rule(),
+                        Some(
+                            Rule::Always { .. }
+                                | Rule::Syllable { .. }
+                                | Rule::Repeated { .. }
+                                | Rule::Repword { .. }
+                                | Rule::Rependword { .. }
+                                | Rule::Nocont { .. }
+                                | Rule::Largesign { .. }
+                                | Rule::Word { .. }
+                                | Rule::Partword { .. }
+                                | Rule::Joinnum { .. }
+                                | Rule::Lowword { .. }
+                                | Rule::Joinword { .. }
+                                | Rule::Sufword { .. }
+                                | Rule::Prfword { .. }
+                                | Rule::Begword { .. }
+                                | Rule::Begmidword { .. }
+                                | Rule::Midword { .. }
+                                | Rule::Midendword { .. }
+                                | Rule::Endword { .. }
+                                | Rule::Match { .. }
+                        )
+                    )
+                });
             }
 
             // In computer braille mode, discard normal candidates and use comp6 rules only.
@@ -1868,6 +2022,19 @@ impl PrimaryTable {
                 delayed_translations
                     .extend(self.match_candidates_within(consumed, nocross.length()));
             } else if let Some(t) = candidate {
+                // an endnum rule takes back the letter sign inserted before it (liblouis's
+                // CTO_EndNum case in translateString)
+                if self.direction == Direction::Forward
+                    && matches!(t.rule(), Some(Rule::Endnum { .. }))
+                    && let Some(i) = translations
+                        .iter()
+                        .rposition(|t| matches!(t.rule(), Some(Rule::Letsign { .. })))
+                    && translations[i + 1..]
+                        .iter()
+                        .all(|t| t.length() == 0 || t.input().is_empty())
+                {
+                    translations.remove(i);
+                }
                 let consumed = chars.as_str();
                 if t.length() == 0 {
                     // if there is a zero-length translation candiate we run the risk of an infinite
@@ -1904,6 +2071,30 @@ impl PrimaryTable {
                             t.origin(),
                         ));
                         delayed_translations = self.update_offsets(delayed_translations, 1);
+                    }
+                }
+
+                if self.direction == Direction::Forward
+                    && matches!(t.rule(), Some(Rule::Joinword { .. }))
+                {
+                    let spaces: String = chars
+                        .as_str()
+                        .chars()
+                        .take_while(|c| self.space_chars.contains(c))
+                        .collect();
+                    let n = spaces.chars().count();
+                    if n > 0 {
+                        chars.nth(n - 1);
+                        prev = spaces.chars().last();
+                        char_pos += n;
+                        translations.push(ResolvedTranslation::new(
+                            &spaces,
+                            "",
+                            n,
+                            TranslationStage::Main,
+                            None,
+                        ));
+                        delayed_translations = self.update_offsets(delayed_translations, n);
                     }
                 }
 
@@ -1977,19 +2168,6 @@ impl PrimaryTable {
     }
 }
 
-fn is_caps_indicator(rule: &Rule) -> bool {
-    matches!(
-        rule,
-        Rule::Capsletter { .. }
-            | Rule::Begcapsword { .. }
-            | Rule::Endcapsword { .. }
-            | Rule::Begcaps { .. }
-            | Rule::Endcaps { .. }
-            | Rule::Begcapsphrase { .. }
-            | Rule::Endcapsphrase { .. }
-    )
-}
-
 /// Map a char to dots according to the North American Braille Computer Code (NABCC)
 ///
 /// A fallback mapping for character to braille in case the table does
@@ -2020,6 +2198,34 @@ fn fallback(ch: char) -> BrailleChars {
         _ => unreachable!("no NABCC fallback for {ch:?}"),
     };
     BrailleChars::try_from(dots).expect("NABCC dot pattern is valid")
+}
+
+fn is_emphasis_indicator(rule: Option<&Rule>, caps_only: bool) -> bool {
+    let caps = matches!(
+        rule,
+        Some(
+            Rule::Capsletter { .. }
+                | Rule::Begcapsword { .. }
+                | Rule::Endcapsword { .. }
+                | Rule::Begcaps { .. }
+                | Rule::Endcaps { .. }
+                | Rule::Begcapsphrase { .. }
+                | Rule::Endcapsphrase { .. }
+        )
+    );
+    caps || !caps_only
+        && matches!(
+            rule,
+            Some(
+                Rule::Emphletter { .. }
+                    | Rule::Begemph { .. }
+                    | Rule::Endemph { .. }
+                    | Rule::Begemphword { .. }
+                    | Rule::Endemphword { .. }
+                    | Rule::Begemphphrase { .. }
+                    | Rule::Endemphphrase { .. }
+            )
+        )
 }
 
 #[cfg(test)]
@@ -2635,6 +2841,234 @@ mod tests {
         assert_eq!(table.translate("cd"), "⠠⠉⠙");
         assert_eq!(table.translate("abcd"), "⠁⠃⠉⠙");
         assert_eq!(table.translate("ef"), "⠑⠋");
+    }
+
+    #[test]
+    fn indicators_follow_liblouis_insertion_order() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("base uppercase A a"),
+            parse_rule("base uppercase B b"),
+            parse_rule("litdigit 1 1"),
+            parse_rule("capsletter 6"),
+            parse_rule("numsign 3456"),
+            parse_rule("nonumsign 56"),
+            parse_rule("numericnocontchars abAB"),
+            parse_rule("nocontractsign 5"),
+            parse_rule("contraction b"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        // nocontractsign before caps start
+        assert_eq!(table.translate("B"), "⠐⠠⠃");
+        // caps start before nonumsign
+        assert_eq!(table.translate("1A"), "⠼⠁⠠⠰⠁");
+    }
+
+    #[test]
+    fn empmatchafter_blocks_a_match_before_a_capital() {
+        let rules = [
+            parse_rule("lowercase s 234"),
+            parse_rule("lowercase e 15"),
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase w 2456"),
+            parse_rule("base uppercase S s"),
+            parse_rule("base uppercase W w"),
+            parse_rule("capsletter 6"),
+            parse_rule("empmatchafter match %a ea %a 2"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("seaw"), "⠎⠂⠺");
+        assert_eq!(table.translate("SeaW"), "⠠⠎⠑⠁⠠⠺");
+    }
+
+    #[test]
+    fn capital_inside_a_rule_prevents_it() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("base uppercase A a"),
+            parse_rule("base uppercase B b"),
+            parse_rule("capsletter 6"),
+            parse_rule("always ab 1234"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("ab"), "⠏");
+        assert_eq!(table.translate("aB"), "⠁⠠⠃");
+    }
+
+    #[test]
+    fn rule_must_not_reach_into_a_typeform_its_first_character_lacks() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("base uppercase A a"),
+            parse_rule("base uppercase B b"),
+            parse_rule("capsletter 6"),
+            parse_rule("always ab 1234"),
+            parse_rule("always abb 123456"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        let italic_b =
+            TranslationOptions::default().with_emphasis(vec![EmphasisSpan::new("italic", 1..2)]);
+        assert_eq!(table.translate_with_options("ab", &italic_b), "⠁⠃");
+        let italic_a =
+            TranslationOptions::default().with_emphasis(vec![EmphasisSpan::new("italic", 0..1)]);
+        assert_eq!(table.translate_with_options("ab", &italic_a), "⠏");
+        // a capital first letter lifts the check
+        assert_eq!(table.translate("Abb"), "⠠⠿");
+        assert_eq!(table.translate("aBb"), "⠁⠠⠃⠃");
+    }
+
+    #[test]
+    fn joinword_swallows_the_spaces_before_a_word() {
+        let rules = [
+            parse_rule("space \\s 0"),
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("punctuation . 256"),
+            parse_rule("joinword a 1-2"),
+            parse_rule("word a 1-5"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("a  b"), "⠁⠂⠃");
+        assert_eq!(table.translate("a ."), "⠁⠐⠀⠲");
+        assert_eq!(table.translate("a"), "⠁⠐");
+    }
+
+    #[test]
+    fn single_letter_word_rule_means_no_letter_sign() {
+        let rules = [
+            parse_rule("lowercase i 24"),
+            parse_rule("lowercase b 12"),
+            parse_rule("punctuation : 25"),
+            parse_rule("letsign 56"),
+            parse_rule("word i 24"),
+            parse_rule("contraction ib"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate(":i"), "⠒⠊");
+        assert_eq!(table.translate(":b"), "⠒⠰⠃");
+        // the letter sign before a contraction ignores noletsign
+        assert_eq!(table.translate("ib"), "⠰⠊⠃");
+    }
+
+    #[test]
+    fn no_rule_spans_a_syllable_boundary() {
+        let rules = [
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase i 24"),
+            parse_rule("lowercase g 1245"),
+            parse_rule("lowercase h 125"),
+            parse_rule("lowercase e 15"),
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase d 145"),
+            parse_rule("always gh 126"),
+            parse_rule("always ea 2"),
+            parse_rule("syllable head 125-2-145"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("bigh"), "⠃⠊⠣");
+        assert_eq!(table.translate("bighead"), "⠃⠊⠛⠓⠂⠙");
+    }
+
+    #[test]
+    fn lowword_needs_spaces_on_both_sides() {
+        let rules = [
+            parse_rule("space \\s 0"),
+            parse_rule("lowercase i 24"),
+            parse_rule("lowercase n 1345"),
+            parse_rule("punctuation . 256"),
+            parse_rule("lowword in 35"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("in"), "⠔");
+        assert_eq!(table.translate("in."), "⠊⠝⠲");
+    }
+
+    #[test]
+    fn number_refuses_single_letter_always_rules_after_it() {
+        let rules = [
+            parse_rule("space \\s 0"),
+            parse_rule("lowercase a 1"),
+            parse_rule("litdigit 1 1"),
+            parse_rule("punctuation . 256"),
+            parse_rule("numsign 3456"),
+            parse_rule("numericmodechars ."),
+            parse_rule("nocontractsign 56"),
+            parse_rule("nonumsign 56"),
+            parse_rule("always a 6"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("a"), "⠠");
+        assert_eq!(table.translate("1a"), "⠼⠁⠁");
+        assert_eq!(table.translate("1 a"), "⠼⠁⠀⠠");
+    }
+
+    #[test]
+    fn endnum_takes_back_the_letter_sign() {
+        let rules = [
+            parse_rule("lowercase s 234"),
+            parse_rule("lowercase t 2345"),
+            parse_rule("lowercase b 12"),
+            parse_rule("digit 1 1"),
+            parse_rule("letsign 56"),
+            parse_rule("endnum st 34"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("1st"), "⠁⠌");
+        assert_eq!(table.translate("1bt"), "⠁⠰⠃⠞");
+    }
+
+    #[test]
+    fn case_change_inside_a_rule_prevents_it() {
+        let rules = [
+            parse_rule("lowercase m 134"),
+            parse_rule("lowercase i 24"),
+            parse_rule("lowercase t 2345"),
+            parse_rule("base uppercase M m"),
+            parse_rule("base uppercase I i"),
+            parse_rule("base uppercase T t"),
+            parse_rule("always mit 2345"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("Mit"), "⠞");
+        assert_eq!(table.translate("MIT"), "⠞");
+        assert_eq!(table.translate("mIt"), "⠍⠊⠞");
+        assert_eq!(table.translate("miT"), "⠍⠊⠞");
     }
 
     #[test]

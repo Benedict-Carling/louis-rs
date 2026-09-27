@@ -223,6 +223,19 @@ impl ClassIndicator {
 
         if starts_clean && ends_clean {
             self.emit_clean_words(&words, result);
+        } else if let Some(begemphphrase) = &self.begemphphrase
+            && !self.endemphphrase_before
+            && words.len() >= self.len_phrase
+        {
+            // liblouis counts a partly emphasized word towards a passage too
+            result.push((
+                effective_run_start,
+                begemphphrase.clone(),
+                EmitKind::Unordered,
+            ));
+            if let Some(end_t) = &self.endemphphrase {
+                result.push((effective_run_end, end_t.clone(), EmitKind::Unordered));
+            }
         } else {
             self.emit_partial(chars, run_start, run_end, &words, result);
         }
@@ -499,7 +512,7 @@ impl Indicator {
 mod tests {
     use super::*;
     use crate::emphasis::EmphasisSpan;
-    use crate::parser::{AnchoredRule, RuleParser};
+    use crate::parser::{AnchoredRule, CharacterClass, RuleParser};
     use crate::translator::table::TableContext;
 
     fn rule(s: &str) -> AnchoredRule {
@@ -564,5 +577,25 @@ mod tests {
         assert_eq!(outputs_at(&result, 0), vec!["⠨"]); // "well"
         assert_eq!(outputs_at(&result, 5), vec!["⠨"]); // "known"
         assert!(outputs_at(&result, 4).is_empty()); // '-' — no indicator
+    }
+
+    #[test]
+    fn passage_may_end_inside_a_word() {
+        let mut b = IndicatorBuilder::new();
+        b.begemphword("bold", "⠘⠂", &rule("always a 1"));
+        b.endemphword("bold", "⠘⠄", &rule("always a 1"));
+        b.begemphphrase("bold", "⠘⠶", &rule("always a 1"));
+        b.endemphphrase("bold", "⠘⠄", &Position::After, &rule("always a 1"));
+        b.lenemphphrase("bold", 3);
+        let ctx = TableContext::new(
+            CharacterClasses::new(&[(CharacterClass::Space, &[' '])]),
+            CharacterClasses::default(),
+            Default::default(),
+        );
+        let indicator = b.build(&ctx).unwrap();
+
+        let result = indicator.precompute("ab cd ef.", &[EmphasisSpan::new("bold", 0..8)]);
+        assert_eq!(outputs_at(&result, 0), vec!["⠘⠶"]);
+        assert_eq!(outputs_at(&result, 8), vec!["⠘⠄"]);
     }
 }

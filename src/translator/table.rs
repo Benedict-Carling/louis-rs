@@ -199,6 +199,11 @@ impl TableContext {
                         if name == "uppercase" || name == "lowercase" {
                             character_classes.insert(CharacterClass::Letter, *derived);
                         }
+                        dots_classes.insert_associated_dot(
+                            CharacterClass::from(name.as_str()),
+                            *base,
+                            &character_definitions,
+                        );
                     } else {
                         // hm, there is no character definition for the base character.
                         // If we are backwards compatible ignore the problem, otherwise
@@ -416,6 +421,20 @@ mod tests {
                 .dots_classes
                 .get(&CharacterClass::UserDefined("accent".to_string())),
             Some(HashSet::from(['⠐']))
+        );
+    }
+
+    #[test]
+    fn dots_classes_includes_base_attribute() {
+        let rules = [
+            parse_rule("lowercase b 12"),
+            parse_rule("base uppercase B b"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+
+        assert_eq!(
+            context.dots_classes.get(&CharacterClass::Uppercase),
+            Some(HashSet::from(['⠃']))
         );
     }
 

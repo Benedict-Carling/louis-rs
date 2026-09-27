@@ -15,6 +15,7 @@
 //! to have exactly the same behaviour. Find a way to merge them.
 
 use crate::translator::TranslationStage;
+use crate::translator::case::CaseClasses;
 use crate::translator::sequence::{Sequences, whole_word_boundaries};
 use crate::translator::table::TableContext;
 use crate::{
@@ -72,6 +73,7 @@ impl IndicatorBuilder {
                     contractions: trie,
                     sequences,
                     start_translation,
+                    case: CaseClasses::from_context(ctx),
                 })
             }
             Some(_) => {
@@ -100,6 +102,7 @@ pub struct Indicator {
     contractions: Trie,
     sequences: Option<Sequences>,
     start_translation: ResolvedTranslation,
+    case: CaseClasses,
 }
 
 impl Indicator {
@@ -126,9 +129,11 @@ impl Indicator {
             .find_translations(s, prev)
             .iter()
             .any(|t| {
-                self.sequences
-                    .as_ref()
-                    .is_none_or(|seq| seq.in_sequence(chars, pos, t.length()))
+                self.case.valid_match(chars, pos, t.length())
+                    && self
+                        .sequences
+                        .as_ref()
+                        .is_none_or(|seq| seq.in_sequence(chars, pos, t.length()))
             })
     }
 }

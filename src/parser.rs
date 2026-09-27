@@ -887,6 +887,8 @@ impl std::fmt::Display for Rule {
                 write!(f, "largesign {} {}", chars, dots)
             }
             Rule::Word { chars, dots, .. } => write!(f, "word {} {}", chars, dots),
+            Rule::Joinword { chars, dots, .. } => write!(f, "joinword {} {}", chars, dots),
+            Rule::Lowword { chars, dots, .. } => write!(f, "lowword {} {}", chars, dots),
             Rule::Contraction { chars } => write!(f, "contraction {}", chars),
             Rule::Begword { chars, dots, .. } => write!(f, "begword {} {}", chars, dots),
             Rule::Begmidword { chars, dots, .. } => write!(f, "begmidword {} {}", chars, dots),
