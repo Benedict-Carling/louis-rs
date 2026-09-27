@@ -255,6 +255,19 @@ mod tests {
     }
 
     #[test]
+    fn swap_class_test_in_a_post_pass() {
+        let rules = [
+            parse_rule("swapdd foo 1,12 4,45"),
+            parse_rule("pass4 %foo %foo"),
+        ];
+        let ctx = TableContext::compile(&rules).unwrap();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Post3, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("⠁⠃⠉"), "⠈⠘⠉");
+    }
+
+    #[test]
     fn effects() {
         let rules = [
             // when encountering @123 set var 1 to 1
