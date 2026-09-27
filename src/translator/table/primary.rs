@@ -961,6 +961,19 @@ impl PrimaryTable {
                         rule,
                     );
                 }
+                Rule::Repeated { chars, dots, .. } if direction == Direction::Forward => {
+                    builder.get_trie_mut(rule).insert(
+                        chars,
+                        &dots.to_string(),
+                        None,
+                        None,
+                        direction,
+                        rule.precedence(),
+                        vec![],
+                        TranslationStage::Main,
+                        rule,
+                    );
+                }
                 Rule::Always {
                     chars,
                     dots,
@@ -1780,6 +1793,32 @@ impl PrimaryTable {
             None => options.emphasis().to_vec(),
         };
 
+        // liblouis' compbrlStart and compbrlEnd, the word at the cursor
+        let compbrl_at_cursor = options.cursor_pos().filter(|_| {
+            self.direction == Direction::Forward
+                && (options.mode().contains(TranslationMode::CompbrlAtCursor)
+                    || options.mode().contains(TranslationMode::CompbrlLeftCursor))
+        });
+        let compbrl_at_cursor = compbrl_at_cursor.and_then(|cursor| {
+            let chars: Vec<char> = input.chars().collect();
+            let is_space = |p: usize| chars.get(p).is_some_and(|c| self.space_chars.contains(c));
+            chars.get(cursor)?;
+            if is_space(cursor) {
+                return Some((cursor, cursor + 1));
+            }
+            let start = (0..cursor)
+                .rev()
+                .find(|&p| is_space(p))
+                .map_or(0, |p| p + 1);
+            let end = if options.mode().contains(TranslationMode::CompbrlLeftCursor) {
+                cursor
+            } else {
+                (cursor..chars.len())
+                    .find(|&p| is_space(p))
+                    .unwrap_or(chars.len())
+            };
+            Some((start, end))
+        });
         let mut indications = self.indicators.precompute(input, &enriched_spans);
         let constraints = self.constrainers.precompute(input, &enriched_spans);
         let input_chars: Vec<char> = input.chars().collect();
@@ -1880,8 +1919,12 @@ impl PrimaryTable {
             // First check for nocross candidates
             // the checks of liblouis's `for_selectRule` that depend on indication state
             let dont_contract = constraints.dont_contract_at(char_pos);
-            let selectable =
-                |t: &ResolvedTranslation| !(dont_contract && t.rule().is_some_and(is_contraction));
+            let selectable = |t: &ResolvedTranslation| {
+                !(dont_contract && t.rule().is_some_and(is_contraction))
+                    && !(matches!(t.rule(), Some(Rule::Repeated { .. }))
+                        && compbrl_at_cursor
+                            .is_some_and(|(start, end)| (start..=end).contains(&char_pos)))
+            };
 
             let nocross_candidate = self
                 .nocross_candidates(chars.as_str(), prev, char_pos, &constraints)
@@ -2094,6 +2137,28 @@ impl PrimaryTable {
                             None,
                         ));
                         delayed_translations = self.update_offsets(delayed_translations, 1);
+                    }
+                }
+                // liblouis skips the repetitions that follow a `repeated` rule
+                if self.direction == Direction::Forward
+                    && let Some(Rule::Repeated {
+                        chars: repeated, ..
+                    }) = t.rule()
+                {
+                    let len = repeated.chars().count();
+                    let limit = compbrl_at_cursor.map_or(usize::MAX, |(start, _)| start);
+                    while char_pos < limit && chars.as_str().starts_with(repeated.as_str()) {
+                        chars.nth(len - 1);
+                        prev = repeated.chars().last();
+                        char_pos += len;
+                        translations.push(ResolvedTranslation::new(
+                            repeated,
+                            "",
+                            len,
+                            TranslationStage::Main,
+                            None,
+                        ));
+                        delayed_translations = self.update_offsets(delayed_translations, len);
                     }
                 }
 
@@ -3706,6 +3771,38 @@ mod tests {
             PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
                 .unwrap();
         assert_eq!(table.translate("a://4 4"), "⠸⠬⠁⠒⠌⠌⠲⠸⠱⠀⠼⠙");
+    }
+
+    fn repeated_and_nocont_table() -> PrimaryTable {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase c 14"),
+            parse_rule("punctuation - 36"),
+            parse_rule("space \\s 0"),
+            parse_rule("repeated -- 36"),
+            parse_rule("always ab 2"),
+            parse_rule("nocont c"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context).unwrap()
+    }
+
+    #[test]
+    fn repeated_skips_the_repetitions() {
+        let table = repeated_and_nocont_table();
+        assert_eq!(table.translate("a----b"), "⠁⠤⠃");
+        assert_eq!(table.translate("a-----b"), "⠁⠤⠤⠃");
+        // but not in the word at the cursor in compbrlAtCursor mode
+        let mut modes = crate::translator::TranslationModes::empty();
+        modes.insert(TranslationMode::CompbrlAtCursor);
+        let options = TranslationOptions::default()
+            .with_mode(modes)
+            .with_cursor_pos(4);
+        assert_eq!(
+            table.translate_with_options("a---- -----", &options),
+            "⠁⠤⠤⠤⠤⠀⠤⠤⠤"
+        );
     }
 
     #[test]
