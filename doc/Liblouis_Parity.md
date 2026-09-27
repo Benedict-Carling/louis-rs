@@ -81,7 +81,9 @@ through the same search path as any other table.
 pipeline stage in both directions. One known mismatch remains in the whole suite.
 
 **Display tables** as a pipeline stage, renders last when translating to braille and
-first when back-translating. `--display` on `translate` and `trace`.
+first when back-translating. `--display` on `translate` and `trace`. The YAML harness,
+like liblouis's checker, reads a block's translation table as its display table when
+the file names none.
 
 **Table metadata queries** — find tables by language, contraction grade and the rest.
 

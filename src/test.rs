@@ -12,8 +12,8 @@ use crate::{
     metadata,
     parser::{self, AnchoredRule, Direction, TableError},
     translator::{
-        self, CharToDots, DisplayTable, PositionMap, TranslationModes, TranslationOptions,
-        TranslationPipeline,
+        self, CharToDots, DisplayTable, ImpliedDisplay, PositionMap, TranslationModes,
+        TranslationOptions, TranslationPipeline,
     },
 };
 
@@ -220,16 +220,21 @@ impl<'a> TestMatrix<'a> {
         })
     }
 
+    /// The pipeline for `table`, and when no `display:` is given the table read as its own
+    /// display table, as liblouis's checker does.
     fn translation_table(
         &self,
         table: &Table,
         direction: Direction,
-    ) -> Result<TranslationPipeline, TestError> {
+    ) -> Result<(TranslationPipeline, Option<ImpliedDisplay>), TestError> {
         let rules = Self::rules(table)?;
-        // the display table is a pipeline stage on the braille side, so the pipeline
-        // applies it in the right place for `direction` and it composes into the positions
-        Ok(TranslationPipeline::compile(&rules, direction)?
-            .with_display(self.display_table(direction)?))
+        let pipeline = TranslationPipeline::compile(&rules, direction)?;
+        Ok(match self.display {
+            // the display table is a pipeline stage on the braille side, so the pipeline
+            // applies it in the right place for `direction` and it composes into the positions
+            Some(_) => (pipeline.with_display(self.display_table(direction)?), None),
+            None => (pipeline, Some(ImpliedDisplay::compile(&rules))),
+        })
     }
 
     pub fn check(&self) -> Result<Vec<TestResult>, TestError> {
@@ -237,11 +242,11 @@ impl<'a> TestMatrix<'a> {
         match self.mode {
             TestMode::Forward => {
                 for table in self.tables {
-                    let table = self.translation_table(table, Direction::Forward)?;
+                    let (table, display) = self.translation_table(table, Direction::Forward)?;
                     results.extend(
                         self.tests
                             .par_iter()
-                            .map(|test| test.check(&table, Direction::Forward))
+                            .map(|test| test.check(&table, display.as_ref(), Direction::Forward))
                             .collect::<Vec<_>>(),
                     );
                 }
@@ -250,11 +255,14 @@ impl<'a> TestMatrix<'a> {
                 // ignore the backward test if LOUIS_TEST_FOWARD_ONLY is defined
                 if option_env!("LOUIS_TEST_FORWARD_ONLY").is_none() {
                     for table in self.tables {
-                        let table = self.translation_table(table, Direction::Backward)?;
+                        let (table, display) =
+                            self.translation_table(table, Direction::Backward)?;
                         results.extend(
                             self.tests
                                 .par_iter()
-                                .map(|test| test.check(&table, Direction::Backward))
+                                .map(|test| {
+                                    test.check(&table, display.as_ref(), Direction::Backward)
+                                })
                                 .collect::<Vec<_>>(),
                         );
                     }
@@ -262,11 +270,11 @@ impl<'a> TestMatrix<'a> {
             }
             TestMode::BothDirections => {
                 for table in self.tables {
-                    let table = self.translation_table(table, Direction::Forward)?;
+                    let (table, display) = self.translation_table(table, Direction::Forward)?;
                     results.extend(
                         self.tests
                             .par_iter()
-                            .map(|test| test.check(&table, Direction::Forward))
+                            .map(|test| test.check(&table, display.as_ref(), Direction::Forward))
                             .collect::<Vec<_>>(),
                     );
                 }
@@ -276,11 +284,14 @@ impl<'a> TestMatrix<'a> {
                     let reversed: Vec<Test> =
                         self.tests.iter().cloned().map(|t| t.reverse()).collect();
                     for table in self.tables {
-                        let table = self.translation_table(table, Direction::Backward)?;
+                        let (table, display) =
+                            self.translation_table(table, Direction::Backward)?;
                         results.extend(
                             reversed
                                 .par_iter()
-                                .map(|test| test.check(&table, Direction::Backward))
+                                .map(|test| {
+                                    test.check(&table, display.as_ref(), Direction::Backward)
+                                })
                                 .collect::<Vec<_>>(),
                         );
                     }
@@ -368,7 +379,14 @@ pub struct Test {
 }
 
 impl Test {
-    fn check(&self, table: &TranslationPipeline, direction: Direction) -> TestResult {
+    /// Check the test against `table`. An implied `display` maps the braille outside the
+    /// pipeline, one character per cell, so the positions are unaffected.
+    fn check(
+        &self,
+        table: &TranslationPipeline,
+        display: Option<&ImpliedDisplay>,
+        direction: Direction,
+    ) -> TestResult {
         let mut options = TranslationOptions::default()
             .with_mode(self.modes.clone())
             .with_emphasis(self.emphasis.clone());
@@ -377,7 +395,18 @@ impl Test {
         {
             options = options.with_cursor_pos(cursor);
         }
-        let (translated, positions) = table.translate_with_positions(&self.input, &options);
+        let input = match (display, direction) {
+            (Some(display), Direction::Backward) => display.read(&self.input),
+            _ => self.input.clone(),
+        };
+        let (translated, positions) = table.translate_with_positions(&input, &options);
+        let translated = match (display, direction) {
+            (Some(display), Direction::Forward) => match display.show(&translated) {
+                Some(shown) => shown,
+                None => return self.failed(translated, direction),
+            },
+            _ => translated,
+        };
         let position_mismatch = self.position_mismatch(&positions, direction);
         self.verdict(translated, direction, position_mismatch)
     }
@@ -386,6 +415,25 @@ impl Test {
     /// table shows it as, the way liblouis's `lou_charToDots` does.
     fn check_display(&self, table: &CharToDots) -> TestResult {
         self.verdict(table.dots(&self.input), Direction::Forward, None)
+    }
+
+    /// A translation that did not produce `expected`, or that liblouis would abort.
+    fn failed(&self, translated: String, direction: Direction) -> TestResult {
+        if self.xfail.is_failure(direction) {
+            TestResult::ExpectedFailure {
+                input: self.input.to_string(),
+                expected: self.expected.to_string(),
+                actual: translated,
+                direction,
+            }
+        } else {
+            TestResult::Failure(FailureReason::Translation {
+                input: self.input.to_string(),
+                expected: self.expected.to_string(),
+                actual: translated,
+                direction,
+            })
+        }
     }
 
     fn verdict(
@@ -406,20 +454,8 @@ impl Test {
                     Some(mismatch) => TestResult::Failure(FailureReason::Position(mismatch)),
                 }
             }
-        } else if self.xfail.is_failure(direction) {
-            TestResult::ExpectedFailure {
-                input: self.input.to_string(),
-                expected: self.expected.to_string(),
-                actual: translated,
-                direction,
-            }
         } else {
-            TestResult::Failure(FailureReason::Translation {
-                input: self.input.to_string(),
-                expected: self.expected.to_string(),
-                actual: translated,
-                direction,
-            })
+            self.failed(translated, direction)
         }
     }
 

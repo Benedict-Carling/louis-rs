@@ -95,6 +95,15 @@ a liblouis design wart rather than something worth reproducing. The
 library takes one through `TranslationPipeline::with_display`, and the
 YAML test harness through a test's `display:` key.
 
+The YAML test harness is the exception, because the liblouis tests are
+written against it: a block without a `display:` key reads its
+translation table as its own display table, as liblouis's checker does.
+Its `display` rules, single-cell character definitions and `grouping`
+pairs map cells to characters, the first mapping for a cell or a
+character winning. A cell with no character fails the translation, and
+a character with no cell reads as a blank cell. A `display:` key holds
+for every later block in the file.
+
 
 ## Installation
 
