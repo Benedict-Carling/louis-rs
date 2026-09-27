@@ -357,17 +357,19 @@ impl PrimaryTableBuilder {
                 .map(Indicator::ComputerBraille),
             // Emphasis must be before capsletter so begemphword appears before capsletter.
             self.emphasis_indicator.build(ctx).map(Indicator::Emphasis),
-            self.numeric_indicator.build().map(Indicator::Numeric),
+            // liblouis inserts nocontractsign, letsign, caps start and then numsign in that
+            // order (translateString).
+            self.nocontract_indicator
+                .build(ctx, self.sequences.clone())
+                .map(Indicator::NoContract),
             self.lettersign_indicator
                 .build(ctx, self.sequences.clone())
                 .map(Indicator::LetterSign),
             self.uppercase_indicator
                 .build(ctx)
                 .map(Indicator::Uppercase),
+            self.numeric_indicator.build().map(Indicator::Numeric),
             self.mode_indicator.build(ctx).map(Indicator::Mode),
-            self.nocontract_indicator
-                .build(ctx, self.sequences.clone())
-                .map(Indicator::NoContract),
         ]
         .into_iter()
         .flatten()
@@ -2471,6 +2473,31 @@ mod tests {
         assert_eq!(table.translate("cd"), "⠠⠉⠙");
         assert_eq!(table.translate("abcd"), "⠁⠃⠉⠙");
         assert_eq!(table.translate("ef"), "⠑⠋");
+    }
+
+    #[test]
+    fn indicators_follow_liblouis_insertion_order() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("base uppercase A a"),
+            parse_rule("base uppercase B b"),
+            parse_rule("litdigit 1 1"),
+            parse_rule("capsletter 6"),
+            parse_rule("numsign 3456"),
+            parse_rule("nonumsign 56"),
+            parse_rule("numericnocontchars abAB"),
+            parse_rule("nocontractsign 5"),
+            parse_rule("contraction b"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        // nocontractsign before caps start
+        assert_eq!(table.translate("B"), "⠐⠠⠃");
+        // caps start before nonumsign
+        assert_eq!(table.translate("1A"), "⠼⠁⠠⠰⠁");
     }
 
     #[test]
