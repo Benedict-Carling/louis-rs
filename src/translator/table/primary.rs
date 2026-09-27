@@ -2082,6 +2082,19 @@ impl PrimaryTable {
                         delayed_translations = self.update_offsets(delayed_translations, 1);
                     }
                 }
+                // and back-translation puts a space after them, if a cell follows
+                if self.direction == Direction::Backward
+                    && matches!(t.rule(), Some(Rule::Joinword { .. } | Rule::Joinnum { .. }))
+                    && !chars.as_str().is_empty()
+                {
+                    translations.push(ResolvedTranslation::new(
+                        "",
+                        " ",
+                        0,
+                        TranslationStage::Main,
+                        None,
+                    ));
+                }
                 // liblouis skips the repetitions that follow a `repeated` rule
                 if self.direction == Direction::Forward
                     && let Some(Rule::Repeated {
@@ -4029,6 +4042,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(table.translate("⠨⠨⠁⠃"), "AB");
+    }
+
+    #[test]
+    fn backward_joinword_puts_a_space_before_the_next_cell() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase y 13456"),
+            parse_rule("space \\s 0"),
+            parse_rule("joinword by 356"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table = PrimaryTable::compile(
+            &rules,
+            Direction::Backward,
+            TranslationStage::Main,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(table.translate("⠴⠁"), "by a");
     }
 
     #[test]
