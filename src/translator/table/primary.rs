@@ -1347,20 +1347,18 @@ impl PrimaryTable {
                     rule,
                 ),
                 Rule::Lowword { chars, dots, .. } => {
+                    // liblouis wants a space on both sides, not punctuation
+                    let boundary = match direction {
+                        Direction::Forward => vec![CharacterClass::Space],
+                        Direction::Backward => {
+                            vec![CharacterClass::Space, CharacterClass::Punctuation]
+                        }
+                    };
                     builder.get_trie_mut(rule).insert(
                         chars,
                         &dots.to_string(),
-                        // FIXME: lowword, prepunc and postpunc need more advanced scaning of
-                        // the input. Just checking for before and after classes as below is
-                        // too simplistic
-                        Some(Transition::Start(vec![
-                            CharacterClass::Space,
-                            CharacterClass::Punctuation,
-                        ])),
-                        Some(Transition::End(vec![
-                            CharacterClass::Space,
-                            CharacterClass::Punctuation,
-                        ])),
+                        Some(Transition::Start(boundary.clone())),
+                        Some(Transition::End(boundary)),
                         direction,
                         rule.precedence(),
                         vec![],
@@ -2879,6 +2877,23 @@ mod tests {
                 .unwrap();
         assert_eq!(table.translate("bigh"), "⠃⠊⠣");
         assert_eq!(table.translate("bighead"), "⠃⠊⠛⠓⠂⠙");
+    }
+
+    #[test]
+    fn lowword_needs_spaces_on_both_sides() {
+        let rules = [
+            parse_rule("space \\s 0"),
+            parse_rule("lowercase i 24"),
+            parse_rule("lowercase n 1345"),
+            parse_rule("punctuation . 256"),
+            parse_rule("lowword in 35"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("in"), "⠔");
+        assert_eq!(table.translate("in."), "⠊⠝⠲");
     }
 
     #[test]
