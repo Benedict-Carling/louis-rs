@@ -224,7 +224,7 @@ impl PrimaryTableBuilder {
             postpunc_trie: Trie::new().with_context(trie_ctx.clone()),
             nocross_trie: Trie::new().with_context(trie_ctx),
             match_patterns: MatchPatternsBuilder::new(),
-            context_patterns: ContextPatternsBuilder::new(),
+            context_patterns: ContextPatternsBuilder::new().for_direction(direction),
             numeric_indicator: numeric::IndicatorBuilder::new(),
             uppercase_indicator: uppercase::IndicatorBuilder::new(),
             mode_indicator: mode::IndicatorBuilder::new(),
@@ -1607,10 +1607,10 @@ impl PrimaryTable {
             .partition(|t| t.offset() == 0)
     }
 
-    /// A nocross candidate is valid only if it doesn't cross an internal
-    /// hyphenation break of the word it's part of, mirroring liblouis's
-    /// `syllableBreak`. `char_pos` is the candidate's starting position in
-    /// the whole input, needed to look up the precomputed breaks.
+    /// A nocross candidate is valid only if it doesn't cross a hyphenation break of the
+    /// word it starts in, mirroring liblouis's `syllableBreak`. `char_pos` is the
+    /// candidate's starting position in the whole input, needed to look up the
+    /// precomputed breaks.
     fn nocross_candidates(
         &self,
         input: &str,
@@ -1623,6 +1623,7 @@ impl PrimaryTable {
             .into_iter()
             .filter(|t| {
                 !(char_pos..char_pos + t.length().saturating_sub(1))
+                    .take_while(|&pos| constraints.letter_gap_at(pos))
                     .any(|pos| constraints.hyphenation_break_at(pos))
             })
             .collect()
@@ -1675,6 +1676,39 @@ impl PrimaryTable {
             .find(input, at_start)
             .into_iter()
             .partition(|t| t.offset() == 0)
+    }
+
+    /// liblouis's `compbrlStart`..`compbrlEnd`: the word under the cursor, or up to the
+    /// cursor with `compbrlLeftCursor`, or the cursor's character when it is a space.
+    fn cursor_word(
+        &self,
+        input: &str,
+        options: &TranslationOptions,
+    ) -> Option<std::ops::Range<usize>> {
+        let left = options.mode().contains(TranslationMode::CompbrlLeftCursor);
+        if self.direction != Direction::Forward
+            || !(left || options.mode().contains(TranslationMode::CompbrlAtCursor))
+        {
+            return None;
+        }
+        let chars: Vec<char> = input.chars().collect();
+        let cursor = options.cursor_pos()?;
+        let is_space = |pos: usize| self.space_chars.contains(&chars[pos]);
+        if cursor >= chars.len() || is_space(cursor) {
+            return Some(cursor..cursor + 1);
+        }
+        let start = (0..cursor)
+            .rev()
+            .find(|&pos| is_space(pos))
+            .map_or(0, |pos| pos + 1);
+        let end = if left {
+            cursor
+        } else {
+            (cursor..chars.len())
+                .find(|&pos| is_space(pos))
+                .unwrap_or(chars.len())
+        };
+        Some(start..end)
     }
 
     fn context_candidates(
@@ -1754,7 +1788,11 @@ impl PrimaryTable {
         };
 
         let mut indications = self.indicators.precompute(input, &enriched_spans);
-        let mut constraints = self.constrainers.precompute(input, &enriched_spans);
+        let constraints = self.constrainers.precompute(input, &enriched_spans);
+        let mut constraints = match self.cursor_word(input, options) {
+            Some(range) => constraints.with_comp6(range),
+            None => constraints,
+        };
         let input_chars: Vec<char> = input.chars().collect();
         for &start in nocont_words {
             let end = input_chars[start..]
@@ -1846,6 +1884,8 @@ impl PrimaryTable {
         };
 
         let mut backward_state = backward::State::default();
+        // a `context` rule liblouis files among its pass rules, due at the current position
+        let mut forced: Option<ResolvedTranslation> = None;
 
         loop {
             if last_indications_pos != Some(char_pos) {
@@ -1888,8 +1928,25 @@ impl PrimaryTable {
 
             // then search for context patterns. Unless they have empty pre patterns they will all
             // have an offset. Split those off.
-            let (context_candidates, context_delayed) =
+            let (mut context_candidates, mut context_delayed) =
                 self.context_candidates(chars.as_str(), &env, at_start);
+            if self.direction == Direction::Forward {
+                let is_pass_rule = |t: &ResolvedTranslation| {
+                    t.rule()
+                        .is_some_and(|rule| backward::context_cells(rule) == 0)
+                };
+                let pass_rule = context_candidates
+                    .iter()
+                    .chain(&context_delayed)
+                    .filter(|t| is_pass_rule(t) && !seen.contains(&TranslationSubset::from(*t)))
+                    .max_by_key(|t| t.rank())
+                    .cloned();
+                context_candidates.retain(|t| !is_pass_rule(t));
+                context_delayed.retain(|t| !is_pass_rule(t));
+                if forced.is_none() && !constraints.use_comp6_at(char_pos) {
+                    forced = pass_rule;
+                }
+            }
             delayed_translations.extend(context_delayed);
             // merge the candidates from the context patters with the candidates from the plain translations
             candidates.extend(context_candidates);
@@ -1971,6 +2028,15 @@ impl PrimaryTable {
                 // use the longest translation
                 None => unseen.max_by_key(|translation| translation.rank()),
             };
+            // liblouis's findForPassRule overrides the rule for_selectRule chose, and copies
+            // the characters before the replacement one by one
+            let forced_now = forced.take_if(|t| t.offset() == 0);
+            let (candidate, nocross_candidate) = match (&forced_now, &forced) {
+                (Some(t), _) => (Some(t), None),
+                (None, Some(_)) => (None, None),
+                (None, None) => (candidate, nocross_candidate),
+            };
+            forced = forced.map(|t| t.decrement_offset(1));
             if self.direction == Direction::Forward
                 && !dont_contract
                 && !options.mode().contains(TranslationMode::NoContractions)
@@ -1995,11 +2061,7 @@ impl PrimaryTable {
             if let Some(nocross) = &nocross_candidate
                 && candidate.is_none_or(|t| nocross.rank() >= t.rank())
             {
-                let mut translation = nocross.clone();
-                if let Some(selector) = &self.backward {
-                    let output = selector.put(&mut backward_state, &translation.output());
-                    translation = translation.with_output(&output);
-                }
+                let translation = nocross.clone();
                 let consumed = chars.as_str();
                 // move the iterator forward by the number of characters in the translation
                 chars.nth(nocross.length() - 1);
@@ -2036,12 +2098,14 @@ impl PrimaryTable {
                     char_pos += t.length();
                 }
                 // there is a matching translation rule
-                let mut translation = t.clone();
-                if let Some(selector) = &self.backward {
-                    selector.applied(&mut backward_state, t.rule());
-                    let output = selector.put(&mut backward_state, &translation.output());
-                    translation = translation.with_output(&output);
-                }
+                let translation = match &self.backward {
+                    Some(selector) => {
+                        selector.applied(&mut backward_state, t.rule());
+                        let output = selector.capitalize(&mut backward_state, &t.output());
+                        t.clone().with_output(&output)
+                    }
+                    None => t.clone(),
+                };
                 translations.push(translation);
                 delayed_translations = self.update_offsets(delayed_translations, t.length());
                 delayed_translations.extend(self.match_candidates_within(consumed, t.length()));
@@ -2077,12 +2141,7 @@ impl PrimaryTable {
                 char_pos += 1;
                 // no translation rule found
                 if let Some(translation) = self.character_translations.get(&next_char) {
-                    let mut translation = translation.clone();
-                    if let Some(selector) = &self.backward {
-                        let output = selector.put(&mut backward_state, &translation.output());
-                        translation = translation.with_output(&output);
-                    }
-                    translations.push(translation);
+                    translations.push(translation.clone());
                     delayed_translations = self.update_offsets(delayed_translations, 1);
                 } else if let Some(ref replacement) = self.undefined {
                     // there is a rule for undefined characters
@@ -3263,6 +3322,31 @@ mod tests {
         assert_eq!(table.translate("fff"), "⠸");
     }
 
+    /// liblouis's `syllableBreak` hyphenates the lowercased word the rule starts in, and
+    /// only that word
+    #[test]
+    fn nocross_checks_the_lowercased_word_it_starts_in() {
+        let rules = vec![
+            parse_rule("include dictionaries/nocross-test.dic"),
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase s 234"),
+            parse_rule("uppercase S 234"),
+            parse_rule("uppercase B 12"),
+            parse_rule("punctuation - 36"),
+            parse_rule("nocross always sb 456"),
+            parse_rule("nocross always -sb 3456"),
+        ];
+        let rules = expand_includes(rules, &fixture_search_path(), &[]).unwrap();
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("asb"), "⠁⠎⠃");
+        assert_eq!(table.translate("aSB"), "⠁⠎⠃");
+        assert_eq!(table.translate("a-sb"), "⠁⠼");
+    }
+
     #[test]
     fn nocross_without_plain_counterpart() {
         // liblouis tables routinely define a `nocross` rule with no plain counterpart
@@ -3644,6 +3728,53 @@ mod tests {
         assert_eq!(table.translate("aa:aa;aa"), "⠁⠁⠇⠄⠄⠸⠁⠁");
     }
 
+    /// A `context` rule whose test starts with no literal is one of liblouis's pass rules:
+    /// when it matches, it overrides the rule chosen at that position, even a longer one
+    #[test]
+    fn context_pass_rule_overrides_longer_rule() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase c 14"),
+            parse_rule("always abc 3456"),
+            parse_rule("context $l[\"bc\"] @2"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("abc"), "⠁⠂");
+        assert_eq!(table.translate("cabc"), "⠉⠁⠂");
+    }
+
+    /// `compbrlAtCursor` spells out the word under the cursor character by character,
+    /// with no computer braille indicators; `compbrlLeftCursor` only up to the cursor
+    #[test]
+    fn compbrl_at_cursor_spells_out_the_word() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("space \\s 0"),
+            parse_rule("always ab 3456"),
+            parse_rule("begcomp 456"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        let options = |mode: TranslationMode, cursor: usize| {
+            let mut modes = crate::translator::options::TranslationModes::empty();
+            modes.insert(mode);
+            TranslationOptions::default()
+                .with_mode(modes)
+                .with_cursor_pos(cursor)
+        };
+        let at = options(TranslationMode::CompbrlAtCursor, 4);
+        assert_eq!(table.translate_with_options("ab abab", &at), "⠼⠀⠁⠃⠁⠃");
+        let left = options(TranslationMode::CompbrlLeftCursor, 4);
+        assert_eq!(table.translate_with_options("ab abab", &left), "⠼⠀⠁⠃⠼");
+    }
+
     #[test]
     fn numsign_before_a_digit() {
         let rules = [
@@ -3774,6 +3905,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(table.translate("⠨⠃"), "B");
+    }
+
+    /// liblouis ends a caps word on the rules applied and the text produced, as its
+    /// `allUpper` state, not on the cells: a blank cell the table also defines as a letter
+    /// still ends it, being a space rule
+    #[test]
+    fn backward_capsword_ends_at_space_rule_and_non_letter_output() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("base uppercase A a"),
+            parse_rule("base uppercase B b"),
+            parse_rule("space \\s 0"),
+            parse_rule("letter \\x00df 0"),
+            parse_rule("punctuation - 36"),
+            parse_rule("capsletter 46"),
+            parse_rule("begcapsword 46-46"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table = PrimaryTable::compile(
+            &rules,
+            Direction::Backward,
+            TranslationStage::Main,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(table.translate("⠨⠨⠁⠃⠀⠁⠃"), "AB ab");
+        assert_eq!(table.translate("⠨⠨⠁⠃⠤⠁⠃"), "AB-ab");
+        assert_eq!(table.translate("⠨⠁⠃"), "Ab");
     }
 
     #[test]

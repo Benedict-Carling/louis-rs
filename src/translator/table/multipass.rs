@@ -22,9 +22,9 @@ struct MultipassTableBuilder {
 }
 
 impl MultipassTableBuilder {
-    fn new() -> Self {
+    fn new(direction: Direction) -> Self {
         Self {
-            patterns: ContextPatternsBuilder::new(),
+            patterns: ContextPatternsBuilder::new().for_direction(direction),
         }
     }
 
@@ -44,7 +44,7 @@ impl MultipassTable {
         stage: TranslationStage,
         ctx: &TableContext,
     ) -> Result<Self, TranslationError> {
-        let mut builder = MultipassTableBuilder::new();
+        let mut builder = MultipassTableBuilder::new(direction);
 
         for rule in rules {
             match &rule.rule {
@@ -187,6 +187,22 @@ mod tests {
         assert_eq!(transform.translate("foobar"), "foobar");
         assert_eq!(transform.translate("corect"), "correct");
         assert_eq!(transform.translate("🐂"), "🐂");
+    }
+
+    /// liblouis applies back-translation's `correct` rules like forward ones, so one whose
+    /// action copies the match (`*`) keeps a shorter rule from rewriting it
+    #[test]
+    fn correct_backward_copy() {
+        let rules = [
+            parse_rule("nofor correct \"ssze\" \"szsze\""),
+            parse_rule("nofor correct \"sszel\" *"),
+        ];
+        let ctx = TableContext::default();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Backward, TranslationStage::Pre, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("resszel"), "resszel");
+        assert_eq!(transform.translate("ressze"), "reszsze");
     }
 
     #[test]
