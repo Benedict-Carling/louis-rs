@@ -341,6 +341,18 @@ impl PrimaryTableBuilder {
         }
     }
 
+    /// liblouis back-translates an emphasis indicator to nothing, noting the emphasis
+    fn backward_emphasis_indicator(
+        &mut self,
+        dots: &str,
+        rule: &AnchoredRule,
+        direction: Direction,
+    ) {
+        if direction == Direction::Backward {
+            self.insert_backward_indicator(dots, rule);
+        }
+    }
+
     fn build(mut self, direction: Direction, ctx: &TableContext) -> PrimaryTable {
         let triggers = self.compbrl_triggers;
         let numeric_mode_chars: Vec<char> = self
@@ -797,21 +809,25 @@ impl PrimaryTable {
                     builder
                         .emphasis_indicator
                         .emphletter(name, &dots.to_string(), rule);
+                    builder.backward_emphasis_indicator(&dots.to_string(), rule, direction);
                 }
                 Rule::Begemphword { name, dots } => {
                     builder
                         .emphasis_indicator
                         .begemphword(name, &dots.to_string(), rule);
+                    builder.backward_emphasis_indicator(&dots.to_string(), rule, direction);
                 }
                 Rule::Endemphword { name, dots } => {
                     builder
                         .emphasis_indicator
                         .endemphword(name, &dots.to_string(), rule);
+                    builder.backward_emphasis_indicator(&dots.to_string(), rule, direction);
                 }
                 Rule::Begemphphrase { name, dots } => {
                     builder
                         .emphasis_indicator
                         .begemphphrase(name, &dots.to_string(), rule);
+                    builder.backward_emphasis_indicator(&dots.to_string(), rule, direction);
                 }
                 Rule::Endemphphrase {
                     name,
@@ -824,6 +840,7 @@ impl PrimaryTable {
                         position,
                         rule,
                     );
+                    builder.backward_emphasis_indicator(&dots.to_string(), rule, direction);
                 }
                 Rule::Lenemphphrase { name, number } => {
                     builder
@@ -834,11 +851,13 @@ impl PrimaryTable {
                     builder
                         .emphasis_indicator
                         .begemph(name, &dots.to_string(), rule);
+                    builder.backward_emphasis_indicator(&dots.to_string(), rule, direction);
                 }
                 Rule::Endemph { name, dots, .. } => {
                     builder
                         .emphasis_indicator
                         .endemph(name, &dots.to_string(), rule);
+                    builder.backward_emphasis_indicator(&dots.to_string(), rule, direction);
                 }
                 Rule::Emphmodechars { name, chars } => {
                     builder.emphasis_indicator.emphmodechars(name, chars);
@@ -2003,6 +2022,7 @@ impl PrimaryTable {
                         pos: char_pos,
                         state: backward_state,
                         partial: options.mode().contains(TranslationMode::PartialTrans),
+                        emphasis_output: options.emphasis_output(),
                     };
                     // `rev` so that of equally ranked rules the first defined wins, as in
                     // liblouis
