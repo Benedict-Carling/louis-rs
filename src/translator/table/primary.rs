@@ -1962,6 +1962,7 @@ impl PrimaryTable {
             // have an offset. Split those off.
             let (mut context_candidates, mut context_delayed) =
                 self.context_candidates(chars.as_str(), &env, at_start);
+            let mut forced_here = false;
             if self.direction == Direction::Forward {
                 let is_pass_rule = |t: &ResolvedTranslation| {
                     t.rule()
@@ -1976,6 +1977,7 @@ impl PrimaryTable {
                 context_candidates.retain(|t| !is_pass_rule(t));
                 context_delayed.retain(|t| !is_pass_rule(t));
                 if forced.is_none() && !constraints.use_comp6_at(char_pos) {
+                    forced_here = pass_rule.is_some();
                     forced = pass_rule;
                 }
             }
@@ -2061,8 +2063,13 @@ impl PrimaryTable {
                 // use the longest translation
                 None => unseen.max_by_key(|translation| translation.rank()),
             };
-            // liblouis's findForPassRule overrides the rule for_selectRule chose, and copies
-            // the characters before the replacement one by one
+            // liblouis's findForPassRule overrides the rule for_selectRule chose unless that is
+            // a `context` rule, and copies the characters before the replacement one by one
+            if forced_here
+                && candidate.is_some_and(|t| matches!(t.rule(), Some(Rule::Context { .. })))
+            {
+                forced = None;
+            }
             let forced_now = forced.take_if(|t| t.offset() == 0);
             let (candidate, nocross_candidate) = match (&forced_now, &forced) {
                 (Some(t), _) => (Some(t), None),
@@ -2255,30 +2262,19 @@ impl PrimaryTable {
 }
 
 /// Pick the forward candidate as liblouis does: a `context` rule ranks by the characters it
-/// is indexed under and wins ties, and one indexed under none overrides any rule that is not
-/// a `context` rule
+/// is indexed under, and wins ties
 fn select_forward<'a>(
     candidates: impl Iterator<Item = &'a ResolvedTranslation>,
 ) -> Option<&'a ResolvedTranslation> {
-    let leading_chars = |t: &ResolvedTranslation| match t.rule() {
-        Some(Rule::Context { test, .. }) => Some(test.leading_chars()),
-        _ => None,
-    };
-    let (indexed, unindexed): (Vec<_>, Vec<_>) = candidates
-        .map(|t| (t, leading_chars(t)))
-        .partition(|(_, chars)| *chars != Some(0));
-    let best = indexed.into_iter().max_by_key(|(t, chars)| match chars {
-        Some(n) => (t.length() == 0, *n, true, t.weight()),
-        None => (t.length() == 0, t.length(), false, t.weight()),
-    });
-    match best {
-        Some((t, Some(_))) => Some(t),
-        best => unindexed
-            .into_iter()
-            .map(|(t, _)| t)
-            .max_by_key(|t| t.rank())
-            .or(best.map(|(t, _)| t)),
-    }
+    candidates.max_by_key(|t| match t.rule() {
+        Some(rule @ Rule::Context { .. }) => (
+            t.length() == 0,
+            backward::context_cells(rule),
+            true,
+            t.weight(),
+        ),
+        _ => (t.length() == 0, t.length(), false, t.weight()),
+    })
 }
 
 /// The opcodes liblouis's `for_selectRule` skips while `dontContract` is set
