@@ -140,6 +140,8 @@ pub struct PrimaryTable {
     backward_digit_overrides: HashMap<char, ResolvedTranslation>,
     /// Forward-only: the standing-alone check for `word` and `contraction` rules.
     sequences: Option<Sequences>,
+    /// The text character classes, for liblouis's backward `isBegWord`.
+    text_classes: CharacterClasses,
 }
 
 /// A builder for [`PrimaryTable`]
@@ -434,11 +436,39 @@ impl PrimaryTableBuilder {
             }),
             backward_digit_overrides: self.backward_digit_overrides,
             sequences: self.sequences,
+            text_classes: ctx.character_classes.clone(),
         }
     }
 }
 
 impl PrimaryTable {
+    /// liblouis's backward `isBegWord`: looking back through the output, a space comes
+    /// before any letter, digit, math or sign character.
+    fn backward_begins_word(&self, translations: &[ResolvedTranslation]) -> bool {
+        let is = |class: &CharacterClass, c: char| {
+            self.text_classes
+                .get(class)
+                .is_some_and(|chars| chars.contains(&c))
+        };
+        let word = [
+            CharacterClass::Letter,
+            CharacterClass::Digit,
+            CharacterClass::Math,
+            CharacterClass::Sign,
+        ];
+        for translation in translations.iter().rev() {
+            for c in translation.output().chars().rev() {
+                if is(&CharacterClass::Space, c) {
+                    return true;
+                }
+                if word.iter().any(|class| is(class, c)) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Breaks a tie in rank in backward translation the way liblouis orders the rules of a
     /// cell: a translation rule before any other, and on a single cell every other rule
     /// before a character definition.
@@ -1503,11 +1533,18 @@ impl PrimaryTable {
                         // Eligibility isn't a fixed-position lookaround (see
                         // `PunctuationConstrainer`), so the trie itself imposes no
                         // boundary; `constraints.prepunc_ok_at()` gates it in `trace()`.
+                        // Backward, `backward_begins_word()` does; the unweighted check
+                        // only keeps it apart from a same-cell character definition.
                         builder.punctuation_constrainer.mark_present();
                         builder.get_trie_mut(rule).insert(
                             chars,
                             &dots.to_string(),
-                            None,
+                            backward.then(|| {
+                                Transition::Unweighted(Box::new(Transition::Start(vec![
+                                    CharacterClass::Space,
+                                    CharacterClass::Punctuation,
+                                ])))
+                            }),
                             None,
                             direction,
                             rule.precedence(),
@@ -1880,7 +1917,10 @@ impl PrimaryTable {
             // leaving the position to fall through to the plain punctuation character
             // definition (`character_translations`), matching liblouis.
             candidates.retain(|t| match t.rule() {
-                Some(Rule::Prepunc { .. }) => constraints.prepunc_ok_at(char_pos),
+                Some(Rule::Prepunc { .. }) => match self.direction {
+                    Direction::Forward => constraints.prepunc_ok_at(char_pos),
+                    Direction::Backward => self.backward_begins_word(&translations),
+                },
                 Some(Rule::Postpunc { .. }) => {
                     self.direction == Direction::Backward || constraints.postpunc_ok_at(char_pos)
                 }
@@ -3020,6 +3060,20 @@ mod tests {
         ]);
         assert_eq!(table.translate("⠼⠁⠤⠤⠓"), "1–h");
         assert_eq!(table.translate("⠼⠁⠤⠤⠁"), "1—1");
+    }
+
+    #[test]
+    fn backward_prepunc_at_the_start_of_a_word() {
+        let table = backward_table(&[
+            parse_rule("lowercase a 1"),
+            parse_rule("digit 8 236"),
+            parse_rule("punctuation ( 1456"),
+            parse_rule("prepunc ( 236"),
+            parse_rule("space \\s 0"),
+        ]);
+        assert_eq!(table.translate("⠦⠁"), "(a");
+        assert_eq!(table.translate("⠁⠀⠦⠁"), "a (a");
+        assert_eq!(table.translate("⠁⠦⠁"), "a8a");
     }
 
     #[test]
