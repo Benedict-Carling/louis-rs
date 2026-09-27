@@ -281,15 +281,12 @@
   - Fixing it properly means matching liblouis's split: text classes
     over produced output for the before side, dots classes plus a rule
     walk for the after side. Widening the guard only moves the ceiling.
-- [ ] Literal hyphen character breaks per-segment contraction in compounds
-  - e.g. en-ueb.yaml: "do-it-yourself" -> expected "d-x-yrf", actual
-    "do-x-y|rself" ("do" and "yourself" fail to contract on their own
-    side of the hyphen); same for "out-and-out"
-  - cause: ~Rule::Hyphen~ (~src/translator/table.rs~) files the hyphen
-    under generic ~CharacterClass::Punctuation~ instead of whatever
-    classification word-boundary detection needs to treat each side as
-    its own word. Unrelated to ~src/hyphenation.rs~/dictionary-based
-    hyphenation.
+- [X] Literal hyphen character breaks per-segment contraction in compounds
+  - "do-it-yourself" now gives "d-x-yrf" and "out-and-out" "|-&-|". The
+    cause was not the hyphen's class: UEB decides whether a word or
+    contraction stands alone with liblouis's sequences (~seqdelimiter~
+    etc., ~src/translator/sequence.rs~), and match rules check their
+    ~pre~ pattern backwards from the current position.
 - [ ] ~nocross~ only checks whether the matched candidate substring can
   hyphenate anywhere, not whether a break falls inside *that*
   candidate's span within the enclosing word (liblouis's real,
