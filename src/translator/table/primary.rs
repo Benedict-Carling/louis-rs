@@ -127,6 +127,10 @@ pub struct PrimaryTable {
     context_patterns: ContextPatterns,
     /// All the nocross translation rules are stored in a separate trie
     nocross_trie: Trie,
+    /// `prepunc` and `postpunc` rules, kept apart from the other rules and from each
+    /// other, as they often share characters or dots
+    prepunc_trie: Trie,
+    postpunc_trie: Trie,
     indicators: Indicators,
     constrainers: Constrainers,
     /// Detects compbrl-triggered computer braille regions.
@@ -152,6 +156,8 @@ struct PrimaryTableBuilder {
     trie: Trie,
     comp6_trie: Trie,
     nocross_trie: Trie,
+    prepunc_trie: Trie,
+    postpunc_trie: Trie,
     match_patterns: MatchPatternsBuilder,
     context_patterns: ContextPatternsBuilder,
     numeric_indicator: numeric::IndicatorBuilder,
@@ -190,6 +196,8 @@ impl PrimaryTableBuilder {
             trie: trie(),
             comp6_trie: trie().case_sensitive(),
             nocross_trie: trie(),
+            prepunc_trie: trie(),
+            postpunc_trie: trie(),
             match_patterns: MatchPatternsBuilder::new(),
             context_patterns: ContextPatternsBuilder::new(),
             numeric_indicator: numeric::IndicatorBuilder::new(),
@@ -398,6 +406,8 @@ impl PrimaryTableBuilder {
             trie: self.trie,
             comp6_trie: self.comp6_trie,
             nocross_trie: self.nocross_trie,
+            prepunc_trie: self.prepunc_trie,
+            postpunc_trie: self.postpunc_trie,
             match_patterns: self.match_patterns.build(),
             context_patterns: self.context_patterns.build(),
             indicators: Indicators::new(indicators),
@@ -1546,7 +1556,7 @@ impl PrimaryTable {
                         // Backward, `backward_begins_word()` does; the unweighted check
                         // only keeps it apart from a same-cell character definition.
                         builder.punctuation_constrainer.mark_present();
-                        builder.get_trie_mut(rule).insert(
+                        builder.prepunc_trie.insert(
                             chars,
                             &dots.to_string(),
                             backward.then(|| {
@@ -1575,7 +1585,7 @@ impl PrimaryTable {
                         // liblouis checks `isEndWord`, which does not make it more
                         // specific than a same-cell rule.
                         builder.punctuation_constrainer.mark_present();
-                        builder.get_trie_mut(rule).insert(
+                        builder.postpunc_trie.insert(
                             chars,
                             &dots.to_string(),
                             None,
@@ -1975,6 +1985,14 @@ impl PrimaryTable {
             // boundary and gated here instead. Rejected candidates are simply dropped,
             // leaving the position to fall through to the plain punctuation character
             // definition (`character_translations`), matching liblouis.
+            // a tie between the two goes to the later, prepunc, as when they shared a trie
+            for trie in [&self.postpunc_trie, &self.prepunc_trie] {
+                candidates.extend(trie.find_translations_with_word_ends(
+                    chars.as_str(),
+                    before,
+                    word_ends.get(char_pos..).unwrap_or_default(),
+                ));
+            }
             candidates.retain(|t| match t.rule() {
                 Some(Rule::Prepunc { .. }) => match self.direction {
                     Direction::Forward => constraints.prepunc_ok_at(char_pos),
@@ -2056,7 +2074,11 @@ impl PrimaryTable {
                 // drop translation candidates that we have applied already at this position in the
                 // input
                 .filter(|t| !seen.contains(&TranslationSubset::from(*t)))
-                .max_by_key(|translation| (translation.rank(), self.backward_order(translation)));
+                .max_by(|a, b| {
+                    a.rank()
+                        .cmp(&b.rank())
+                        .then_with(|| self.backward_order(a).cmp(&self.backward_order(b)))
+                });
             // A nocross rule wins if there is no plain candidate to beat (many, e.g.
             // liblouis' `nocross always en`, have no plain counterpart at all).
             if let Some(nocross) = &nocross_candidate
@@ -2801,6 +2823,23 @@ mod tests {
         assert_eq!(table.translate("abc"), "⠁⠞");
         assert_eq!(table.translate("aBC"), "⠁⠠⠠⠞");
         assert_eq!(table.translate("abC"), "⠁⠃⠨⠉");
+    }
+
+    #[test]
+    fn prepunc_and_postpunc_for_the_same_character() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("space \\s 0"),
+            parse_rule("punctuation \" 5"),
+            parse_rule("prepunc \" 236"),
+            parse_rule("postpunc \" 356"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("\"a\""), "⠦⠁⠴");
+        assert_eq!(table.translate("a \" a"), "⠁⠀⠐⠀⠁");
     }
 
     #[test]
