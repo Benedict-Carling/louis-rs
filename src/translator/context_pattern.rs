@@ -714,7 +714,7 @@ mod tests {
             .insert(&tests, &action, &origin, stage, &TableContext::default())
             .unwrap();
         let translation =
-            ResolvedTranslation::new("a", "X", 1, TranslationStage::Main, origin.clone());
+            ResolvedTranslation::new("a", "X", 2, TranslationStage::Main, origin.clone());
         let patterns = builder.build();
         // matches when `input` truly starts at position 0 of the whole string being translated
         assert_eq!(patterns.find("a", &env, true), [translation]);
@@ -734,7 +734,7 @@ mod tests {
             .insert(&tests, &action, &origin, stage, &TableContext::default())
             .unwrap();
         let translation =
-            ResolvedTranslation::new("a", "X", 1, TranslationStage::Main, origin.clone());
+            ResolvedTranslation::new("a", "X", 2, TranslationStage::Main, origin.clone());
         let patterns = builder.build();
         // matches when "a" is exactly the whole remaining input
         assert_eq!(patterns.find("a", &env, true), [translation]);
@@ -759,7 +759,7 @@ mod tests {
             .insert(&tests, &action, &origin, stage, &TableContext::default())
             .unwrap();
         let translation =
-            ResolvedTranslation::new("a", "X", 1, TranslationStage::Main, origin.clone());
+            ResolvedTranslation::new("a", "X", 2, TranslationStage::Main, origin.clone());
         let patterns = builder.build();
         assert_eq!(patterns.find("a", &env, true), [translation]);
         assert!(patterns.find("a", &env, false).is_empty());
@@ -866,7 +866,7 @@ mod tests {
             .insert(&tests, &action, &origin, stage, &TableContext::default())
             .unwrap();
         let translation =
-            ResolvedTranslation::new("-", "-", 1, TranslationStage::Main, origin.clone());
+            ResolvedTranslation::new("-", "-", 3, TranslationStage::Main, origin.clone());
         let patterns = builder.build();
         assert_eq!(patterns.find("-", &env, true), [translation]);
         assert!(patterns.find("-0", &env, true).is_empty());

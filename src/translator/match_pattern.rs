@@ -426,7 +426,7 @@ mod tests {
         let mut builder = MatchPatternsBuilder::new();
         builder.insert(&pre, "a", &post, "X", &rule, &ctx);
         let matcher = builder.build();
-        let translation = ResolvedTranslation::new("a", "X", 2, TranslationStage::Main, rule);
+        let translation = ResolvedTranslation::new("a", "X", 3, TranslationStage::Main, rule);
         // "a" is preceded by nothing only when it truly begins the whole input
         assert_eq!(matcher.find("ab", true), vec![translation]);
         assert!(matcher.find("ab", false).is_empty());
@@ -452,7 +452,7 @@ mod tests {
                 .with_offset(1);
         assert_eq!(matcher.find("Axy", false), vec![translation]);
         // boundary branch: no preceding letter needed, at the true start of input
-        let translation = ResolvedTranslation::new("x", "X", 2, TranslationStage::Main, rule);
+        let translation = ResolvedTranslation::new("x", "X", 3, TranslationStage::Main, rule);
         assert_eq!(matcher.find("xy_", true), vec![translation]);
         // neither branch applies: not at the true start, and not preceded by an uppercase letter
         assert!(matcher.find("xy_", false).is_empty());

@@ -2285,6 +2285,22 @@ mod tests {
     }
 
     #[test]
+    fn match_end_of_input_counts_as_checked_context() {
+        let rules = [
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase e 15"),
+            parse_rule("match - be b%[_~^] ="),
+            parse_rule("match - be b 23"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("beb"), "⠃⠑⠃");
+        assert_eq!(table.translate("bebb"), "⠆⠃⠃");
+    }
+
+    #[test]
     fn match_with_any() {
         let rules = [
             parse_rule("lowercase a 1"),
