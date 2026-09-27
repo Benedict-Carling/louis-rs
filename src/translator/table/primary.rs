@@ -1943,7 +1943,11 @@ impl PrimaryTable {
                 let pass_rule = context_candidates
                     .iter()
                     .chain(&context_delayed)
-                    .filter(|t| is_pass_rule(t) && !seen.contains(&TranslationSubset::from(*t)))
+                    .filter(|t| {
+                        // `seen` holds what was applied at the current position only
+                        is_pass_rule(t)
+                            && (t.offset() > 0 || !seen.contains(&TranslationSubset::from(*t)))
+                    })
                     .max_by_key(|t| t.rank())
                     .cloned();
                 context_candidates.retain(|t| !is_pass_rule(t));
@@ -2946,6 +2950,18 @@ mod tests {
             "noback context $l[]$d @56",
         ]);
         assert_eq!(table.translate("a1"), "⠁⠰⠼⠁");
+    }
+
+    #[test]
+    fn a_pass_rule_applies_again_at_a_later_position() {
+        let table = forward_table(&[
+            "lowercase h 125",
+            "lowercase o 135",
+            "digit 1 1",
+            "digit 2 12",
+            "noback context $d[]$l @56",
+        ]);
+        assert_eq!(table.translate("1h12o"), "⠁⠰⠓⠁⠃⠰⠕");
     }
 
     #[test]
