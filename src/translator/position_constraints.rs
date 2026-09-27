@@ -53,6 +53,12 @@ impl PositionConstraints {
         Self(Vec::new())
     }
 
+    pub fn dont_contract(&mut self, range: std::ops::Range<usize>) {
+        for constraints in &mut self.0[range] {
+            constraints.insert(Constraint::DontContract);
+        }
+    }
+
     pub fn dont_contract_at(&self, pos: usize) -> bool {
         self.0
             .get(pos)

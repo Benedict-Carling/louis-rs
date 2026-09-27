@@ -147,6 +147,10 @@ pub struct PrimaryTable {
     backward: Option<BackwardSelector>,
     case: CaseClasses,
     capsletter_defined: bool,
+    /// The `nocont` strings, and the characters that end the word they take out of
+    /// contraction.
+    nocont: Vec<Vec<char>>,
+    word_delimiters: HashSet<char>,
     syllables: Vec<Vec<char>>,
     letter_or_litdigit_chars: HashSet<char>,
 }
@@ -178,6 +182,10 @@ struct PrimaryTableBuilder {
     prepunc_trie: Trie,
     postpunc_trie: Trie,
     capsletter_defined: bool,
+    /// The `nocont` strings, and the characters that end the word they take out of
+    /// contraction.
+    nocont: Vec<Vec<char>>,
+    word_delimiters: HashSet<char>,
     syllables: Vec<Vec<char>>,
 }
 
@@ -232,6 +240,8 @@ impl PrimaryTableBuilder {
             backward: None,
             direction,
             capsletter_defined: false,
+            nocont: Vec::new(),
+            word_delimiters: HashSet::default(),
             syllables: Vec::new(),
         }
     }
@@ -384,6 +394,8 @@ impl PrimaryTableBuilder {
             fallback_definitions: ctx.character_definitions().clone(),
             case: CaseClasses::from_context(ctx),
             capsletter_defined: self.capsletter_defined,
+            nocont: self.nocont,
+            word_delimiters: self.word_delimiters,
             syllables: self.syllables,
             letter_or_litdigit_chars: [CharacterClass::Letter, CharacterClass::Litdigit]
                 .iter()
@@ -663,6 +675,9 @@ impl PrimaryTable {
                 }
                 Rule::Capsnocont {} => {
                     builder.dont_contract_constrainer.capsnocont();
+                }
+                Rule::Nocont { chars } if direction == Direction::Forward => {
+                    builder.nocont.push(chars.chars().collect());
                 }
                 Rule::Numericmodechars { chars } => {
                     builder.numeric_indicator.runs().numericmodechars(chars);
@@ -1489,9 +1504,9 @@ impl PrimaryTable {
                 .unwrap_or_default(),
         );
         for class in [CharacterClass::Space, CharacterClass::Seqdelimiter] {
-            builder
-                .dont_contract_constrainer
-                .reset_chars(ctx.character_classes().get(&class).unwrap_or_default());
+            let chars = ctx.character_classes().get(&class).unwrap_or_default();
+            builder.word_delimiters.extend(chars.iter().copied());
+            builder.dont_contract_constrainer.reset_chars(chars);
         }
         builder.uppercase_indicator.uppercase_characters(
             ctx.character_classes()
@@ -1702,6 +1717,23 @@ impl PrimaryTable {
     }
 
     pub fn trace(&self, input: &str, options: &TranslationOptions) -> Vec<ResolvedTranslation> {
+        let mut nocont_words = Vec::new();
+        loop {
+            match self.trace_with_nocont(input, options, &nocont_words) {
+                Ok(translations) => return translations,
+                Err(word_start) => nocont_words.push(word_start),
+            }
+        }
+    }
+
+    /// liblouis's `doNocont`: a `nocont` rule selected inside a word starts the word
+    /// over, uncontracted. `Err` holds the start of such a word, to add to `nocont_words`.
+    fn trace_with_nocont(
+        &self,
+        input: &str,
+        options: &TranslationOptions,
+        nocont_words: &[usize],
+    ) -> Result<Vec<ResolvedTranslation>, usize> {
         let mut translations: Vec<ResolvedTranslation> = Vec::new();
         let mut delayed_translations: Vec<ResolvedTranslation> = Vec::new();
 
@@ -1722,8 +1754,15 @@ impl PrimaryTable {
         };
 
         let mut indications = self.indicators.precompute(input, &enriched_spans);
-        let constraints = self.constrainers.precompute(input, &enriched_spans);
+        let mut constraints = self.constrainers.precompute(input, &enriched_spans);
         let input_chars: Vec<char> = input.chars().collect();
+        for &start in nocont_words {
+            let end = input_chars[start..]
+                .iter()
+                .position(|c| self.word_delimiters.contains(c))
+                .map_or(input_chars.len(), |len| start + len);
+            constraints.dont_contract(start..end);
+        }
         let stands_alone = |t: &ResolvedTranslation, pos: usize| match &self.sequences {
             Some(sequences)
                 if matches!(t.rule(), Some(Rule::Word { .. } | Rule::Contraction { .. })) =>
@@ -1932,6 +1971,25 @@ impl PrimaryTable {
                 // use the longest translation
                 None => unseen.max_by_key(|translation| translation.rank()),
             };
+            if self.direction == Direction::Forward
+                && !dont_contract
+                && !options.mode().contains(TranslationMode::NoContractions)
+                && let Some(c) = input_chars.get(char_pos)
+                && !self.space_chars.contains(c)
+                && let Some(len) = self
+                    .nocont
+                    .iter()
+                    .filter(|s| input_chars[char_pos..].starts_with(s))
+                    .map(Vec::len)
+                    .max()
+                && candidate.as_ref().is_none_or(|t| t.length() <= len)
+            {
+                let word_start = input_chars[..char_pos]
+                    .iter()
+                    .rposition(|c| self.word_delimiters.contains(c))
+                    .map_or(0, |i| i + 1);
+                return Err(word_start);
+            }
             // A nocross rule wins if there is no plain candidate to beat (many, e.g.
             // liblouis' `nocross always en`, have no plain counterpart at all).
             if let Some(nocross) = &nocross_candidate
@@ -2056,7 +2114,7 @@ impl PrimaryTable {
                 break;
             }
         }
-        translations
+        Ok(translations)
     }
 
     /// liblouis's forward check for `joinword` (`onlyLettersAhead`) and `joinnum`: the
@@ -2790,6 +2848,24 @@ mod tests {
         let rules: Vec<AnchoredRule> = rules.iter().map(|r| parse_rule(r)).collect();
         let context = TableContext::compile(&rules).unwrap();
         PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context).unwrap()
+    }
+
+    #[test]
+    fn nocont_leaves_its_word_uncontracted() {
+        let table = forward_table(&[
+            "space \\s 0",
+            "punctuation @ 4",
+            "lowercase a 1",
+            "lowercase t 2345",
+            "lowercase x 1346",
+            "word at 1",
+            "always ax 2346",
+            "nocont @",
+            "nocont x",
+        ]);
+        assert_eq!(table.translate("at@at at"), "⠁⠞⠈⠁⠞⠀⠁");
+        assert_eq!(table.translate("at ax"), "⠁⠀⠮");
+        assert_eq!(table.translate("at xa"), "⠁⠀⠭⠁");
     }
 
     #[test]
