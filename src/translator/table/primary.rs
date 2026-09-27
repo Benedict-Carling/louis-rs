@@ -7,7 +7,7 @@ use crate::{
     emphasis::EmphasisSpan,
     parser::{
         AnchoredRule, Braille, BrailleChars, CharacterClass, CharacterClasses, HasNocross,
-        HasPrecedence, WithClass,
+        HasPrecedence, WithClass, WithMatch,
     },
     translator::{
         CharacterDefinition, ClassConstraint, ResolvedTranslation, Rule, TranslationError,
@@ -1663,6 +1663,39 @@ impl PrimaryTable {
                 || matches!(t.rule(), Some(Rule::Context { .. }))
                 || self.case.valid_match(&input_chars, pos, t.length())
         };
+        // where liblouis's emphasisBuffer (caps included) marks a begin, end, word or symbol
+        let emphasis_at = |caps_only: bool| -> Vec<bool> {
+            (0..=input_chars.len())
+                .map(|pos| {
+                    indications
+                        .translations_at(pos)
+                        .iter()
+                        .any(|t| is_emphasis_indicator(t.rule(), caps_only))
+                })
+                .collect()
+        };
+        let (emphasis_at, caps_at) = (emphasis_at(false), emphasis_at(true));
+        let emphasis_allows = |t: &ResolvedTranslation, pos: usize| {
+            if self.direction == Direction::Backward {
+                return true;
+            }
+            let end = pos + t.length();
+            let at = |i: usize| emphasis_at.get(i).copied().unwrap_or(false);
+            let interior = matches!(
+                t.rule(),
+                Some(Rule::Always { .. } | Rule::Word { .. } | Rule::Match { .. })
+            ) && (pos + 1..end).any(|i| caps_at[i]);
+            let (before, after) = match t.rule() {
+                Some(Rule::Match {
+                    matches: Some(m), ..
+                }) => (
+                    m.contains(&WithMatch::Before),
+                    m.contains(&WithMatch::After),
+                ),
+                _ => (false, false),
+            };
+            !(interior || (before && at(pos)) || (after && at(end)))
+        };
 
         loop {
             if last_indications_pos != Some(char_pos) {
@@ -1678,7 +1711,11 @@ impl PrimaryTable {
             let nocross_candidate = self
                 .nocross_candidates(chars.as_str(), prev, char_pos, &constraints)
                 .into_iter()
-                .filter(|t| stands_alone(t, char_pos) && valid_match(t, char_pos))
+                .filter(|t| {
+                    stands_alone(t, char_pos)
+                        && valid_match(t, char_pos)
+                        && emphasis_allows(t, char_pos)
+                })
                 .max_by_key(|t| t.rank());
 
             // given an input query the trie for matching translations. Then split off the
@@ -1711,7 +1748,7 @@ impl PrimaryTable {
             // boundary and gated here instead. Rejected candidates are simply dropped,
             // leaving the position to fall through to the plain punctuation character
             // definition (`character_translations`), matching liblouis.
-            candidates.retain(|t| valid_match(t, char_pos));
+            candidates.retain(|t| valid_match(t, char_pos) && emphasis_allows(t, char_pos));
 
             candidates.retain(|t| match t.rule() {
                 Some(Rule::Prepunc { .. }) => constraints.prepunc_ok_at(char_pos),
@@ -1925,6 +1962,34 @@ fn fallback(ch: char) -> BrailleChars {
         _ => unreachable!("no NABCC fallback for {ch:?}"),
     };
     BrailleChars::try_from(dots).expect("NABCC dot pattern is valid")
+}
+
+fn is_emphasis_indicator(rule: Option<&Rule>, caps_only: bool) -> bool {
+    let caps = matches!(
+        rule,
+        Some(
+            Rule::Capsletter { .. }
+                | Rule::Begcapsword { .. }
+                | Rule::Endcapsword { .. }
+                | Rule::Begcaps { .. }
+                | Rule::Endcaps { .. }
+                | Rule::Begcapsphrase { .. }
+                | Rule::Endcapsphrase { .. }
+        )
+    );
+    caps || !caps_only
+        && matches!(
+            rule,
+            Some(
+                Rule::Emphletter { .. }
+                    | Rule::Begemph { .. }
+                    | Rule::Endemph { .. }
+                    | Rule::Begemphword { .. }
+                    | Rule::Endemphword { .. }
+                    | Rule::Begemphphrase { .. }
+                    | Rule::Endemphphrase { .. }
+            )
+        )
 }
 
 #[cfg(test)]
@@ -2504,6 +2569,44 @@ mod tests {
         assert_eq!(table.translate("B"), "⠐⠠⠃");
         // caps start before nonumsign
         assert_eq!(table.translate("1A"), "⠼⠁⠠⠰⠁");
+    }
+
+    #[test]
+    fn empmatchafter_blocks_a_match_before_a_capital() {
+        let rules = [
+            parse_rule("lowercase s 234"),
+            parse_rule("lowercase e 15"),
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase w 2456"),
+            parse_rule("base uppercase S s"),
+            parse_rule("base uppercase W w"),
+            parse_rule("capsletter 6"),
+            parse_rule("empmatchafter match %a ea %a 2"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("seaw"), "⠎⠂⠺");
+        assert_eq!(table.translate("SeaW"), "⠠⠎⠑⠁⠠⠺");
+    }
+
+    #[test]
+    fn capital_inside_a_rule_prevents_it() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("base uppercase A a"),
+            parse_rule("base uppercase B b"),
+            parse_rule("capsletter 6"),
+            parse_rule("always ab 1234"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("ab"), "⠏");
+        assert_eq!(table.translate("aB"), "⠁⠠⠃");
     }
 
     #[test]
