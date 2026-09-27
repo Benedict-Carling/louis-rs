@@ -178,6 +178,19 @@ pub fn context_cells(rule: &Rule) -> usize {
     }
 }
 
+/// How many characters or cells a multipass rule's test starts with literally, which
+/// liblouis tries the rules of a pass by, most first
+pub fn pass_rule_cells(rule: &Rule) -> usize {
+    match rule {
+        Rule::Correct { test, .. }
+        | Rule::Context { test, .. }
+        | Rule::Pass2 { test, .. }
+        | Rule::Pass3 { test, .. }
+        | Rule::Pass4 { test, .. } => leading_cells(test.tests(), &mut 0).unwrap_or(0),
+        _ => 0,
+    }
+}
+
 impl BackwardSelector {
     /// `single_cell_rules` are the translations of every rule whose dots are one cell,
     /// keyed by that cell.
