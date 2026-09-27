@@ -5,8 +5,7 @@
 //! to decide which rules are eligible at each character position.
 //!
 //! The constrainer types are:
-//! * [`Constrainer::Numeric`]: sets [`Constraint::DontContract`] after a number, as liblouis's
-//!   numeric mode does
+//! * [`Constrainer::DontContract`]: detects numbers and capitals that set [`Constraint::DontContract`]
 //! * [`Constrainer::ComputerBraille`]: maps computer-braille spans to [`Constraint::UseComp6`]
 
 use enumset::{EnumSet, EnumSetType};
@@ -14,6 +13,7 @@ use std::collections::HashSet;
 
 use crate::emphasis::EmphasisSpan;
 use crate::hyphenation::HyphenationTable;
+use crate::translator::indication::numeric::{NumericRuns, RunEvent};
 
 /// A rule-selection constraint that can be set at a character position.
 #[derive(EnumSetType, Debug)]
@@ -110,51 +110,54 @@ impl PositionConstraints {
     }
 }
 
-/// Mirrors liblouis's `checkNumericMode`: in a table that uses numeric mode and whose
-/// `nocontractsign` equals its `nonumsign`, entering a number switches contractions off
-/// until the next space or `seqdelimiter` character. The rule at the first digit is
-/// selected before that happens, so [`Constraint::DontContract`] starts at the character
-/// after it.
+/// Sets [`Constraint::DontContract`] where liblouis sets `dontContract`: from a digit
+/// starting a number when the table uses numeric mode and its nocontractsign is its
+/// nonumsign (`checkNumericMode`), and from a run of two or more capitals when the table
+/// has `capsnocont`. Either lasts up to and including the next space or `seqdelimiter`.
 #[derive(Debug, Clone)]
-pub struct NumericConstrainer {
-    numeric_chars: HashSet<char>,
-    numeric_mode_chars: HashSet<char>,
-    midend_numeric_mode_chars: HashSet<char>,
-    word_end_chars: HashSet<char>,
+pub struct DontContractConstrainer {
+    runs: Option<NumericRuns>,
+    capsnocont: Option<HashSet<char>>,
+    reset_chars: HashSet<char>,
 }
 
-impl NumericConstrainer {
+impl DontContractConstrainer {
     fn compute(&self, input: &str) -> Vec<Constraints> {
         let chars: Vec<char> = input.chars().collect();
-        let mut constraints: Vec<Constraints> = vec![Constraints::empty(); chars.len()];
-        let mut dont_contract = false;
-        let mut numeric_mode = false;
-
-        for (pos, &c) in chars.iter().enumerate() {
-            if dont_contract {
-                constraints[pos].insert(Constraint::DontContract);
-            }
-            if !numeric_mode {
-                if self.numeric_chars.contains(&c) {
-                    numeric_mode = true;
-                    dont_contract = true;
-                } else if self.numeric_mode_chars.contains(&c) {
-                    numeric_mode = chars[pos + 1..]
-                        .iter()
-                        .find(|c| !self.numeric_mode_chars.contains(c))
-                        .is_some_and(|c| self.numeric_chars.contains(c));
-                }
-            } else if !(self.numeric_chars.contains(&c)
-                || self.numeric_mode_chars.contains(&c)
-                || self.midend_numeric_mode_chars.contains(&c))
-            {
-                numeric_mode = false;
-            }
-            if self.word_end_chars.contains(&c) {
-                dont_contract = false;
+        let mut starts = vec![false; chars.len()];
+        // checkNumericMode runs after the rule at the first digit is selected
+        let mut numeric_starts = vec![false; chars.len()];
+        if let Some(runs) = &self.runs {
+            for (start, event) in numeric_starts.iter_mut().zip(runs.events(&chars)) {
+                *start = event == (RunEvent::Start { by_digit: true });
             }
         }
-        constraints
+        if let Some(uppercase) = &self.capsnocont {
+            for (pos, c) in chars.iter().enumerate() {
+                let upper = |p: usize| chars.get(p).is_some_and(|c| uppercase.contains(c));
+                starts[pos] |=
+                    uppercase.contains(c) && (upper(pos + 1) || pos > 0 && upper(pos - 1));
+            }
+        }
+        let mut dont_contract = false;
+        starts
+            .into_iter()
+            .zip(numeric_starts)
+            .zip(&chars)
+            .map(|((start, numeric_start), c)| {
+                dont_contract |= start;
+                let constraints = if dont_contract {
+                    Constraints::only(Constraint::DontContract)
+                } else {
+                    Constraints::empty()
+                };
+                dont_contract |= numeric_start;
+                if self.reset_chars.contains(c) {
+                    dont_contract = false;
+                }
+                constraints
+            })
+            .collect()
     }
 }
 
@@ -343,8 +346,8 @@ impl BackwardCapsConstrainer {
 /// A single analysis pass that contributes to [`PositionConstraints`].
 #[derive(Debug, Clone)]
 pub enum Constrainer {
-    /// Detects numeric runs and sets [`Constraint::DontContract`].
-    Numeric(NumericConstrainer),
+    /// Detects numbers and runs of capitals and sets [`Constraint::DontContract`].
+    DontContract(DontContractConstrainer),
     /// Maps `computer_braille` emphasis spans to [`Constraint::UseComp6`].
     ComputerBraille(ComputerBrailleConstrainer),
     /// Detects backward `capsletter`/`begcapsword`/`endcapsword` dots and sets
@@ -360,7 +363,7 @@ pub enum Constrainer {
 impl Constrainer {
     fn compute(&self, input: &str, spans: &[EmphasisSpan]) -> Vec<Constraints> {
         match self {
-            Constrainer::Numeric(c) => c.compute(input),
+            Constrainer::DontContract(c) => c.compute(input),
             Constrainer::ComputerBraille(c) => c.compute(input, spans),
             Constrainer::BackwardCaps(c) => c.compute(input),
             Constrainer::Hyphenation(c) => c.compute(input),
@@ -393,39 +396,19 @@ impl Constrainers {
     }
 }
 
-/// A builder for [`Constrainer::Numeric`].
+/// A builder for [`Constrainer::DontContract`].
 #[derive(Debug, Default)]
-pub struct NumericConstrainerBuilder {
-    numeric_chars: HashSet<char>,
-    numeric_mode_chars: HashSet<char>,
-    midend_numeric_mode_chars: HashSet<char>,
-    uses_numeric_mode: bool,
+pub struct DontContractConstrainerBuilder {
     nocontractsign: Option<String>,
     nonumsign: Option<String>,
+    capsnocont: bool,
+    uppercase_chars: HashSet<char>,
+    reset_chars: HashSet<char>,
 }
 
-impl NumericConstrainerBuilder {
+impl DontContractConstrainerBuilder {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn numeric_characters(&mut self, chars: HashSet<char>) {
-        self.numeric_chars = chars;
-    }
-
-    pub fn numericmodechars(&mut self, s: &str) {
-        self.numeric_mode_chars.extend(s.chars());
-        self.uses_numeric_mode = true;
-    }
-
-    pub fn midendnumericmodechars(&mut self, s: &str) {
-        self.midend_numeric_mode_chars.extend(s.chars());
-        self.uses_numeric_mode = true;
-    }
-
-    /// `numericnocontchars` switches liblouis to its numeric mode handling too.
-    pub fn uses_numeric_mode(&mut self) {
-        self.uses_numeric_mode = true;
     }
 
     pub fn nocontractsign(&mut self, dots: &str) {
@@ -436,19 +419,30 @@ impl NumericConstrainerBuilder {
         self.nonumsign = Some(dots.to_string());
     }
 
-    /// `word_end_chars` are the table's space and `seqdelimiter` characters.
-    pub fn build(self, word_end_chars: HashSet<char>) -> Option<NumericConstrainer> {
-        let signs_equal = self.nocontractsign.is_some() && self.nocontractsign == self.nonumsign;
-        if self.uses_numeric_mode && signs_equal && !self.numeric_chars.is_empty() {
-            Some(NumericConstrainer {
-                numeric_chars: self.numeric_chars,
-                numeric_mode_chars: self.numeric_mode_chars,
-                midend_numeric_mode_chars: self.midend_numeric_mode_chars,
-                word_end_chars,
-            })
-        } else {
-            None
-        }
+    pub fn capsnocont(&mut self) {
+        self.capsnocont = true;
+    }
+
+    pub fn uppercase_chars(&mut self, chars: HashSet<char>) {
+        self.uppercase_chars = chars;
+    }
+
+    /// Space and `seqdelimiter` characters, which end the no-contraction span
+    pub fn reset_chars(&mut self, chars: impl IntoIterator<Item = char>) {
+        self.reset_chars.extend(chars);
+    }
+
+    pub fn build(self, runs: NumericRuns) -> Option<DontContractConstrainer> {
+        let runs = (runs.uses_numeric_mode()
+            && self.nocontractsign.is_some()
+            && self.nocontractsign == self.nonumsign)
+            .then_some(runs);
+        let capsnocont = self.capsnocont.then_some(self.uppercase_chars);
+        (runs.is_some() || capsnocont.is_some()).then_some(DontContractConstrainer {
+            runs,
+            capsnocont,
+            reset_chars: self.reset_chars,
+        })
     }
 }
 
@@ -587,24 +581,30 @@ mod tests {
             .collect()
     }
 
-    fn numeric_constrainers(builder: NumericConstrainerBuilder) -> Constrainers {
-        Constrainers::new(vec![Constrainer::Numeric(
-            builder.build(HashSet::from([' ', '-'])).unwrap(),
-        )])
-    }
-
-    fn ueb_like_builder() -> NumericConstrainerBuilder {
-        let mut builder = NumericConstrainerBuilder::new();
-        builder.numeric_characters(HashSet::from(['1', '2', '3']));
-        builder.numericmodechars(".");
+    fn dont_contract_constrainers(runs: NumericRuns) -> Option<Constrainers> {
+        let mut builder = DontContractConstrainerBuilder::new();
         builder.nocontractsign("56");
         builder.nonumsign("56");
-        builder
+        builder.reset_chars([' ', '-']);
+        let constrainer = builder.build(runs)?;
+        Some(Constrainers::new(vec![Constrainer::DontContract(
+            constrainer,
+        )]))
+    }
+
+    fn digits() -> NumericRuns {
+        let mut runs = NumericRuns::default();
+        runs.numeric_characters(HashSet::from(['1', '2', '3']));
+        runs
     }
 
     #[test]
     fn number_leaves_rest_of_word_uncontracted() {
-        let c = numeric_constrainers(ueb_like_builder()).precompute("a1bc d-1e-f", &[]);
+        let mut runs = digits();
+        runs.numericmodechars(".");
+        let c = dont_contract_constrainers(runs)
+            .unwrap()
+            .precompute("a1bc d-1e-f", &[]);
         assert_eq!(
             dont_contract(&c),
             vec![
@@ -614,31 +614,44 @@ mod tests {
     }
 
     #[test]
-    fn first_digit_may_still_contract() {
-        let c = numeric_constrainers(ueb_like_builder()).precompute("12", &[]);
-        assert_eq!(dont_contract(&c), vec![false, true]);
+    fn number_started_by_numericmodechars_stays_contractable() {
+        let mut runs = digits();
+        runs.numericmodechars(".");
+        let c = dont_contract_constrainers(runs)
+            .unwrap()
+            .precompute("a.1b", &[]);
+        assert_eq!(dont_contract(&c), vec![false, false, false, false]);
     }
 
     #[test]
-    fn number_entered_through_numeric_mode_char_keeps_contractions() {
-        let c = numeric_constrainers(ueb_like_builder()).precompute(".1a", &[]);
-        assert_eq!(dont_contract(&c), vec![false, false, false]);
+    fn number_contracts_without_numeric_mode() {
+        assert!(dont_contract_constrainers(digits()).is_none());
     }
 
     #[test]
-    fn no_constraint_when_signs_differ() {
-        let mut builder = ueb_like_builder();
-        builder.nonumsign("6");
-        assert!(builder.build(HashSet::from([' '])).is_none());
-    }
-
-    #[test]
-    fn no_constraint_without_numeric_mode() {
-        let mut builder = NumericConstrainerBuilder::new();
-        builder.numeric_characters(HashSet::from(['1', '2', '3']));
+    fn number_contracts_when_nocontractsign_is_not_nonumsign() {
+        let mut runs = digits();
+        runs.numericnocontchars("abc");
+        let mut builder = DontContractConstrainerBuilder::new();
         builder.nocontractsign("56");
-        builder.nonumsign("56");
-        assert!(builder.build(HashSet::from([' '])).is_none());
+        builder.nonumsign("6");
+        assert!(builder.build(runs).is_none());
+    }
+
+    #[test]
+    fn capitals_leave_the_rest_of_the_word_uncontracted() {
+        let mut builder = DontContractConstrainerBuilder::new();
+        builder.capsnocont();
+        builder.uppercase_chars(HashSet::from(['A', 'B']));
+        builder.reset_chars([' ']);
+        let constrainers = Constrainers::new(vec![Constrainer::DontContract(
+            builder.build(NumericRuns::default()).unwrap(),
+        )]);
+        let c = constrainers.precompute("aAB a Aa", &[]);
+        assert_eq!(
+            dont_contract(&c),
+            vec![false, true, true, true, false, false, false, false]
+        );
     }
 
     #[test]

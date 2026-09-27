@@ -22,7 +22,7 @@ use crate::{
         match_pattern::{MatchPatterns, MatchPatternsBuilder},
         position_constraints::{
             BackwardCapsConstrainerBuilder, ComputerBrailleConstrainer, Constrainer, Constrainers,
-            HyphenationConstrainerBuilder, NumericConstrainerBuilder, PositionConstraints,
+            DontContractConstrainerBuilder, HyphenationConstrainerBuilder, PositionConstraints,
             PunctuationConstrainerBuilder,
         },
         sequence::{Sequences, whole_word_boundaries},
@@ -132,7 +132,11 @@ pub struct PrimaryTable {
     match_patterns: MatchPatterns,
     context_patterns: ContextPatterns,
     /// All the nocross translation rules are stored in a separate trie
+    prepunc_trie: Trie,
+    postpunc_trie: Trie,
     nocross_trie: Trie,
+    /// `prepunc` and `postpunc` rules, kept apart from the other rules and from each
+    /// other, as they often share characters or dots
     indicators: Indicators,
     constrainers: Constrainers,
     /// Detects compbrl-triggered computer braille regions.
@@ -165,14 +169,16 @@ struct PrimaryTableBuilder {
     nocontract_indicator: nocontract::IndicatorBuilder,
     emphasis_indicator: emphasis::IndicatorBuilder,
     computer_braille_indicator: computer_braille::IndicatorBuilder,
-    numeric_constrainer: NumericConstrainerBuilder,
     backward_caps_constrainer: BackwardCapsConstrainerBuilder,
+    dont_contract_constrainer: DontContractConstrainerBuilder,
     hyphenation_constrainer: HyphenationConstrainerBuilder,
     punctuation_constrainer: PunctuationConstrainerBuilder,
     compbrl_triggers: Vec<String>,
     sequences: Option<Sequences>,
     backward: Option<BackwardSelector>,
     direction: Direction,
+    prepunc_trie: Trie,
+    postpunc_trie: Trie,
     capsletter_defined: bool,
     syllables: Vec<Vec<char>>,
 }
@@ -207,6 +213,8 @@ impl PrimaryTableBuilder {
             character_translations: CharacterTranslation::new(),
             trie,
             comp6_trie: Trie::new().with_context(trie_ctx.clone()).case_sensitive(),
+            prepunc_trie: Trie::new().with_context(trie_ctx.clone()),
+            postpunc_trie: Trie::new().with_context(trie_ctx.clone()),
             nocross_trie: Trie::new().with_context(trie_ctx),
             match_patterns: MatchPatternsBuilder::new(),
             context_patterns: ContextPatternsBuilder::new(),
@@ -217,8 +225,8 @@ impl PrimaryTableBuilder {
             nocontract_indicator: nocontract::IndicatorBuilder::new(),
             emphasis_indicator: emphasis::IndicatorBuilder::new(),
             computer_braille_indicator: computer_braille::IndicatorBuilder::new(),
-            numeric_constrainer: NumericConstrainerBuilder::new(),
             backward_caps_constrainer: BackwardCapsConstrainerBuilder::new(),
+            dont_contract_constrainer: DontContractConstrainerBuilder::new(),
             hyphenation_constrainer: HyphenationConstrainerBuilder::new(),
             punctuation_constrainer: PunctuationConstrainerBuilder::new(),
             compbrl_triggers: Vec::new(),
@@ -232,6 +240,22 @@ impl PrimaryTableBuilder {
 
     fn whole_word_boundaries(&self) -> (Transition, Option<Transition>) {
         whole_word_boundaries(self.sequences.as_ref())
+    }
+
+    /// Forward `prepunc` and `postpunc` rules live in tries of their own, so a rule of
+    /// another opcode for the same characters does not replace them
+    fn prepunc_trie_mut(&mut self, rule: &AnchoredRule) -> &mut Trie {
+        match self.direction {
+            Direction::Forward => &mut self.prepunc_trie,
+            Direction::Backward => self.get_trie_mut(rule),
+        }
+    }
+
+    fn postpunc_trie_mut(&mut self, rule: &AnchoredRule) -> &mut Trie {
+        match self.direction {
+            Direction::Forward => &mut self.postpunc_trie,
+            Direction::Backward => self.get_trie_mut(rule),
+        }
     }
 
     fn get_trie_mut(&mut self, rule: &AnchoredRule) -> &mut Trie {
@@ -316,8 +340,18 @@ impl PrimaryTableBuilder {
         }
     }
 
-    fn build(self, direction: Direction, ctx: &TableContext) -> PrimaryTable {
+    fn build(mut self, direction: Direction, ctx: &TableContext) -> PrimaryTable {
         let triggers = self.compbrl_triggers;
+        let numeric_mode_chars: Vec<char> = self
+            .numeric_indicator
+            .runs()
+            .continuation_chars()
+            .copied()
+            .collect();
+        self.mode_indicator.numeric_mode_chars(numeric_mode_chars);
+        let dont_contract_constrainer = self
+            .dont_contract_constrainer
+            .build(self.numeric_indicator.runs().clone());
         let indicators = [
             // Computer braille must be first so begcomp appears before emphasis.
             self.computer_braille_indicator
@@ -361,21 +395,15 @@ impl PrimaryTableBuilder {
             trie: self.trie,
             comp6_trie: self.comp6_trie,
             nocross_trie: self.nocross_trie,
+            prepunc_trie: self.prepunc_trie,
+            postpunc_trie: self.postpunc_trie,
             match_patterns: self.match_patterns.build(),
             context_patterns: self.context_patterns.build(),
             indicators: Indicators::new(indicators),
             constrainers: Constrainers::new(
                 [
                     Some(Constrainer::ComputerBraille(ComputerBrailleConstrainer {})),
-                    self.numeric_constrainer
-                        .build(
-                            [CharacterClass::Space, CharacterClass::Seqdelimiter]
-                                .iter()
-                                .filter_map(|class| ctx.character_classes().get(class))
-                                .flatten()
-                                .collect(),
-                        )
-                        .map(Constrainer::Numeric),
+                    dont_contract_constrainer.map(Constrainer::DontContract),
                     self.backward_caps_constrainer
                         .build()
                         .map(Constrainer::BackwardCaps),
@@ -529,7 +557,7 @@ impl PrimaryTable {
                     // must not get a second numsign.  Registering it as a midnum
                     // character achieves this via the numeric indicator and constrainer.
                     let s = character.to_string();
-                    builder.numeric_indicator.midnum(&s);
+                    builder.numeric_indicator.runs().midnum(&s);
                 }
                 Rule::Hyphen {
                     character, dots, ..
@@ -616,7 +644,9 @@ impl PrimaryTable {
                 }
                 Rule::Nonumsign { dots, .. } => {
                     builder.numeric_indicator.nonumsign(&dots.to_string(), rule);
-                    builder.numeric_constrainer.nonumsign(&dots.to_string());
+                    builder
+                        .dont_contract_constrainer
+                        .nonumsign(&dots.to_string());
                     if direction == Direction::Backward
                         && PrimaryTableBuilder::backward_indicator_dots_available(
                             "nonumsign",
@@ -628,16 +658,19 @@ impl PrimaryTable {
                     }
                 }
                 Rule::Numericnocontchars { chars } => {
-                    builder.numeric_indicator.numericnocontchars(chars);
-                    builder.numeric_constrainer.uses_numeric_mode();
+                    builder.numeric_indicator.runs().numericnocontchars(chars);
                 }
                 Rule::Midendnumericmodechars { chars } => {
-                    builder.numeric_indicator.midendnumericmodechars(chars);
-                    builder.numeric_constrainer.midendnumericmodechars(chars);
+                    builder
+                        .numeric_indicator
+                        .runs()
+                        .midendnumericmodechars(chars);
+                }
+                Rule::Capsnocont {} => {
+                    builder.dont_contract_constrainer.capsnocont();
                 }
                 Rule::Numericmodechars { chars } => {
-                    builder.numeric_indicator.numericmodechars(chars);
-                    builder.numeric_constrainer.numericmodechars(chars);
+                    builder.numeric_indicator.runs().numericmodechars(chars);
                 }
                 Rule::Capsletter { dots, .. } => {
                     builder.capsletter_defined = true;
@@ -862,10 +895,13 @@ impl PrimaryTable {
                 }
                 Rule::Nocontractsign { dots, .. } => {
                     builder
+                        .dont_contract_constrainer
+                        .nocontractsign(&dots.to_string());
+                    builder
                         .nocontract_indicator
                         .nocontractsign(&dots.to_string(), rule);
                     builder
-                        .numeric_constrainer
+                        .dont_contract_constrainer
                         .nocontractsign(&dots.to_string());
                     if direction == Direction::Backward
                         && PrimaryTableBuilder::backward_indicator_dots_available(
@@ -882,6 +918,7 @@ impl PrimaryTable {
                 // like liblouis, a character's own definition wins over its base
                 Rule::Base { derived, .. } if defined_chars.contains(derived) => {}
                 Rule::Base { derived, base, .. } => {
+                    builder.mode_indicator.base(*derived, *base);
                     if let Some(translation) = ctx.character_definitions().get(base).cloned() {
                         builder.insert_character(*derived, &translation, direction, rule);
                     } else {
@@ -1343,7 +1380,7 @@ impl PrimaryTable {
                     )
                 }
                 Rule::Midnum { chars, dots, .. } => {
-                    builder.numeric_indicator.midnum(chars);
+                    builder.numeric_indicator.runs().midnum(chars);
                     builder.get_trie_mut(rule).insert(
                         chars,
                         &dots.to_string(),
@@ -1383,7 +1420,7 @@ impl PrimaryTable {
                         // `PunctuationConstrainer`), so the trie itself imposes no
                         // boundary; `constraints.prepunc_ok_at()` gates it in `trace()`.
                         builder.punctuation_constrainer.mark_present();
-                        builder.get_trie_mut(rule).insert(
+                        builder.prepunc_trie_mut(rule).insert(
                             chars,
                             &dots.to_string(),
                             None,
@@ -1405,7 +1442,7 @@ impl PrimaryTable {
                     }) {
                         // See the comment in the `Rule::Prepunc` arm above.
                         builder.punctuation_constrainer.mark_present();
-                        builder.get_trie_mut(rule).insert(
+                        builder.postpunc_trie_mut(rule).insert(
                             chars,
                             &dots.to_string(),
                             None,
@@ -1458,10 +1495,18 @@ impl PrimaryTable {
             .collect();
         builder
             .numeric_indicator
-            .numeric_characters(numeric_chars.clone());
-        builder
-            .numeric_constrainer
+            .runs()
             .numeric_characters(numeric_chars);
+        builder.dont_contract_constrainer.uppercase_chars(
+            ctx.character_classes()
+                .get(&CharacterClass::Uppercase)
+                .unwrap_or_default(),
+        );
+        for class in [CharacterClass::Space, CharacterClass::Seqdelimiter] {
+            builder
+                .dont_contract_constrainer
+                .reset_chars(ctx.character_classes().get(&class).unwrap_or_default());
+        }
         builder.uppercase_indicator.uppercase_characters(
             ctx.character_classes()
                 .get(&CharacterClass::Uppercase)
@@ -1746,7 +1791,7 @@ impl PrimaryTable {
             None => options.emphasis().to_vec(),
         };
 
-        let indications = self.indicators.precompute(input, &enriched_spans);
+        let mut indications = self.indicators.precompute(input, &enriched_spans);
         let constraints = self.constrainers.precompute(input, &enriched_spans);
         let input_chars: Vec<char> = input.chars().collect();
         let stands_alone = |t: &ResolvedTranslation, pos: usize| match &self.sequences {
@@ -1798,8 +1843,7 @@ impl PrimaryTable {
             (0..=input_chars.len())
                 .map(|pos| {
                     indications
-                        .translations_at(pos)
-                        .iter()
+                        .precomputed_at(pos)
                         .any(|t| is_emphasis_indicator(t.rule(), caps_only))
                 })
                 .collect()
@@ -1845,6 +1889,11 @@ impl PrimaryTable {
             let at_start = chars.as_str().len() == input.len();
 
             // First check for nocross candidates
+            // the checks of liblouis's `for_selectRule` that depend on indication state
+            let dont_contract = constraints.dont_contract_at(char_pos);
+            let selectable =
+                |t: &ResolvedTranslation| !(dont_contract && t.rule().is_some_and(is_contraction));
+
             let nocross_candidate = self
                 .nocross_candidates(chars.as_str(), prev, char_pos, &constraints)
                 .into_iter()
@@ -1852,6 +1901,7 @@ impl PrimaryTable {
                     stands_alone(t, char_pos)
                         && valid_match(t, char_pos)
                         && emphasis_allows(t, char_pos)
+                        && selectable(t)
                 })
                 .max_by_key(|t| t.rank());
 
@@ -1879,6 +1929,10 @@ impl PrimaryTable {
             let (current, delayed) = self.partition_delayed_translations(delayed_translations);
             delayed_translations = delayed;
             candidates.extend(current);
+            // a tie between the two goes to the later, prepunc, as when they shared a trie
+            for trie in [&self.postpunc_trie, &self.prepunc_trie] {
+                candidates.extend(trie.find_translations(chars.as_str(), prev));
+            }
 
             // `prepunc`/`postpunc` need a variable-length scan the trie can't express
             // (see `PunctuationConstrainer`), so they're inserted with no trie-level
@@ -1909,35 +1963,8 @@ impl PrimaryTable {
                 _ => stands_alone(t, char_pos),
             });
 
-            // liblouis's dontContract refuses these opcodes whatever their length
-            if self.direction == Direction::Forward && constraints.dont_contract_at(char_pos) {
-                candidates.retain(|t| {
-                    !matches!(
-                        t.rule(),
-                        Some(
-                            Rule::Always { .. }
-                                | Rule::Syllable { .. }
-                                | Rule::Repeated { .. }
-                                | Rule::Repword { .. }
-                                | Rule::Rependword { .. }
-                                | Rule::Nocont { .. }
-                                | Rule::Largesign { .. }
-                                | Rule::Word { .. }
-                                | Rule::Partword { .. }
-                                | Rule::Joinnum { .. }
-                                | Rule::Lowword { .. }
-                                | Rule::Joinword { .. }
-                                | Rule::Sufword { .. }
-                                | Rule::Prfword { .. }
-                                | Rule::Begword { .. }
-                                | Rule::Begmidword { .. }
-                                | Rule::Midword { .. }
-                                | Rule::Midendword { .. }
-                                | Rule::Endword { .. }
-                                | Rule::Match { .. }
-                        )
-                    )
-                });
+            if self.direction == Direction::Forward {
+                candidates.retain(selectable);
             }
 
             // In computer braille mode, discard normal candidates and use comp6 rules only.
@@ -2166,6 +2193,33 @@ impl PrimaryTable {
             })
             .collect()
     }
+}
+
+/// The opcodes liblouis's `for_selectRule` skips while `dontContract` is set
+fn is_contraction(rule: &Rule) -> bool {
+    matches!(
+        rule,
+        Rule::Repeated { .. }
+            | Rule::Repword { .. }
+            | Rule::Rependword { .. }
+            | Rule::Nocont { .. }
+            | Rule::Always { .. }
+            | Rule::Syllable { .. }
+            | Rule::Largesign { .. }
+            | Rule::Word { .. }
+            | Rule::Partword { .. }
+            | Rule::Joinnum { .. }
+            | Rule::Lowword { .. }
+            | Rule::Joinword { .. }
+            | Rule::Sufword { .. }
+            | Rule::Prfword { .. }
+            | Rule::Begword { .. }
+            | Rule::Begmidword { .. }
+            | Rule::Midword { .. }
+            | Rule::Midendword { .. }
+            | Rule::Endword { .. }
+            | Rule::Match { .. }
+    )
 }
 
 /// Map a char to dots according to the North American Braille Computer Code (NABCC)
@@ -2719,6 +2773,71 @@ mod tests {
         assert_eq!(table.translate("123"), "⠼⠁⠃⠉");
         assert_eq!(table.translate("123foo"), "⠼⠁⠃⠉⠰⠄⠈⠈");
         assert_eq!(table.translate("foof"), "⠄⠈⠈⠄");
+    }
+
+    #[test]
+    fn number_suppresses_contractions_but_not_number_rules() {
+        let rules = [
+            parse_rule("lowercase f 3"),
+            parse_rule("lowercase o 4"),
+            parse_rule("punctuation - 36"),
+            parse_rule("digit 1 1"),
+            parse_rule("litdigit 1 1"),
+            parse_rule("numsign 3456"),
+            parse_rule("nonumsign 56"),
+            parse_rule("nocontractsign 56"),
+            parse_rule("numericnocontchars abcdefghij"),
+            parse_rule("midendnumericmodechars -"),
+            parse_rule("always oo 1246"),
+            parse_rule("endnum -fo 36-2"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("oo"), "⠫");
+        assert_eq!(table.translate("1oo"), "⠼⠁⠈⠈");
+        assert_eq!(table.translate("1-foo"), "⠼⠁⠤⠂⠈");
+        assert_eq!(table.translate("1-1"), "⠼⠁⠤⠁");
+    }
+
+    #[test]
+    fn contraction_not_across_caps_indication() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase c 14"),
+            parse_rule("base uppercase A a"),
+            parse_rule("base uppercase B b"),
+            parse_rule("base uppercase C c"),
+            parse_rule("capsletter 46"),
+            parse_rule("begcapsword 6-6"),
+            parse_rule("always bc 2345"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("abc"), "⠁⠞");
+        assert_eq!(table.translate("aBC"), "⠁⠠⠠⠞");
+        assert_eq!(table.translate("abC"), "⠁⠃⠨⠉");
+    }
+
+    #[test]
+    fn prepunc_and_postpunc_for_the_same_character() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("space \\s 0"),
+            parse_rule("punctuation \" 5"),
+            parse_rule("prepunc \" 236"),
+            parse_rule("postpunc \" 356"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("\"a\""), "⠦⠁⠴");
+        assert_eq!(table.translate("a \" a"), "⠁⠀⠐⠀⠁");
     }
 
     #[test]

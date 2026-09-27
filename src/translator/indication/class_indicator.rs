@@ -7,8 +7,8 @@
 //! - [`letter_characters`](ClassIndicator::letter_characters) — what bounds a mode word,
 //!   i.e. what a run can extend across without an explicit `endmode`-family close.
 //!   Uppercase is bounded by `letter` (plus [`mode_characters`](ClassIndicator::mode_characters),
-//!   e.g. a hyphen, as a transparent gap); `digit` is bounded by itself, so its
-//!   `endmode`/`endmodeword` structurally can never fire; any other custom class is
+//!   e.g. a hyphen, as a transparent gap); `digit` by digits and the base characters of
+//!   digits, with the numeric mode characters as the gap; any other custom class is
 //!   bounded by `letter`, like uppercase without the transparency carve-out.
 //!
 //! [`mode::IndicatorBuilder::build`](super::mode::IndicatorBuilder::build) picks the
@@ -80,6 +80,9 @@ pub(super) struct ClassIndicator {
     endmodephrase: Option<ResolvedTranslation>,
     endmodephrase_before: bool,
     len_phrase: usize,
+    /// Whether only whitespace separates the words of a passage, as for capitals; for
+    /// other modes anything that isn't a letter does (liblouis's `isEmphSpace`)
+    whitespace_separates_words: bool,
 }
 
 impl ClassIndicator {
@@ -98,6 +101,7 @@ impl ClassIndicator {
             endmodephrase: None,
             endmodephrase_before: true,
             len_phrase: 2,
+            whitespace_separates_words: false,
         }
     }
 
@@ -156,6 +160,10 @@ impl ClassIndicator {
     /// generic opcode sets this for any other mode).
     pub(super) fn mode_characters(&mut self, chars: HashSet<char>) {
         self.mode_chars = chars;
+    }
+
+    pub(super) fn whitespace_separates_words(&mut self) {
+        self.whitespace_separates_words = true;
     }
 
     pub(super) fn set_character_classes(&mut self, classes: CharacterClasses) {
@@ -407,12 +415,59 @@ impl ClassIndicator {
         }
     }
 
+    /// With only `begmode`/`endmode` there are no words to consider, just liblouis's
+    /// `resolveEmphasisBeginEnd`: a passage starts at an active character and runs
+    /// across everything but an inactive letter. It ends before that letter, or after
+    /// the last word with an active character if a space came in between.
+    fn passages(&self, chars: &[char]) -> Vec<(usize, ResolvedTranslation)> {
+        let mut result = Vec::new();
+        let mut push = |start: usize, end: usize| {
+            if let Some(t) = &self.begmode {
+                result.push((start, t.clone()));
+            }
+            if let Some(t) = &self.endmode {
+                result.push((end, t.clone()));
+            }
+        };
+        let mut start = None;
+        let mut last_word = chars.len();
+        let mut in_word = false;
+        for (i, &c) in chars.iter().enumerate() {
+            let is_space = if self.whitespace_separates_words {
+                self.is_space(c)
+            } else {
+                !self.is_letter(c)
+            };
+            if is_space {
+                if in_word {
+                    last_word = i;
+                    in_word = false;
+                }
+            } else if self.is_letter(c) {
+                if self.is_active(c) {
+                    start.get_or_insert(i);
+                    in_word = true;
+                } else if let Some(s) = start.take() {
+                    push(s, if in_word { i } else { last_word });
+                    in_word = false;
+                }
+            }
+        }
+        if let Some(s) = start {
+            push(s, if in_word { chars.len() } else { last_word });
+        }
+        result
+    }
+
     /// Returns sparse `(position, translation)` pairs.
     pub(super) fn precompute(&self, chars: &[char]) -> Vec<(usize, ResolvedTranslation)> {
         let mut result = Vec::new();
 
         if !self.is_indicating() {
             return result;
+        }
+        if self.modeletter.is_none() && self.begmodeword.is_none() && self.begmodephrase.is_none() {
+            return self.passages(chars);
         }
 
         let words: Vec<Word> = self
