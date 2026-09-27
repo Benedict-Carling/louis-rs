@@ -1100,7 +1100,8 @@ impl HasPrecedence for Rule {
             | Rule::Begnum { .. }
             | Rule::Midnum { .. }
             | Rule::Endnum { .. }
-            | Rule::Always { .. } => Precedence::Translation,
+            | Rule::Always { .. }
+            | Rule::Replace { .. } => Precedence::Translation,
             Rule::Capsletter { .. }
             | Rule::Begcapsword { .. }
             | Rule::Endcapsword { .. }
@@ -1538,8 +1539,20 @@ impl<'a> RuleParser<'a> {
         unescape(s, EscapingContext::Default)
     }
 
-    fn maybe_chars(&mut self) -> Option<String> {
-        self.tokens.next().map(|s| s.to_string())
+    /// The optional replacement of a `replace` rule. A token starting with `#` is a comment,
+    /// and `\#` escapes a literal `#`.
+    fn replacement(&mut self) -> Result<Option<String>, ParseError> {
+        match self.tokens.next() {
+            None => Ok(None),
+            Some(s) if s.starts_with('#') => Ok(None),
+            Some(s) => unescape(
+                s.strip_prefix('\\')
+                    .filter(|s| s.starts_with('#'))
+                    .unwrap_or(s),
+                EscapingContext::Default,
+            )
+            .map(Some),
+        }
     }
 
     fn filename(&mut self) -> Result<String, ParseError> {
@@ -2169,7 +2182,7 @@ impl<'a> RuleParser<'a> {
                 fail_if_invalid_constraints(Constraints::empty(), constraints, opcode)?;
                 Rule::Replace {
                     chars: self.chars()?,
-                    replacement: self.maybe_chars(),
+                    replacement: self.replacement()?,
                 }
             }
             Opcode::Always => Rule::Always {
@@ -2731,6 +2744,19 @@ mod tests {
         assert!(RuleParser::new("nofor nocross").nofor());
         assert!(!RuleParser::new("nocross nofor").nofor());
         assert!(!RuleParser::new("").nofor());
+    }
+
+    #[test]
+    fn replace() {
+        let replacement = |source| match RuleParser::new(source).rule().unwrap() {
+            Rule::Replace { replacement, .. } => replacement,
+            rule => panic!("not a replace rule: {rule:?}"),
+        };
+        assert_eq!(replacement("replace \\x2060"), None);
+        assert_eq!(replacement("replace \\x2060 #WORD JOINER"), None);
+        assert_eq!(replacement("replace \\x2026 ..."), Some("...".to_string()));
+        assert_eq!(replacement("replace x \\#"), Some("#".to_string()));
+        assert_eq!(replacement("replace x \\x0041"), Some("A".to_string()));
     }
 
     #[test]

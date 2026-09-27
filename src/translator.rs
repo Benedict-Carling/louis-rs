@@ -60,7 +60,7 @@ impl CharacterDefinition {
         self.0.get(from)
     }
 
-    fn resolve_implicit_dots(&self, chars: &str) -> Result<String, TranslationError> {
+    pub(crate) fn resolve_implicit_dots(&self, chars: &str) -> Result<String, TranslationError> {
         chars
             .chars()
             .map(|c| {

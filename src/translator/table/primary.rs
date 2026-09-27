@@ -958,6 +958,26 @@ impl PrimaryTable {
                         rule,
                     );
                 }
+                // liblouis never selects a `replace` rule when back-translating
+                Rule::Replace { chars, replacement } if direction == Direction::Forward => {
+                    let replacement = replacement.as_deref().unwrap_or_default();
+                    if let Ok(dots) = ctx
+                        .character_definitions()
+                        .resolve_implicit_dots(replacement)
+                    {
+                        builder.get_trie_mut(rule).insert(
+                            chars,
+                            &dots,
+                            None,
+                            None,
+                            direction,
+                            rule.precedence(),
+                            vec![],
+                            TranslationStage::Main,
+                            rule,
+                        );
+                    }
+                }
                 Rule::Begcomp { dots, .. } => {
                     builder
                         .computer_braille_indicator
@@ -2478,6 +2498,31 @@ mod tests {
         assert_eq!(table.translate("aa"), "⠁⠁");
         assert_eq!(table.translate("aa;aa"), "⠁⠁⠸⠁⠁");
         assert_eq!(table.translate("aa:aa;aa"), "⠁⠁⠇⠄⠄⠸⠁⠁");
+    }
+
+    #[test]
+    fn replace() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("space \\x2060 0"),
+            parse_rule("replace \\x2060"),
+            parse_rule("replace c ab"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("a\u{2060}b"), "⠁⠃");
+        assert_eq!(table.translate("c"), "⠁⠃");
+        let table = PrimaryTable::compile(
+            &rules,
+            Direction::Backward,
+            TranslationStage::Main,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(table.translate("⠁⠃"), "ab");
     }
 
     #[test]
