@@ -901,6 +901,11 @@ impl std::fmt::Display for Rule {
                 write!(f, "midnum {} {}", chars, dots)
             }
             Rule::Endnum { chars, dots, .. } => write!(f, "endnum {} {}", chars, dots),
+            Rule::Joinnum { chars, dots, .. } => write!(f, "joinnum {} {}", chars, dots),
+            Rule::Replace { chars, replacement } => match replacement {
+                Some(replacement) => write!(f, "replace {} {}", chars, replacement),
+                None => write!(f, "replace {}", chars),
+            },
             Rule::Modeletter { name, dots, .. } => write!(f, "modeletter {} {}", name, dots),
             Rule::Capsletter { dots, .. } => write!(f, "capsletter {}", dots),
             Rule::Begmodeword { name, dots, .. } => write!(f, "begmodeword {} {}", name, dots),
@@ -2757,6 +2762,14 @@ mod tests {
         assert_eq!(replacement("replace \\x2026 ..."), Some("...".to_string()));
         assert_eq!(replacement("replace x \\#"), Some("#".to_string()));
         assert_eq!(replacement("replace x \\x0041"), Some("A".to_string()));
+    }
+
+    #[test]
+    fn display_joinnum_and_replace() {
+        let show = |source| RuleParser::new(source).rule().unwrap().to_string();
+        assert_eq!(show("joinnum § 346"), "joinnum § ⠬");
+        assert_eq!(show("replace \\x2026 ..."), "replace … ...");
+        assert_eq!(show("replace x"), "replace x");
     }
 
     #[test]
