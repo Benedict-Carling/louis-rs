@@ -73,6 +73,16 @@ impl PositionConstraints {
             .is_some_and(|f| f.contains(Constraint::DontContract))
     }
 
+    /// Take the contractions away from `start` up to and including the next reset character
+    pub fn dont_contract_from(&mut self, start: usize, reset: impl Fn(char) -> bool, input: &str) {
+        for (constraints, c) in self.0.iter_mut().zip(input.chars()).skip(start) {
+            constraints.insert(Constraint::DontContract);
+            if reset(c) {
+                break;
+            }
+        }
+    }
+
     pub fn use_comp6_at(&self, pos: usize) -> bool {
         self.0
             .get(pos)

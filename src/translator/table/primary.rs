@@ -680,6 +680,19 @@ impl PrimaryTable {
                 Rule::Capsnocont {} => {
                     builder.dont_contract_constrainer.capsnocont();
                 }
+                Rule::Nocont { chars } if direction == Direction::Forward => {
+                    builder.get_trie_mut(rule).insert(
+                        chars,
+                        "",
+                        None,
+                        None,
+                        direction,
+                        rule.precedence(),
+                        vec![],
+                        TranslationStage::Main,
+                        rule,
+                    );
+                }
                 Rule::Numericmodechars { chars } => {
                     builder.numeric_indicator.runs().numericmodechars(chars);
                 }
@@ -1774,6 +1787,23 @@ impl PrimaryTable {
     }
 
     pub fn trace(&self, input: &str, options: &TranslationOptions) -> Vec<ResolvedTranslation> {
+        let mut nocont_words = Vec::new();
+        loop {
+            match self.trace_without_contractions_in(input, options, &nocont_words) {
+                Ok(translations) => return translations,
+                Err(word) => nocont_words.push(word),
+            }
+        }
+    }
+
+    /// Translate `input` with no contractions in the words starting at `nocont_words`, or
+    /// return the start of the word a `nocont` rule takes the contractions back from
+    fn trace_without_contractions_in(
+        &self,
+        input: &str,
+        options: &TranslationOptions,
+        nocont_words: &[usize],
+    ) -> Result<Vec<ResolvedTranslation>, usize> {
         let mut translations: Vec<ResolvedTranslation> = Vec::new();
         let mut delayed_translations: Vec<ResolvedTranslation> = Vec::new();
 
@@ -1820,7 +1850,10 @@ impl PrimaryTable {
             Some((start, end))
         });
         let mut indications = self.indicators.precompute(input, &enriched_spans);
-        let constraints = self.constrainers.precompute(input, &enriched_spans);
+        let mut constraints = self.constrainers.precompute(input, &enriched_spans);
+        for &word in nocont_words {
+            constraints.dont_contract_from(word, |c| self.space_chars.contains(&c), input);
+        }
         let input_chars: Vec<char> = input.chars().collect();
         let stands_alone = |t: &ResolvedTranslation, pos: usize| match &self.sequences {
             Some(sequences)
@@ -2084,6 +2117,16 @@ impl PrimaryTable {
                 delayed_translations = self.update_offsets(delayed_translations, nocross.length());
                 delayed_translations
                     .extend(self.match_candidates_within(consumed, nocross.length()));
+            } else if let Some(t) = candidate
+                && self.direction == Direction::Forward
+                && matches!(t.rule(), Some(Rule::Nocont { .. }))
+            {
+                // liblouis' doNocont goes back to the start of the word
+                let word = input_chars[..char_pos]
+                    .iter()
+                    .rposition(|c| self.space_chars.contains(c))
+                    .map_or(0, |p| p + 1);
+                return Err(word);
             } else if let Some(t) = candidate {
                 // an endnum rule takes back the letter sign inserted before it (liblouis's
                 // CTO_EndNum case in translateString)
@@ -2220,7 +2263,7 @@ impl PrimaryTable {
                 break;
             }
         }
-        translations
+        Ok(translations)
     }
 
     /// liblouis's forward check for `joinword` (`onlyLettersAhead`) and `joinnum`: the
@@ -3803,6 +3846,12 @@ mod tests {
             table.translate_with_options("a---- -----", &options),
             "⠁⠤⠤⠤⠤⠀⠤⠤⠤"
         );
+    }
+
+    #[test]
+    fn nocont_takes_back_the_contractions_of_its_word() {
+        let table = repeated_and_nocont_table();
+        assert_eq!(table.translate("ab abc ab"), "⠂⠀⠁⠃⠉⠀⠂");
     }
 
     #[test]
