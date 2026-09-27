@@ -12,6 +12,9 @@ pub struct TableContext {
     character_definitions: CharacterDefinition,
     character_classes: CharacterClasses,
     dots_classes: CharacterClasses,
+    /// The dots classes of only the rules for the translation direction, where they differ
+    /// from `dots_classes` (see [`Self::with_classes_of`])
+    direction_dots_classes: Option<CharacterClasses>,
     swap_classes: SwapClasses,
     seq_after_patterns: Vec<String>,
 }
@@ -29,6 +32,7 @@ impl TableContext {
             dots_classes,
             swap_classes,
             seq_after_patterns: Vec::new(),
+            direction_dots_classes: None,
         }
     }
 
@@ -46,6 +50,22 @@ impl TableContext {
 
     pub fn swap_classes(&self) -> &SwapClasses {
         &self.swap_classes
+    }
+
+    /// This context with the character and dots classes of `other`
+    pub fn with_classes_of(self, other: &TableContext) -> Self {
+        Self {
+            character_classes: other.character_classes.clone(),
+            direction_dots_classes: Some(self.dots_classes),
+            dots_classes: other.dots_classes.clone(),
+            ..self
+        }
+    }
+
+    pub fn direction_dots_classes(&self) -> &CharacterClasses {
+        self.direction_dots_classes
+            .as_ref()
+            .unwrap_or(&self.dots_classes)
     }
 
     pub fn seq_after_patterns(&self) -> &[String] {
@@ -323,6 +343,7 @@ impl TableContext {
             dots_classes,
             swap_classes,
             seq_after_patterns,
+            direction_dots_classes: None,
         })
     }
 }
@@ -449,6 +470,25 @@ mod tests {
                 .get(&CharacterClass::Letter)
                 .unwrap()
                 .contains(&'⠤')
+        );
+    }
+
+    #[test]
+    fn classes_of_rules_for_the_other_direction() {
+        let all = [parse_rule("lowercase a 1"), parse_rule("noback sign ⠠ 6")];
+        let backward = [parse_rule("lowercase a 1")];
+        let context = TableContext::compile(&backward)
+            .unwrap()
+            .with_classes_of(&TableContext::compile(&all).unwrap());
+        assert!(
+            context
+                .dots_classes()
+                .get(&CharacterClass::Sign)
+                .is_some_and(|cells| cells.contains(&'⠠'))
+        );
+        assert_eq!(
+            context.direction_dots_classes().get(&CharacterClass::Sign),
+            None
         );
     }
 }

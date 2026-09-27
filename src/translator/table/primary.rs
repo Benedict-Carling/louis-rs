@@ -1497,7 +1497,7 @@ impl PrimaryTable {
         );
         if direction == Direction::Backward {
             let mut letter_cells = ctx
-                .dots_classes()
+                .direction_dots_classes()
                 .get(&CharacterClass::Letter)
                 .unwrap_or_default();
             // Multi-letter `always` rules (e.g. Hungarian "sz"/"cs" digraphs) define
