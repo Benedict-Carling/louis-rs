@@ -386,7 +386,15 @@ impl PrimaryTableBuilder {
             constrainers: Constrainers::new(
                 [
                     Some(Constrainer::ComputerBraille(ComputerBrailleConstrainer {})),
-                    self.numeric_constrainer.build().map(Constrainer::Numeric),
+                    self.numeric_constrainer
+                        .build(
+                            [CharacterClass::Space, CharacterClass::Seqdelimiter]
+                                .iter()
+                                .filter_map(|class| ctx.character_classes().get(class))
+                                .flatten()
+                                .collect(),
+                        )
+                        .map(Constrainer::Numeric),
                     self.backward_caps_constrainer
                         .build()
                         .map(Constrainer::BackwardCaps),
@@ -631,6 +639,7 @@ impl PrimaryTable {
                 }
                 Rule::Nonumsign { dots, .. } => {
                     builder.numeric_indicator.nonumsign(&dots.to_string(), rule);
+                    builder.numeric_constrainer.nonumsign(&dots.to_string());
                     if direction == Direction::Backward
                         && PrimaryTableBuilder::backward_indicator_dots_available(
                             "nonumsign",
@@ -649,6 +658,10 @@ impl PrimaryTable {
                 }
                 Rule::Numericnocontchars { chars } => {
                     builder.numeric_indicator.numericnocontchars(chars);
+                    builder.numeric_constrainer.uses_numeric_mode();
+                }
+                Rule::Midendnumericmodechars { .. } => {
+                    builder.numeric_constrainer.uses_numeric_mode();
                 }
                 Rule::Numericmodechars { chars } => {
                     builder.numeric_indicator.numericmodechars(chars);
@@ -878,6 +891,9 @@ impl PrimaryTable {
                     builder
                         .nocontract_indicator
                         .nocontractsign(&dots.to_string(), rule);
+                    builder
+                        .numeric_constrainer
+                        .nocontractsign(&dots.to_string());
                     if direction == Direction::Backward
                         && PrimaryTableBuilder::backward_indicator_dots_available(
                             "nocontractsign",
