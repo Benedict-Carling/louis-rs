@@ -1539,7 +1539,14 @@ impl PrimaryTable {
                         builder.get_trie_mut(rule).insert(
                             chars,
                             &dots.to_string(),
-                            None,
+                            // back-translation approximates liblouis' `isBegWord`, which
+                            // looks back past further punctuation
+                            (direction == Direction::Backward).then(|| {
+                                Transition::Start(vec![
+                                    CharacterClass::Space,
+                                    CharacterClass::Punctuation,
+                                ])
+                            }),
                             None,
                             direction,
                             rule.precedence(),
@@ -1562,7 +1569,7 @@ impl PrimaryTable {
                             chars,
                             &dots.to_string(),
                             None,
-                            None,
+                            end_for(direction, None, Some(Transition::EndOfWord(true))),
                             direction,
                             rule.precedence(),
                             vec![],
@@ -1897,8 +1904,8 @@ impl PrimaryTable {
             // leaving the position to fall through to the plain punctuation character
             // definition (`character_translations`), matching liblouis.
             candidates.retain(|t| match t.rule() {
-                Some(Rule::Prepunc { .. }) => constraints.prepunc_ok_at(char_pos),
-                Some(Rule::Postpunc { .. }) => constraints.postpunc_ok_at(char_pos),
+                Some(Rule::Prepunc { .. }) => is_backward || constraints.prepunc_ok_at(char_pos),
+                Some(Rule::Postpunc { .. }) => is_backward || constraints.postpunc_ok_at(char_pos),
                 _ => stands_alone(t, char_pos),
             });
 
@@ -2956,6 +2963,19 @@ mod tests {
         ];
         let table = backward_table(&rules);
         assert_eq!(table.translate("⠰⠃⠤⠃⠀⠃"), "b-b but");
+    }
+
+    #[test]
+    fn backward_postpunc_at_the_end_of_a_word() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("punctuation ? 5"),
+            parse_rule("digit 8 236"),
+            parse_rule("postpunc ? 236"),
+        ];
+        let table = backward_table(&rules);
+        assert_eq!(table.translate("⠁⠦"), "a?");
+        assert_eq!(table.translate("⠦⠁"), "8a");
     }
 
     #[test]
