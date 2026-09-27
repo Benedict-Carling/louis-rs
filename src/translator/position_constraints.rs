@@ -172,7 +172,11 @@ impl HyphenationConstrainer {
     /// Marks the breaks of the word spanning `chars[start..end]` at their
     /// absolute positions in `constraints`.
     fn mark_word(&self, constraints: &mut [Constraints], chars: &[char], start: usize, end: usize) {
-        let word: String = chars[start..end].iter().collect();
+        // liblouis looks a word up in lowercase
+        let word: String = chars[start..end]
+            .iter()
+            .map(|c| c.to_lowercase().next().unwrap_or(*c))
+            .collect();
         for (i, is_break) in self.hyphenator.break_points(&word).into_iter().enumerate() {
             if is_break {
                 constraints[start + i].insert(Constraint::HyphenationBreak);

@@ -3232,6 +3232,7 @@ mod tests {
             parse_rule("lowercase s 234"),
             parse_rule("lowercase t 2345"),
             parse_rule("lowercase u 136"),
+            parse_rule("uppercase H 125"),
             parse_rule("always hausboot 123"),
             parse_rule("nocross always hausboot 456"),
             parse_rule("always fff 123"),
@@ -3244,6 +3245,7 @@ mod tests {
             PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
                 .unwrap();
         assert_eq!(table.translate("hausboot"), "⠇");
+        assert_eq!(table.translate("Hausboot"), "⠇");
         assert_eq!(table.translate("fff"), "⠸");
     }
 
