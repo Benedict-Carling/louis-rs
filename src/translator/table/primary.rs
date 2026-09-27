@@ -1481,7 +1481,10 @@ impl PrimaryTable {
                         ctx.character_classes(),
                     );
                 }
-                Rule::Context { test, action, .. } if direction == Direction::Backward => {
+                Rule::Context { test, action, .. }
+                    if direction == Direction::Backward
+                        && backward::context_cells(&rule.rule) > 0 =>
+                {
                     builder.context_patterns.insert(
                         test,
                         action,
@@ -1559,9 +1562,7 @@ impl PrimaryTable {
             ));
         }
         let mut table = builder.build(direction, ctx);
-        if direction == Direction::Forward {
-            table.context_rules = ContextRules::compile(rules, ctx)?;
-        }
+        table.context_rules = ContextRules::compile(rules, direction, ctx)?;
         Ok(table)
     }
 
@@ -1876,7 +1877,35 @@ impl PrimaryTable {
         // liblouis tries no context rule where one just applied without moving on
         let mut context_stalled_at: Option<usize> = None;
 
+        // backward, liblouis tries its pass-list context rules once after each rule
+        let mut context_due = false;
         loop {
+            if self.direction == Direction::Backward && std::mem::take(&mut context_due) {
+                let put = |c: char| match self.character_translations.get(&c) {
+                    Some(t) => t.output(),
+                    None => self.handle_undefined_char(c, options),
+                };
+                let applied = self
+                    .context_rules
+                    .candidates(&input_chars, char_pos, &env, &put)
+                    .into_iter()
+                    .max_by_key(|t| t.rank());
+                if let Some(t) = applied {
+                    for effect in t.effects() {
+                        env.apply(effect);
+                    }
+                    let length = t.length();
+                    if length > 0 {
+                        chars.nth(length - 1);
+                        prev = t.input().chars().last();
+                        char_pos += length;
+                    }
+                    delayed_translations = self.update_offsets(delayed_translations, length);
+                    translations.extend(t.into_steps());
+                    continue;
+                }
+            }
+            context_due = true;
             if last_indications_pos != Some(char_pos) {
                 translations.extend(indications.translations_at(char_pos));
                 last_indications_pos = Some(char_pos);
@@ -3768,6 +3797,28 @@ mod tests {
         ]);
         assert_eq!(table.translate(";b"), "⠨⠼");
         assert_eq!(table.translate("ab"), "⠁⠃");
+    }
+
+    /// Backward, liblouis tries its pass-list context rules after each rule, on the cells
+    #[test]
+    fn backward_context_rule_after_a_rule() {
+        let rules: Vec<_> = [
+            "lowercase a 1",
+            "punctuation . 46",
+            "nofor context $p \"p\"",
+        ]
+        .iter()
+        .map(|r| parse_rule(r))
+        .collect();
+        let context = TableContext::compile(&rules).unwrap();
+        let table = PrimaryTable::compile(
+            &rules,
+            Direction::Backward,
+            TranslationStage::Main,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(table.translate("⠁⠨⠁"), "apa");
     }
 
     /// liblouis tries no context rule where one has just applied without moving on

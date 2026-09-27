@@ -736,22 +736,38 @@ impl PassRules {
 #[derive(Debug, Default)]
 pub struct ContextRules {
     rules: Vec<PassRule>,
+    direction: Direction,
 }
 
 impl ContextRules {
-    pub fn compile(rules: &[AnchoredRule], ctx: &TableContext) -> Result<Self, TranslationError> {
+    pub fn compile(
+        rules: &[AnchoredRule],
+        direction: Direction,
+        ctx: &TableContext,
+    ) -> Result<Self, TranslationError> {
+        // backward, a context rule tests the cells
         let compiler = Compiler {
             ctx,
-            classes: ctx.character_classes(),
+            classes: match direction {
+                Direction::Forward => ctx.character_classes(),
+                Direction::Backward => ctx.dots_classes(),
+            },
             dots: false,
         };
         let mut compiled = Vec::new();
         for rule in rules {
-            if let crate::parser::Rule::Context { test, action, .. } = &rule.rule {
+            if let crate::parser::Rule::Context { test, action, .. } = &rule.rule
+                // backward, only the rules liblouis files with its pass rules
+                && (direction == Direction::Forward
+                    || crate::translator::table::backward::context_cells(&rule.rule) == 0)
+            {
                 compiled.push(PassRule::compile(test, action, rule, &compiler)?);
             }
         }
-        Ok(Self { rules: compiled })
+        Ok(Self {
+            rules: compiled,
+            direction,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -772,7 +788,10 @@ impl ContextRules {
         self.rules
             .iter()
             .filter_map(|rule| {
-                let m = rule.test_forward(input, pos, &vars)?;
+                let m = match self.direction {
+                    Direction::Forward => rule.test_forward(input, pos, &vars),
+                    Direction::Backward => rule.test_backward(input, pos, &vars),
+                }?;
                 let (parts, new_pos) = rule.apply(input, m, TranslationStage::Main, put);
                 let consumed: String = input[pos..new_pos].iter().collect();
                 let output: String = parts.iter().map(|t| t.output()).collect();
