@@ -2144,7 +2144,7 @@ impl PrimaryTable {
                     // otherwise handle it as a undefined character
                     let translation = ResolvedTranslation::new(
                         &next_char.to_string(),
-                        &self.handle_undefined_char(next_char),
+                        &self.handle_undefined_char(next_char, options),
                         1,
                         TranslationStage::Main,
                         None,
@@ -2178,21 +2178,49 @@ impl PrimaryTable {
         }
     }
 
-    fn handle_undefined_char(&self, ch: char) -> String {
-        ch.escape_unicode()
-            .to_string()
-            .replace(r"\u", r"\x") // replace \u by \x
-            .replace(['{', '}'], "") // drop the curly braces
+    /// How liblouis shows a character the table does not define: going forward its escape in
+    /// quotes (`'\x2026'`) in the table's own cells for those characters, going backward the
+    /// numbers of its dots (`\456/`), and nothing at all under `noUndefined`.
+    fn handle_undefined_char(&self, ch: char, options: &TranslationOptions) -> String {
+        if options.mode().contains(TranslationMode::NoUndefined) {
+            return String::new();
+        }
+        if self.direction == Direction::Backward {
+            return unknown_dots(ch);
+        }
+        let hex = format!("{:x}", u32::from(ch));
+        let escape = match hex.len() {
+            ..=4 => format!("'\\x{hex:0>4}'"),
+            5 => format!("'\\y{hex}'"),
+            _ => format!("'\\z{hex:0>8}'"),
+        };
+        escape
             .chars()
-            .map(|c| {
-                if let Some(t) = self.fallback_definitions.get(&c) {
-                    t.clone()
-                } else {
-                    fallback(c).to_string()
-                }
+            .map(|c| match self.fallback_definitions.get(&c) {
+                Some(dots) if dots.chars().count() == 1 => dots.clone(),
+                _ => fallback(c).to_string(),
             })
             .collect()
     }
+}
+
+/// The dot numbers of a cell as liblouis's `_lou_unknownDots` spells them
+fn unknown_dots(cell: char) -> String {
+    let bits = u32::from(cell).wrapping_sub(0x2800);
+    let dots: String = if bits <= 0xff {
+        (0..8)
+            .filter(|dot| bits & (1 << dot) != 0)
+            .map(|dot| char::from(b'1' + dot as u8))
+            .collect()
+    } else {
+        String::new()
+    };
+    let dots = if dots.is_empty() {
+        "0".to_string()
+    } else {
+        dots
+    };
+    format!("\\{dots}/")
 }
 
 /// The opcodes liblouis's `for_selectRule` skips while `dontContract` is set
@@ -2247,8 +2275,11 @@ fn fallback(ch: char) -> BrailleChars {
         'd' => "145",
         'e' => "15",
         'f' => "124",
-        '\\' => "1256",
+        '\\' => "12567",
+        '\'' => "3",
         'x' => "1346",
+        'y' => "13456",
+        'z' => "1356",
         _ => unreachable!("no NABCC fallback for {ch:?}"),
     };
     BrailleChars::try_from(dots).expect("NABCC dot pattern is valid")
@@ -2294,11 +2325,18 @@ mod tests {
     fn fallback_covers_every_escaped_char() {
         // handle_undefined_char emits `\x` plus lowercase hex digits, so
         // fallback must map all of them without hitting the unreachable arm
-        for c in r"\x0123456789abcdef".chars() {
+        for c in r"'\xyz0123456789abcdef".chars() {
             assert_eq!(fallback(c).len(), 1);
         }
         assert_eq!(fallback('a').to_string(), "\u{2801}"); // dot 1
         assert_eq!(fallback('9').to_string(), "\u{2814}"); // dots 35, not 25
+    }
+
+    #[test]
+    fn unknown_dots_are_spelled_by_number() {
+        assert_eq!(unknown_dots('⠸'), "\\456/");
+        assert_eq!(unknown_dots('⢁'), "\\18/");
+        assert_eq!(unknown_dots('⠀'), "\\0/");
     }
 
     fn parse_rule(source: &str) -> AnchoredRule {
@@ -2324,7 +2362,7 @@ mod tests {
                 .unwrap();
         assert_eq!(table.translate("foobar"), "⠇⠸");
         assert_eq!(table.translate("  "), "⠀⠀");
-        assert_eq!(table.translate("🐂"), "⠳⠭⠂⠋⠲⠴⠆");
+        assert_eq!(table.translate("🐂"), "⠄⡳⠽⠂⠋⠲⠴⠆⠄");
     }
 
     #[test]
