@@ -27,12 +27,24 @@ impl Test {
     }
 
     pub fn add_implicit_replace(self) -> Self {
-        if !self.has_replace() {
-            Self {
-                tests: vec![TestInstruction::Replace { tests: self.tests }],
+        if self.has_replace() {
+            return self;
+        }
+        // liblouis replaces from where the match started, so what a leading `_N` steps
+        // back over is context
+        if let Some(TestInstruction::Lookback { len }) = self.tests.first() {
+            let len = usize::from(*len);
+            let rest = &self.tests[1..];
+            if rest.len() > len && rest[..len].iter().all(TestInstruction::matches_one_char) {
+                let mut tests = rest[..len].to_vec();
+                tests.push(TestInstruction::Replace {
+                    tests: rest[len..].to_vec(),
+                });
+                return Self { tests };
             }
-        } else {
-            self
+        }
+        Self {
+            tests: vec![TestInstruction::Replace { tests: self.tests }],
         }
     }
 }
@@ -114,6 +126,19 @@ pub enum TestInstruction {
     /// `~` (tilde): true only when there is no more input left, i.e. the match has reached the
     /// true end of the original string being translated.
     AtEnd,
+}
+
+impl TestInstruction {
+    fn matches_one_char(&self) -> bool {
+        let single = |q: &Option<Quantifier>| matches!(q, None | Some(Quantifier::Number(1)));
+        match self {
+            TestInstruction::String { s } => s.chars().count() == 1,
+            TestInstruction::Dots { dots } => dots.len() == 1,
+            TestInstruction::Attributes { quantifier, .. }
+            | TestInstruction::Class { quantifier, .. } => single(quantifier),
+            _ => false,
+        }
+    }
 }
 
 impl IsLiteral for TestInstruction {
@@ -695,6 +720,21 @@ mod tests {
             Parser::new("![$d]").negate(),
             Err(ParseError::NegatedReplacement)
         );
+    }
+
+    #[test]
+    fn implicit_replace_starts_after_a_leading_lookback() {
+        let test = Parser::new("_$l@456")
+            .tests()
+            .unwrap()
+            .add_implicit_replace();
+        assert!(matches!(
+            test.tests().as_slice(),
+            [
+                TestInstruction::Attributes { .. },
+                TestInstruction::Replace { tests }
+            ] if matches!(tests.as_slice(), [TestInstruction::Dots { .. }])
+        ));
     }
 
     #[test]
