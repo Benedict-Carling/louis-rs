@@ -1,6 +1,8 @@
+use std::collections::HashSet;
+
 use crate::{
     Direction,
-    parser::{AnchoredRule, BrailleChars, Constraints, HasDirection, Rule},
+    parser::{AnchoredRule, BrailleChars, CharacterClass, Constraints, HasDirection, Rule},
     translator::{
         PositionMap, ResolvedTranslation, TranslationError, TranslationOptions, TranslationStage,
         table::{
@@ -77,6 +79,9 @@ fn with_grouping_characters(rules: &[AnchoredRule]) -> Vec<AnchoredRule> {
 pub struct TranslationPipeline {
     steps: Vec<Transformation>,
     direction: Direction,
+    /// The characters or cells that separate words on the input side of the main pass
+    spaces: HashSet<char>,
+    word_separators: HashSet<char>,
 }
 
 impl TranslationPipeline {
@@ -146,13 +151,29 @@ impl TranslationPipeline {
                 MultipassTable::compile(&pass4_rules, direction, TranslationStage::Post3, &ctx)?;
             steps.push(Transformation::Post(transform));
         }
-        match direction {
-            Direction::Forward => Ok(Self { steps, direction }),
-            Direction::Backward => Ok(Self {
-                steps: steps.into_iter().rev().collect(),
-                direction,
-            }),
+        let classes = match direction {
+            Direction::Forward => ctx.character_classes(),
+            Direction::Backward => ctx.dots_classes(),
+        };
+        let spaces = classes.get(&CharacterClass::Space).unwrap_or_default();
+        let mut word_separators = spaces.clone();
+        if direction == Direction::Forward {
+            word_separators.extend(
+                classes
+                    .get(&CharacterClass::Seqdelimiter)
+                    .unwrap_or_default(),
+            );
         }
+        let steps = match direction {
+            Direction::Forward => steps,
+            Direction::Backward => steps.into_iter().rev().collect(),
+        };
+        Ok(Self {
+            steps,
+            direction,
+            spaces,
+            word_separators,
+        })
     }
 
     /// Add `display` as the outermost stage, mapping the braille side of the pipeline.
@@ -205,6 +226,91 @@ impl TranslationPipeline {
             result = step.translate_with_options(&result, options);
         }
         result
+    }
+
+    /// Translate `input` into at most `max_output` characters, as liblouis does into an
+    /// output buffer of that size, also returning how much of the input was used. The main
+    /// pass stops before the first rule that no longer fits and, in the middle of a word,
+    /// gives back the whole word; every pass then skips the spaces that follow.
+    pub fn translate_limited(
+        &self,
+        input: &str,
+        options: &TranslationOptions,
+        max_output: usize,
+    ) -> (String, usize) {
+        let mut text = input.to_string();
+        let mut consumed_original: Option<usize> = None;
+        let mut stages: Vec<Vec<ResolvedTranslation>> = Vec::new();
+        for step in &self.steps {
+            let chars: Vec<char> = text.chars().collect();
+            let steps = step.trace(&text, options);
+            let is_main = matches!(step, Transformation::Primary(_));
+            let (mut pos, mut out) = (0, 0);
+            let mut last_word = (0, 0);
+            let mut kept = 0;
+            let mut overflow = false;
+            for (i, t) in steps.iter().enumerate() {
+                if is_main && pos > 0 && self.word_separators.contains(&chars[pos - 1]) {
+                    last_word = (pos, out);
+                }
+                let length = t.output().chars().count();
+                if out + length > max_output {
+                    overflow = true;
+                    break;
+                }
+                out += length;
+                pos += t.input().chars().count();
+                kept = i + 1;
+                if is_main
+                    && pos > 0
+                    && pos <= chars.len()
+                    && self.word_separators.contains(&chars[pos - 1])
+                {
+                    last_word = (pos, out);
+                }
+            }
+            let mut steps = steps;
+            if overflow {
+                if is_main
+                    && last_word.1 != 0
+                    && pos < chars.len()
+                    && !self.spaces.contains(&chars[pos])
+                {
+                    let (word_pos, word_out) = last_word;
+                    let (mut p, mut o) = (0, 0);
+                    kept = 0;
+                    for t in &steps {
+                        if p >= word_pos || o >= word_out {
+                            break;
+                        }
+                        p += t.input().chars().count();
+                        o += t.output().chars().count();
+                        kept += 1;
+                    }
+                    pos = word_pos;
+                }
+                steps.truncate(kept);
+                while pos < chars.len() && self.spaces.contains(&chars[pos]) {
+                    pos += 1;
+                }
+            }
+            let stage_consumed = if overflow { pos } else { chars.len() };
+            consumed_original = Some(match consumed_original {
+                None => stage_consumed,
+                Some(previous) => {
+                    let map =
+                        PositionMap::from_trace(input.chars().count(), &stages, self.direction);
+                    map.input_positions()
+                        .get(stage_consumed)
+                        .copied()
+                        .unwrap_or(previous)
+                        .min(previous)
+                }
+            });
+            text = steps.iter().map(|t| t.output()).collect();
+            stages.push(steps);
+        }
+        (text, consumed_original.unwrap_or(input.chars().count()))
     }
 
     /// Translate `input` and map its positions to the positions of the output
@@ -278,6 +384,30 @@ mod tests {
         // `*@136` copies the accent out of the bracket and consumes the whole match,
         // so the @135 and @13456 cells around it are replaced, not kept
         assert_eq!(pipeline.translate("oύ"), "⠐⠥");
+    }
+
+    #[test]
+    fn a_limited_output_gives_back_the_word_that_does_not_fit() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase c 14"),
+            parse_rule("space \\s 0"),
+        ];
+        let pipeline = TranslationPipeline::compile(&rules, Direction::Forward).unwrap();
+        let options = TranslationOptions::default();
+        assert_eq!(
+            pipeline.translate_limited("abc abc", &options, 5),
+            ("⠁⠃⠉⠀".to_string(), 4)
+        );
+        assert_eq!(
+            pipeline.translate_limited("abc abc", &options, 7),
+            ("⠁⠃⠉⠀⠁⠃⠉".to_string(), 7)
+        );
+        assert_eq!(
+            pipeline.translate_limited("abc", &options, 2),
+            ("⠁⠃".to_string(), 2)
+        );
     }
 
     #[test]

@@ -543,6 +543,23 @@ impl Test {
             (Some(display), Direction::Backward) => display.read(&self.input),
             _ => self.input.clone(),
         };
+        if let Some(max_output) = self.max_output_length {
+            let (translated, consumed) = table.translate_limited(&input, &options, max_output);
+            let translated = match (display, direction) {
+                (Some(display), Direction::Forward) => match display.show(&translated) {
+                    Some(shown) => shown,
+                    None => return self.failed(translated, direction),
+                },
+                _ => translated,
+            };
+            if self
+                .real_input_length
+                .is_some_and(|length| length != consumed)
+            {
+                return self.failed(format!("{translated} (input used: {consumed})"), direction);
+            }
+            return self.verdict(translated, direction, None);
+        }
         let (translated, positions) = table.translate_with_positions(&input, &options);
         let translated = match (display, direction) {
             (Some(display), Direction::Forward) => match display.show(&translated) {
