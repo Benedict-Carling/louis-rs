@@ -17,11 +17,20 @@ use crate::translator::{ResolvedTranslation, TranslationError, TranslationStage}
 
 impl Regexp {
     fn from_test(test: &Test, whole_match: bool, ctx: &CharacterClasses) -> Self {
-        let regexp = Regexp::from_instructions(test.tests(), whole_match, ctx);
-        if whole_match {
-            Regexp::Consume(Box::new(regexp))
-        } else {
+        if !whole_match {
+            return Regexp::from_instructions(test.tests(), whole_match, ctx);
+        }
+        // `*` advances to where the test ends, so a trailing `_N` leaves the last N
+        // characters checked but not consumed
+        let (consumed, checked) = split_trailing_lookback(test.tests());
+        let regexp = Regexp::Consume(Box::new(Regexp::from_instructions(consumed, true, ctx)));
+        if checked.is_empty() {
             regexp
+        } else {
+            Regexp::Concat(
+                Box::new(regexp),
+                Box::new(Regexp::from_instructions(checked, true, ctx)),
+            )
         }
     }
 
@@ -143,6 +152,48 @@ impl Regexp {
         }
         Regexp::CharacterClass(characters).quantified(quantifier)
     }
+}
+
+/// The number of characters `test` always advances over, if fixed
+fn fixed_width(test: &TestInstruction) -> Option<usize> {
+    let repeat = |quantifier: &Option<Quantifier>| match quantifier {
+        None => Some(1),
+        Some(Quantifier::Number(n)) => Some(*n as usize),
+        _ => None,
+    };
+    match test {
+        TestInstruction::String { s } => Some(s.chars().count()),
+        TestInstruction::Dots { dots } => Some(dots.len()),
+        TestInstruction::Attributes { quantifier, .. }
+        | TestInstruction::Class { quantifier, .. } => repeat(quantifier),
+        TestInstruction::Negate { test } => fixed_width(test),
+        TestInstruction::Variable { .. }
+        | TestInstruction::AtBeginning
+        | TestInstruction::AtEnd => Some(0),
+        TestInstruction::Lookback { .. } | TestInstruction::Replace { .. } => None,
+    }
+}
+
+/// Split `tests` ending in `_N` into the tests before the last N characters and the tests
+/// that check those characters
+fn split_trailing_lookback(tests: &[TestInstruction]) -> (&[TestInstruction], &[TestInstruction]) {
+    let Some((TestInstruction::Lookback { len }, rest)) = tests.split_last() else {
+        return (tests, &[]);
+    };
+    let mut width = 0;
+    for start in (0..rest.len()).rev() {
+        match fixed_width(&rest[start]) {
+            Some(w) => width += w,
+            None => break,
+        }
+        if width == *len as usize {
+            return (&rest[..start], &rest[start..]);
+        }
+        if width > *len as usize {
+            break;
+        }
+    }
+    (tests, &[])
 }
 
 impl TranslationTarget {
@@ -801,6 +852,26 @@ mod tests {
         // "not at the beginning" -- opposite of `context_at_beginning_anchor`
         assert!(patterns.find("a", &env, true).is_empty());
         assert_eq!(patterns.find("a", &env, false), [translation]);
+    }
+
+    #[test]
+    fn context_copy_trailing_lookback_not_consumed() {
+        let env = Environment::new();
+        let tests = test::Parser::new(r#""a"["b"]!"c"_"#).tests().unwrap();
+        let action = action::Parser::new("*").actions().unwrap();
+        let origin = origin(r#"context "a"["b"]!"c"_ *"#);
+        let stage = TranslationStage::Main;
+        let ctx = compiled(&["letter b 12"]);
+        let mut builder = ContextPatternsBuilder::new();
+        builder
+            .insert(&tests, &action, &origin, stage, &ctx)
+            .unwrap();
+        let patterns = builder.build();
+        // "a" and "b" are consumed, "d" only checked
+        let translation =
+            ResolvedTranslation::new("b", "⠃", 3, stage, origin.clone()).with_length(2);
+        assert_eq!(patterns.find("abd", &env, true), [translation]);
+        assert!(patterns.find("abc", &env, true).is_empty());
     }
 
     #[test]
