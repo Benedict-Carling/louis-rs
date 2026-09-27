@@ -5,7 +5,7 @@
 //! to decide which rules are eligible at each character position.
 //!
 //! The constrainer types are:
-//! * [`Constrainer::Numeric`]: detects digit runs and sets [`Constraint::DontContract`]
+//! * [`Constrainer::DontContract`]: detects numbers and capitals that set [`Constraint::DontContract`]
 //! * [`Constrainer::ComputerBraille`]: maps computer-braille spans to [`Constraint::UseComp6`]
 
 use enumset::{EnumSet, EnumSetType};
@@ -135,28 +135,39 @@ impl PositionConstraints {
     }
 }
 
-/// Sets [`Constraint::DontContract`] the way liblouis's `checkNumericMode` sets
-/// `dontContract`: from a digit starting a numeric run up to and including the next
-/// space or `seqdelimiter` character, and only when the table uses numeric mode and its
-/// nocontractsign is its nonumsign.
+/// Sets [`Constraint::DontContract`] where liblouis sets `dontContract`: from a digit
+/// starting a number when the table uses numeric mode and its nocontractsign is its
+/// nonumsign (`checkNumericMode`), and from a run of two or more capitals when the table
+/// has `capsnocont`. Either lasts up to and including the next space or `seqdelimiter`.
 #[derive(Debug, Clone)]
-pub struct NumericConstrainer {
-    runs: NumericRuns,
+pub struct DontContractConstrainer {
+    runs: Option<NumericRuns>,
+    capsnocont: Option<HashSet<char>>,
     reset_chars: HashSet<char>,
 }
 
-impl NumericConstrainer {
+impl DontContractConstrainer {
     fn compute(&self, input: &str) -> Vec<Constraints> {
         let chars: Vec<char> = input.chars().collect();
+        let mut starts = vec![false; chars.len()];
+        if let Some(runs) = &self.runs {
+            for (start, event) in starts.iter_mut().zip(runs.events(&chars)) {
+                *start |= event == (RunEvent::Start { by_digit: true });
+            }
+        }
+        if let Some(uppercase) = &self.capsnocont {
+            for (pos, c) in chars.iter().enumerate() {
+                let upper = |p: usize| chars.get(p).is_some_and(|c| uppercase.contains(c));
+                starts[pos] |=
+                    uppercase.contains(c) && (upper(pos + 1) || pos > 0 && upper(pos - 1));
+            }
+        }
         let mut dont_contract = false;
-        self.runs
-            .events(&chars)
+        starts
             .into_iter()
             .zip(&chars)
-            .map(|(event, c)| {
-                if event == (RunEvent::Start { by_digit: true }) {
-                    dont_contract = true;
-                }
+            .map(|(start, c)| {
+                dont_contract |= start;
                 let constraints = if dont_contract {
                     Constraints::only(Constraint::DontContract)
                 } else {
@@ -503,8 +514,8 @@ impl BackwardNoContractConstrainerBuilder {
 /// A single analysis pass that contributes to [`PositionConstraints`].
 #[derive(Debug, Clone)]
 pub enum Constrainer {
-    /// Detects numeric runs and sets [`Constraint::DontContract`].
-    Numeric(NumericConstrainer),
+    /// Detects numbers and runs of capitals and sets [`Constraint::DontContract`].
+    DontContract(DontContractConstrainer),
     /// Maps `computer_braille` emphasis spans to [`Constraint::UseComp6`].
     ComputerBraille(ComputerBrailleConstrainer),
     /// Detects backward `capsletter`/`begcapsword`/`endcapsword` dots and sets
@@ -525,7 +536,7 @@ pub enum Constrainer {
 impl Constrainer {
     fn compute(&self, input: &str, spans: &[EmphasisSpan]) -> Vec<Constraints> {
         match self {
-            Constrainer::Numeric(c) => c.compute(input),
+            Constrainer::DontContract(c) => c.compute(input),
             Constrainer::ComputerBraille(c) => c.compute(input, spans),
             Constrainer::BackwardCaps(c) => c.compute(input),
             Constrainer::BackwardNoContract(c) => c.compute(input),
@@ -560,15 +571,17 @@ impl Constrainers {
     }
 }
 
-/// A builder for [`Constrainer::Numeric`].
+/// A builder for [`Constrainer::DontContract`].
 #[derive(Debug, Default)]
-pub struct NumericConstrainerBuilder {
+pub struct DontContractConstrainerBuilder {
     nocontractsign: Option<String>,
     nonumsign: Option<String>,
+    capsnocont: bool,
+    uppercase_chars: HashSet<char>,
     reset_chars: HashSet<char>,
 }
 
-impl NumericConstrainerBuilder {
+impl DontContractConstrainerBuilder {
     pub fn new() -> Self {
         Self::default()
     }
@@ -581,19 +594,30 @@ impl NumericConstrainerBuilder {
         self.nonumsign = Some(dots.to_string());
     }
 
+    pub fn capsnocont(&mut self) {
+        self.capsnocont = true;
+    }
+
+    pub fn uppercase_chars(&mut self, chars: HashSet<char>) {
+        self.uppercase_chars = chars;
+    }
+
     /// Space and `seqdelimiter` characters, which end the no-contraction span
     pub fn reset_chars(&mut self, chars: impl IntoIterator<Item = char>) {
         self.reset_chars.extend(chars);
     }
 
-    pub fn build(self, runs: NumericRuns) -> Option<NumericConstrainer> {
-        (runs.uses_numeric_mode()
+    pub fn build(self, runs: NumericRuns) -> Option<DontContractConstrainer> {
+        let runs = (runs.uses_numeric_mode()
             && self.nocontractsign.is_some()
             && self.nocontractsign == self.nonumsign)
-            .then_some(NumericConstrainer {
-                runs,
-                reset_chars: self.reset_chars,
-            })
+            .then_some(runs);
+        let capsnocont = self.capsnocont.then_some(self.uppercase_chars);
+        (runs.is_some() || capsnocont.is_some()).then_some(DontContractConstrainer {
+            runs,
+            capsnocont,
+            reset_chars: self.reset_chars,
+        })
     }
 }
 
@@ -790,13 +814,15 @@ mod tests {
             .collect()
     }
 
-    fn numeric_constrainers(runs: NumericRuns) -> Option<Constrainers> {
-        let mut builder = NumericConstrainerBuilder::new();
+    fn dont_contract_constrainers(runs: NumericRuns) -> Option<Constrainers> {
+        let mut builder = DontContractConstrainerBuilder::new();
         builder.nocontractsign("56");
         builder.nonumsign("56");
         builder.reset_chars([' ', '-']);
         let constrainer = builder.build(runs)?;
-        Some(Constrainers::new(vec![Constrainer::Numeric(constrainer)]))
+        Some(Constrainers::new(vec![Constrainer::DontContract(
+            constrainer,
+        )]))
     }
 
     fn digits() -> NumericRuns {
@@ -809,7 +835,7 @@ mod tests {
     fn number_leaves_rest_of_word_uncontracted() {
         let mut runs = digits();
         runs.numericmodechars(".");
-        let c = numeric_constrainers(runs)
+        let c = dont_contract_constrainers(runs)
             .unwrap()
             .precompute("a1bc d-1e-f", &[]);
         assert_eq!(
@@ -824,23 +850,41 @@ mod tests {
     fn number_started_by_numericmodechars_stays_contractable() {
         let mut runs = digits();
         runs.numericmodechars(".");
-        let c = numeric_constrainers(runs).unwrap().precompute("a.1b", &[]);
+        let c = dont_contract_constrainers(runs)
+            .unwrap()
+            .precompute("a.1b", &[]);
         assert_eq!(dont_contract(&c), vec![false, false, false, false]);
     }
 
     #[test]
     fn number_contracts_without_numeric_mode() {
-        assert!(numeric_constrainers(digits()).is_none());
+        assert!(dont_contract_constrainers(digits()).is_none());
     }
 
     #[test]
     fn number_contracts_when_nocontractsign_is_not_nonumsign() {
         let mut runs = digits();
         runs.numericnocontchars("abc");
-        let mut builder = NumericConstrainerBuilder::new();
+        let mut builder = DontContractConstrainerBuilder::new();
         builder.nocontractsign("56");
         builder.nonumsign("6");
         assert!(builder.build(runs).is_none());
+    }
+
+    #[test]
+    fn capitals_leave_the_rest_of_the_word_uncontracted() {
+        let mut builder = DontContractConstrainerBuilder::new();
+        builder.capsnocont();
+        builder.uppercase_chars(HashSet::from(['A', 'B']));
+        builder.reset_chars([' ']);
+        let constrainers = Constrainers::new(vec![Constrainer::DontContract(
+            builder.build(NumericRuns::default()).unwrap(),
+        )]);
+        let c = constrainers.precompute("aAB a Aa", &[]);
+        assert_eq!(
+            dont_contract(&c),
+            vec![false, true, true, true, false, false, false, false]
+        );
     }
 
     #[test]

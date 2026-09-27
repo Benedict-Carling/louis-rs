@@ -22,7 +22,7 @@ use crate::{
         position_constraints::{
             BackwardCapsConstrainerBuilder, BackwardNoContractConstrainerBuilder,
             BackwardNumericConstrainerBuilder, ComputerBrailleConstrainer, Constrainer,
-            Constrainers, HyphenationConstrainerBuilder, NumericConstrainerBuilder,
+            Constrainers, DontContractConstrainerBuilder, HyphenationConstrainerBuilder,
             PositionConstraints, PunctuationConstrainerBuilder,
         },
         sequence::{Sequences, whole_word_boundaries},
@@ -160,7 +160,7 @@ struct PrimaryTableBuilder {
     emphasis_indicator: emphasis::IndicatorBuilder,
     computer_braille_indicator: computer_braille::IndicatorBuilder,
     backward_caps_constrainer: BackwardCapsConstrainerBuilder,
-    numeric_constrainer: NumericConstrainerBuilder,
+    dont_contract_constrainer: DontContractConstrainerBuilder,
     backward_numeric_constrainer: BackwardNumericConstrainerBuilder,
     backward_nocontract_constrainer: BackwardNoContractConstrainerBuilder,
     hyphenation_constrainer: HyphenationConstrainerBuilder,
@@ -192,7 +192,7 @@ impl PrimaryTableBuilder {
             emphasis_indicator: emphasis::IndicatorBuilder::new(),
             computer_braille_indicator: computer_braille::IndicatorBuilder::new(),
             backward_caps_constrainer: BackwardCapsConstrainerBuilder::new(),
-            numeric_constrainer: NumericConstrainerBuilder::new(),
+            dont_contract_constrainer: DontContractConstrainerBuilder::new(),
             backward_numeric_constrainer: BackwardNumericConstrainerBuilder::new(),
             backward_nocontract_constrainer: BackwardNoContractConstrainerBuilder::new(),
             hyphenation_constrainer: HyphenationConstrainerBuilder::new(),
@@ -350,8 +350,8 @@ impl PrimaryTableBuilder {
 
     fn build(mut self, direction: Direction, ctx: &TableContext) -> PrimaryTable {
         let triggers = self.compbrl_triggers;
-        let numeric_constrainer = self
-            .numeric_constrainer
+        let dont_contract_constrainer = self
+            .dont_contract_constrainer
             .build(self.numeric_indicator.runs().clone());
         let indicators = [
             // Computer braille must be first so begcomp appears before emphasis.
@@ -389,7 +389,7 @@ impl PrimaryTableBuilder {
             constrainers: Constrainers::new(
                 [
                     Some(Constrainer::ComputerBraille(ComputerBrailleConstrainer {})),
-                    numeric_constrainer.map(Constrainer::Numeric),
+                    dont_contract_constrainer.map(Constrainer::DontContract),
                     self.backward_caps_constrainer
                         .build()
                         .map(Constrainer::BackwardCaps),
@@ -633,7 +633,9 @@ impl PrimaryTable {
                 }
                 Rule::Nonumsign { dots, .. } => {
                     builder.numeric_indicator.nonumsign(&dots.to_string(), rule);
-                    builder.numeric_constrainer.nonumsign(&dots.to_string());
+                    builder
+                        .dont_contract_constrainer
+                        .nonumsign(&dots.to_string());
                     if direction == Direction::Backward
                         && PrimaryTableBuilder::backward_indicator_dots_available(
                             "nonumsign",
@@ -652,6 +654,9 @@ impl PrimaryTable {
                 }
                 Rule::Numericnocontchars { chars } => {
                     builder.numeric_indicator.runs().numericnocontchars(chars);
+                }
+                Rule::Capsnocont {} => {
+                    builder.dont_contract_constrainer.capsnocont();
                 }
                 Rule::Numericmodechars { chars } => {
                     builder.numeric_indicator.runs().numericmodechars(chars);
@@ -884,13 +889,13 @@ impl PrimaryTable {
                 }
                 Rule::Nocontractsign { dots, .. } => {
                     builder
-                        .numeric_constrainer
+                        .dont_contract_constrainer
                         .nocontractsign(&dots.to_string());
                     builder
                         .nocontract_indicator
                         .nocontractsign(&dots.to_string(), rule);
                     builder
-                        .numeric_constrainer
+                        .dont_contract_constrainer
                         .nocontractsign(&dots.to_string());
                     if direction == Direction::Backward
                         && PrimaryTableBuilder::backward_indicator_dots_available(
@@ -1432,9 +1437,14 @@ impl PrimaryTable {
             .numeric_indicator
             .runs()
             .numeric_characters(numeric_chars);
+        builder.dont_contract_constrainer.uppercase_chars(
+            ctx.character_classes()
+                .get(&CharacterClass::Uppercase)
+                .unwrap_or_default(),
+        );
         for class in [CharacterClass::Space, CharacterClass::Seqdelimiter] {
             builder
-                .numeric_constrainer
+                .dont_contract_constrainer
                 .reset_chars(ctx.character_classes().get(&class).unwrap_or_default());
         }
         builder.uppercase_indicator.uppercase_characters(
@@ -1681,10 +1691,22 @@ impl PrimaryTable {
             let at_start = chars.as_str().len() == input.len();
 
             // First check for nocross candidates
+            // the checks of liblouis's `for_selectRule` that depend on indication state
+            let dont_contract = constraints.dont_contract_at(char_pos);
+            let selectable = |t: &ResolvedTranslation| match t.rule() {
+                Some(rule) => {
+                    !(dont_contract && is_contraction(rule)
+                        || checks_caps_change(rule)
+                            && indications.caps_change_within(char_pos, t.length()))
+                }
+                None => true,
+            };
+
             let nocross_candidate = self
                 .nocross_candidates(chars.as_str(), prev, char_pos, &constraints)
                 .into_iter()
                 .filter(|t| stands_alone(t, char_pos))
+                .filter(selectable)
                 .max_by_key(|t| t.rank());
 
             // given an input query the trie for matching translations. Then split off the
@@ -1737,14 +1759,7 @@ impl PrimaryTable {
                 candidates.push(digit_translation.clone());
             }
 
-            candidates.retain(|t| {
-                !(t.rule().is_some_and(checks_caps_change)
-                    && indications.caps_change_within(char_pos, t.length()))
-            });
-
-            if constraints.dont_contract_at(char_pos) {
-                candidates.retain(|t| !t.rule().is_some_and(is_contraction));
-            }
+            candidates.retain(selectable);
 
             // Backward no-contract mode: a letsign/nocontractsign/nonumsign says the
             // cells that follow spell out letters, so the word-family rules must not
