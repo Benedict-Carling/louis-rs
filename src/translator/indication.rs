@@ -21,6 +21,7 @@
 //! * [`nocontract::Indicator`]: detects contractions that require a no-contract sign
 
 use crate::emphasis::EmphasisSpan;
+use crate::parser::Rule;
 use crate::translator::ResolvedTranslation;
 
 mod class_indicator;
@@ -76,18 +77,32 @@ pub enum Indicator {
 #[derive(Debug, Clone)]
 pub struct Indicators(Vec<Indicator>);
 
+/// An indicator's translation, whether it is inserted even where a rule spans its
+/// position, and its place among the indicators at that position
+type Precomputed = (ResolvedTranslation, bool, u8);
+
+fn is_end_indicator(rule: Option<&Rule>) -> bool {
+    matches!(
+        rule,
+        Some(
+            Rule::Endcapsword { .. }
+                | Rule::Endcaps { .. }
+                | Rule::Endcapsphrase { .. }
+                | Rule::Endmodeword { .. }
+                | Rule::Endmode { .. }
+                | Rule::Endmodephrase { .. }
+        )
+    )
+}
+
 /// The result of pre-computing indications for a given input.
 ///
 /// Holds per-position braille translations to emit, indexed by
 /// character position (with one extra slot at index `n` for translations that
 /// must appear after all input characters, e.g. `endemph` at end of string).
 pub struct PrecomputedIndications<'a> {
-    /// The translations of the indicators before the numeric one, and after it, each
-    /// with whether it is inserted even where a rule spans its position
-    translations: Vec<(
-        Vec<(ResolvedTranslation, bool)>,
-        Vec<(ResolvedTranslation, bool)>,
-    )>,
+    /// The translations of the indicators before the numeric one, and after it
+    translations: Vec<(Vec<Precomputed>, Vec<Precomputed>)>,
     /// The position after the last one visited
     next: usize,
     /// A numeric indicator stepped as the translation loop visits positions
@@ -108,16 +123,16 @@ impl PrecomputedIndications<'_> {
         let mut result: Vec<ResolvedTranslation> = self.translations[skipped]
             .iter()
             .flat_map(|(before, after)| before.iter().chain(after))
-            .filter(|(_, spanned)| *spanned)
-            .map(|(t, _)| t.clone())
+            .filter(|(_, spanned, _)| *spanned)
+            .map(|(t, ..)| t.clone())
             .collect();
         let numeric = self
             .live_numeric
             .and_then(|n| n.at(&mut self.in_numeric, &self.chars, pos));
         if let Some((before, after)) = self.translations.get(pos) {
-            result.extend(before.iter().map(|(t, _)| t.clone()));
+            result.extend(before.iter().map(|(t, ..)| t.clone()));
             result.extend(numeric);
-            result.extend(after.iter().map(|(t, _)| t.clone()));
+            result.extend(after.iter().map(|(t, ..)| t.clone()));
         } else {
             result.extend(numeric);
         }
@@ -130,7 +145,7 @@ impl PrecomputedIndications<'_> {
             .get(pos)
             .into_iter()
             .flat_map(|(before, after)| before.iter().chain(after))
-            .map(|(t, _)| t)
+            .map(|(t, ..)| t)
     }
 }
 
@@ -171,11 +186,27 @@ impl Indicators {
                 Indicator::NoContract(i) => i.precompute(input),
             };
             for (pos, t) in pairs {
+                // liblouis ends capitals, then the other modes, before any other indicator
+                // but computer braille
+                let phase = match indicator {
+                    Indicator::ComputerBraille(_) => 0,
+                    Indicator::Uppercase(_) if is_end_indicator(t.rule()) => 1,
+                    Indicator::Mode(_) if is_end_indicator(t.rule()) => 2,
+                    _ => 3,
+                };
                 let (before, after) = &mut translations[pos];
+                if phase < 3 {
+                    let at = before
+                        .iter()
+                        .position(|(_, _, p)| *p > phase)
+                        .unwrap_or(before.len());
+                    before.insert(at, (t, spanned, phase));
+                    continue;
+                }
                 if live_numeric.is_some() {
-                    after.push((t, spanned));
+                    after.push((t, spanned, phase));
                 } else {
-                    before.push((t, spanned));
+                    before.push((t, spanned, phase));
                 }
             }
         }

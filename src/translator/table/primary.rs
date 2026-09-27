@@ -380,11 +380,12 @@ impl PrimaryTableBuilder {
             self.lettersign_indicator
                 .build(ctx, self.sequences.clone())
                 .map(Indicator::LetterSign),
+            // the other modes begin before capitals, closest to the word
+            self.mode_indicator.build(ctx).map(Indicator::Mode),
             self.uppercase_indicator
                 .build(ctx)
                 .map(Indicator::Uppercase),
             self.numeric_indicator.build().map(Indicator::Numeric),
-            self.mode_indicator.build(ctx).map(Indicator::Mode),
         ]
         .into_iter()
         .flatten()
