@@ -109,9 +109,10 @@ impl MultipassTable {
             // given an input query the patterns for matching translations. Then split off the
             // translations that are delayed, i.e. have an offset because they have a pre-pattern
             let before = &input[..input.len() - chars.as_str().len()];
-            let (mut candidates, delayed) =
+            // a rule found with context before its replacement starts here, and competes with
+            // the rules that replace from here: liblouis applies one rule per position
+            let (mut candidates, found_here) =
                 self.translation_candidates(before, chars.as_str(), &env);
-            delayed_translations.extend(delayed);
 
             // move delayed_translations with zero offset into candidates
             let (current, delayed) = self.partition_delayed_translations(delayed_translations);
@@ -128,6 +129,7 @@ impl MultipassTable {
             if let Some(t) = candidate {
                 if t.length() == 0 {
                     advanced = false;
+                    delayed_translations.extend(found_here);
                 } else {
                     // move the iterator forward by the number of characters in the translation
                     chars.nth(t.length() - 1);
@@ -145,6 +147,7 @@ impl MultipassTable {
                 }
             } else if let Some(next_char) = chars.next() {
                 // no translation rule found, just pass the character through
+                delayed_translations.extend(found_here);
                 let translation = ResolvedTranslation::new(
                     &next_char.to_string(),
                     &next_char.to_string(),
@@ -199,6 +202,21 @@ mod tests {
                 .unwrap();
         assert_eq!(transform.translate("resszel"), "resszel");
         assert_eq!(transform.translate("ressze"), "reszsze");
+    }
+
+    #[test]
+    fn one_rule_per_position() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("digit 5 15"),
+            parse_rule("correct [\"a\"]$d \"x\""),
+            parse_rule("correct $l[]$d \"y\""),
+        ];
+        let ctx = TableContext::compile(&rules).unwrap();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Pre, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("a5"), "x5");
     }
 
     #[test]
