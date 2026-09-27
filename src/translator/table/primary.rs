@@ -1213,13 +1213,24 @@ impl PrimaryTable {
                         rule,
                     );
                 }
-                Rule::Joinword { chars, dots, .. } | Rule::Lowword { chars, dots, .. } => {
+                Rule::Lowword { chars, dots, .. } => builder.get_trie_mut(rule).insert(
+                    chars,
+                    &dots.to_string(),
+                    Some(Transition::Start(vec![CharacterClass::Space])),
+                    Some(Transition::End(vec![CharacterClass::Space])),
+                    direction,
+                    rule.precedence(),
+                    vec![],
+                    TranslationStage::Main,
+                    rule,
+                ),
+                Rule::Joinword { chars, dots, .. } => {
                     builder.get_trie_mut(rule).insert(
                         chars,
                         &dots.to_string(),
-                        // FIXME: joinword, lowword, prepunc and postpunc need more
-                        // advanced scaning of the input. Just checking for before and
-                        // after classes as below is too simplistic
+                        // FIXME: joinword, prepunc and postpunc need more advanced
+                        // scaning of the input. Just checking for before and after
+                        // classes as below is too simplistic
                         Some(Transition::Start(vec![
                             CharacterClass::Space,
                             CharacterClass::Punctuation,
@@ -1412,14 +1423,31 @@ impl PrimaryTable {
                 .dots_classes()
                 .get(&CharacterClass::Letter)
                 .unwrap_or_default();
-            // Multi-letter `always` rules (e.g. Hungarian "sz"/"cs" digraphs) define
-            // their own dots but aren't registered in the Letter dots class; a
-            // begcapsword span must still continue across them.
+            // Contractions spelling letters (e.g. Hungarian "sz"/"cs" digraphs) define
+            // their own dots, which are no letter by definition; a begcapsword span must
+            // still treat them as letters.
             for rule in rules {
-                if let Rule::Always { chars, dots, .. } = &rule.rule
-                    && chars.chars().all(|c| c.is_alphabetic())
-                {
-                    letter_cells.extend(dots.to_string().chars());
+                match &rule.rule {
+                    Rule::Always { chars, dots, .. }
+                    | Rule::Word { chars, dots, .. }
+                    | Rule::Sufword { chars, dots, .. }
+                    | Rule::Prfword { chars, dots, .. }
+                    | Rule::Begword { chars, dots, .. }
+                    | Rule::Begmidword { chars, dots, .. }
+                    | Rule::Midword { chars, dots, .. }
+                    | Rule::Midendword { chars, dots, .. }
+                    | Rule::Endword { chars, dots, .. }
+                    | Rule::Partword { chars, dots, .. }
+                        if chars.chars().all(|c| c.is_alphabetic()) =>
+                    {
+                        letter_cells.extend(dots.to_string().chars());
+                    }
+                    Rule::Lowword { chars, dots, .. } | Rule::Joinword { chars, dots, .. }
+                        if chars.chars().all(|c| c.is_alphabetic()) =>
+                    {
+                        letter_cells.extend(dots.to_string().chars());
+                    }
+                    _ => (),
                 }
             }
             builder.backward_caps_constrainer.letter_cells(letter_cells);
@@ -2612,6 +2640,153 @@ mod tests {
     fn backward_table(rules: &[AnchoredRule]) -> PrimaryTable {
         let context = TableContext::compile(rules).unwrap();
         PrimaryTable::compile(rules, Direction::Backward, TranslationStage::Main, &context).unwrap()
+    }
+
+    #[test]
+    fn backward_always_beats_postpunc_on_the_same_cell() {
+        let table = backward_table(&[
+            parse_rule("letter \\x0A1D 356"),
+            parse_rule("always \\x0A1D 356"),
+            parse_rule("punctuation \" 236"),
+            parse_rule("postpunc \" 356"),
+        ]);
+        assert_eq!(table.translate("⠴"), "\u{0A1D}");
+    }
+
+    #[test]
+    fn backward_endnum_only_before_a_non_digit() {
+        let table = backward_table(&[
+            parse_rule("numsign 3456"),
+            parse_rule("digit 1 1"),
+            parse_rule("litdigit 1 1"),
+            parse_rule("lowercase h 125"),
+            parse_rule("punctuation - 36"),
+            parse_rule("endnum \\x2013 36-36"),
+        ]);
+        assert_eq!(table.translate("⠼⠁⠤⠤⠓"), "1–h");
+        assert_eq!(table.translate("⠼⠁⠤⠤⠁"), "1--1");
+    }
+
+    #[test]
+    fn backward_letsign_suppresses_whole_words_up_to_a_space() {
+        let table = backward_table(&[
+            parse_rule("lowercase b 12"),
+            parse_rule("punctuation - 36"),
+            parse_rule("letsign 56"),
+            parse_rule("space \\s 0"),
+            parse_rule("word but 12"),
+        ]);
+        assert_eq!(table.translate("⠰⠃⠤⠃"), "b-b");
+        assert_eq!(table.translate("⠰⠃⠀⠃"), "b but");
+    }
+
+    #[test]
+    fn backward_multind_consumes_its_indicators() {
+        let table = backward_table(&[
+            parse_rule("lowercase a 1"),
+            parse_rule("capsletter 6"),
+            parse_rule("letsign 56"),
+            parse_rule("endcapsword 56"),
+            parse_rule("multind 56-6 letsign capsletter"),
+            parse_rule("word at 1"),
+        ]);
+        assert_eq!(table.translate("⠰⠠⠁"), "A");
+    }
+
+    #[test]
+    fn backward_postpunc_at_the_end_of_a_word() {
+        let table = backward_table(&[
+            parse_rule("lowercase a 1"),
+            parse_rule("digit 8 236"),
+            parse_rule("punctuation ? 1456"),
+            parse_rule("postpunc ? 236"),
+            parse_rule("space \\s 0"),
+        ]);
+        assert_eq!(table.translate("⠁⠦"), "a?");
+        assert_eq!(table.translate("⠁⠦⠀⠁"), "a? a");
+        assert_eq!(table.translate("⠁⠦⠁"), "a8a");
+    }
+
+    #[test]
+    fn backward_prepunc_at_the_start_of_a_word() {
+        let table = backward_table(&[
+            parse_rule("lowercase a 1"),
+            parse_rule("digit 8 236"),
+            parse_rule("punctuation ( 1456"),
+            parse_rule("prepunc ( 236"),
+            parse_rule("space \\s 0"),
+        ]);
+        assert_eq!(table.translate("⠦⠁"), "(a");
+        assert_eq!(table.translate("⠁⠀⠦⠁"), "a (a");
+        assert_eq!(table.translate("⠁⠦⠁"), "a8a");
+    }
+
+    #[test]
+    fn backward_word_end_scans_past_punctuation_to_a_letter() {
+        let table = backward_table(&[
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("punctuation , 2"),
+            parse_rule("space \\s 0"),
+            parse_rule("word baie 12"),
+        ]);
+        assert_eq!(table.translate("⠃⠂⠁"), "b,a");
+        assert_eq!(table.translate("⠃⠂"), "baie,");
+        assert_eq!(table.translate("⠃⠂⠀⠁"), "baie, a");
+    }
+
+    #[test]
+    fn backward_word_end_stops_at_a_contraction_cell() {
+        // `always ing 346` makes its cell word-continuation, `begword` and `midword`
+        // do not (liblouis#360).
+        let table = backward_table(&[
+            parse_rule("lowercase b 12"),
+            parse_rule("punctuation ; 346"),
+            parse_rule("punctuation ! 235"),
+            parse_rule("always ing 346"),
+            parse_rule("midword ea 235"),
+            parse_rule("word but 12"),
+        ]);
+        assert_eq!(table.translate("⠃⠬"), "bing");
+        assert_eq!(table.translate("⠃⠖"), "but!");
+    }
+
+    #[test]
+    fn backward_word_start_is_judged_by_the_output() {
+        // `midword aa 2` shares its cell with the comma. The cell before `b` has been
+        // translated to letters, so `word liefde 123` must not fire there.
+        let table = backward_table(&[
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase l 123"),
+            parse_rule("punctuation , 2"),
+            parse_rule("space \\s 0"),
+            parse_rule("midword aa 2"),
+            parse_rule("word liefde 123"),
+        ]);
+        assert_eq!(table.translate("⠃⠂⠇"), "baal");
+        assert_eq!(table.translate("⠇"), "liefde");
+        assert_eq!(table.translate("⠂⠀⠇"), ", liefde");
+    }
+
+    #[test]
+    fn lowword_needs_space_on_both_sides() {
+        let rules = [
+            parse_rule("lowercase t 2345"),
+            parse_rule("lowercase e 15"),
+            parse_rule("punctuation . 256"),
+            parse_rule("space \\s 0"),
+            parse_rule("lowword te 235"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let forward =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(forward.translate("te"), "⠖");
+        assert_eq!(forward.translate(" te "), "⠀⠖⠀");
+        assert_eq!(forward.translate("te."), "⠞⠑⠲");
+        let backward = backward_table(&rules);
+        assert_eq!(backward.translate("⠖"), "te");
     }
 
     #[test]

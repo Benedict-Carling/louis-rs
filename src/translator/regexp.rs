@@ -84,6 +84,12 @@ pub enum Regexp {
     /// Zero-width assertion that matches unless the match is at the true beginning of the
     /// original string. The negation of [`StartAnchor`](Regexp::StartAnchor).
     NotStartAnchor,
+    /// Like [`StartAnchor`](Regexp::StartAnchor), but standing in for a boundary character:
+    /// liblouis treats the edges of the input like a space, so passing it weighs as much as
+    /// matching the character it replaces.
+    StartBoundary,
+    /// Like [`EndAnchor`](Regexp::EndAnchor), weighted as [`StartBoundary`](Regexp::StartBoundary).
+    EndBoundary,
     /// Never matches, regardless of input. The negation of [`Empty`](Regexp::Empty).
     Never,
 }
@@ -139,6 +145,8 @@ impl Regexp {
             Regexp::NotEndAnchor => Regexp::EndAnchor,
             Regexp::StartAnchor => Regexp::NotStartAnchor,
             Regexp::NotStartAnchor => Regexp::StartAnchor,
+            Regexp::StartBoundary => Regexp::NotStartAnchor,
+            Regexp::EndBoundary => Regexp::NotEndAnchor,
         }
     }
 
@@ -268,6 +276,8 @@ impl Regexp {
             Regexp::NotEndAnchor => instructions.push(Instruction::AssertMoreInput),
             Regexp::StartAnchor => instructions.push(Instruction::AssertStart),
             Regexp::NotStartAnchor => instructions.push(Instruction::AssertNotStart),
+            Regexp::StartBoundary => instructions.push(Instruction::AssertStartBoundary),
+            Regexp::EndBoundary => instructions.push(Instruction::AssertEndBoundary),
             Regexp::Never => instructions.push(Instruction::Fail),
         }
     }
@@ -321,6 +331,10 @@ pub enum Instruction {
     AssertStart,
     /// Zero-width assertion: succeeds unless at the true beginning of the original string
     AssertNotStart,
+    /// [`AssertStart`](Instruction::AssertStart) that adds one to the match's weight
+    AssertStartBoundary,
+    /// [`AssertEnd`](Instruction::AssertEnd) that adds one to the match's weight
+    AssertEndBoundary,
     /// Never matches, regardless of input
     Fail,
 }
@@ -348,9 +362,7 @@ struct Thread {
     pc: InstructionIndex,
     captured: CharacterRange,
     consumed: CharacterRange,
-    /// Start or end anchors that held on the way, each counting towards the weight of the match
-    /// like a character checked does.
-    anchors: usize,
+    bonus: usize,
 }
 
 /// A bitset over instruction indices, used to track which `pc`s have already been added
@@ -421,7 +433,8 @@ impl CompiledRegexp {
         // position counted in chars (the consumed span is reported in chars)
         sp: usize,
         cp: usize,
-        anchors: usize,
+        // weight earned by zero-width boundary assertions (see `Regexp::StartBoundary`)
+        bonus: usize,
         input_len: usize,
         at_start: bool,
         env: &Environment,
@@ -432,7 +445,7 @@ impl CompiledRegexp {
         list.seen.insert(pc);
         match self.instructions[pc] {
             Instruction::Jump(target) => self.add_thread(
-                list, target, captured, consumed, sp, cp, anchors, input_len, at_start, env,
+                list, target, captured, consumed, sp, cp, bonus, input_len, at_start, env,
             ),
             Instruction::Split(a, b) => {
                 self.add_thread(
@@ -442,13 +455,13 @@ impl CompiledRegexp {
                     consumed.clone(),
                     sp,
                     cp,
-                    anchors,
+                    bonus,
                     input_len,
                     at_start,
                     env,
                 );
                 self.add_thread(
-                    list, b, captured, consumed, sp, cp, anchors, input_len, at_start, env,
+                    list, b, captured, consumed, sp, cp, bonus, input_len, at_start, env,
                 );
             }
             Instruction::CaptureStart => self.add_thread(
@@ -460,7 +473,7 @@ impl CompiledRegexp {
                 consumed,
                 sp,
                 cp,
-                anchors,
+                bonus,
                 input_len,
                 at_start,
                 env,
@@ -472,7 +485,7 @@ impl CompiledRegexp {
                 consumed,
                 sp,
                 cp,
-                anchors,
+                bonus,
                 input_len,
                 at_start,
                 env,
@@ -486,7 +499,7 @@ impl CompiledRegexp {
                 cp..cp,
                 sp,
                 cp,
-                anchors,
+                bonus,
                 input_len,
                 at_start,
                 env,
@@ -498,7 +511,7 @@ impl CompiledRegexp {
                 consumed.start..cp,
                 sp,
                 cp,
-                anchors,
+                bonus,
                 input_len,
                 at_start,
                 env,
@@ -512,7 +525,7 @@ impl CompiledRegexp {
                         consumed,
                         sp,
                         cp,
-                        anchors,
+                        bonus,
                         input_len,
                         at_start,
                         env,
@@ -528,7 +541,7 @@ impl CompiledRegexp {
                         consumed,
                         sp,
                         cp,
-                        anchors,
+                        bonus,
                         input_len,
                         at_start,
                         env,
@@ -544,7 +557,7 @@ impl CompiledRegexp {
                         consumed,
                         sp,
                         cp,
-                        anchors + 1,
+                        bonus,
                         input_len,
                         at_start,
                         env,
@@ -560,7 +573,7 @@ impl CompiledRegexp {
                         consumed,
                         sp,
                         cp,
-                        anchors,
+                        bonus,
                         input_len,
                         at_start,
                         env,
@@ -576,7 +589,7 @@ impl CompiledRegexp {
                         consumed,
                         sp,
                         cp,
-                        anchors + 1,
+                        bonus,
                         input_len,
                         at_start,
                         env,
@@ -592,7 +605,39 @@ impl CompiledRegexp {
                         consumed,
                         sp,
                         cp,
-                        anchors,
+                        bonus,
+                        input_len,
+                        at_start,
+                        env,
+                    );
+                }
+            }
+            Instruction::AssertStartBoundary => {
+                if at_start && sp == 0 {
+                    self.add_thread(
+                        list,
+                        pc + 1,
+                        captured,
+                        consumed,
+                        sp,
+                        cp,
+                        bonus + 1,
+                        input_len,
+                        at_start,
+                        env,
+                    );
+                }
+            }
+            Instruction::AssertEndBoundary => {
+                if sp == input_len {
+                    self.add_thread(
+                        list,
+                        pc + 1,
+                        captured,
+                        consumed,
+                        sp,
+                        cp,
+                        bonus + 1,
                         input_len,
                         at_start,
                         env,
@@ -605,7 +650,7 @@ impl CompiledRegexp {
                 pc,
                 captured,
                 consumed,
-                anchors,
+                bonus,
             }),
         }
     }
@@ -656,7 +701,7 @@ impl CompiledRegexp {
                         matched = Some((
                             thread.captured.clone(),
                             thread.consumed.clone(),
-                            length + thread.anchors,
+                            length + thread.bonus,
                             index,
                         ));
                         // every remaining thread in this step is lower priority than the one
@@ -672,7 +717,7 @@ impl CompiledRegexp {
                                 thread.consumed.clone(),
                                 sp + expected.len_utf8(),
                                 length + 1,
-                                thread.anchors,
+                                thread.bonus,
                                 input.len(),
                                 at_start,
                                 env,
@@ -690,7 +735,7 @@ impl CompiledRegexp {
                                 thread.consumed.clone(),
                                 sp + actual.len_utf8(),
                                 length + 1,
-                                thread.anchors,
+                                thread.bonus,
                                 input.len(),
                                 at_start,
                                 env,
@@ -708,7 +753,7 @@ impl CompiledRegexp {
                                 thread.consumed.clone(),
                                 sp + actual.len_utf8(),
                                 length + 1,
-                                thread.anchors,
+                                thread.bonus,
                                 input.len(),
                                 at_start,
                                 env,
@@ -726,7 +771,7 @@ impl CompiledRegexp {
                                 thread.consumed.clone(),
                                 sp + actual.len_utf8(),
                                 length + 1,
-                                thread.anchors,
+                                thread.bonus,
                                 input.len(),
                                 at_start,
                                 env,
@@ -744,7 +789,7 @@ impl CompiledRegexp {
                                 thread.consumed.clone(),
                                 sp + actual.len_utf8(),
                                 length + 1,
-                                thread.anchors,
+                                thread.bonus,
                                 input.len(),
                                 at_start,
                                 env,
@@ -760,7 +805,7 @@ impl CompiledRegexp {
                                 thread.consumed.clone(),
                                 sp + actual.len_utf8(),
                                 length + 1,
-                                thread.anchors,
+                                thread.bonus,
                                 input.len(),
                                 at_start,
                                 env,

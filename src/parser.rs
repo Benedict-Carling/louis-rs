@@ -1063,7 +1063,7 @@ impl HasNocross for Rule {
 }
 
 /// Defines precedence levels for [`Rules`](Rule).
-#[derive(Debug, Default, Clone, PartialEq, PartialOrd)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Precedence {
     #[default]
     Default,

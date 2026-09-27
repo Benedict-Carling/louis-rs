@@ -13,8 +13,8 @@ use crate::translator::{ResolvedTranslation, TranslationStage};
 /// -- see [`Pattern::Boundary`].
 fn boundary_anchor(side: Side) -> Regexp {
     match side {
-        Side::Pre => Regexp::StartAnchor,
-        Side::Post => Regexp::EndAnchor,
+        Side::Pre => Regexp::StartBoundary,
+        Side::Post => Regexp::EndBoundary,
     }
 }
 
@@ -426,6 +426,7 @@ mod tests {
         let mut builder = MatchPatternsBuilder::new();
         builder.insert(&pre, "a", &post, "X", &rule, &ctx);
         let matcher = builder.build();
+        // the boundary weighs as much as the space it stands for
         let translation = ResolvedTranslation::new("a", "X", 3, TranslationStage::Main, rule);
         // "a" is preceded by nothing only when it truly begins the whole input
         assert_eq!(matcher.find("ab", true), vec![translation]);
@@ -451,10 +452,28 @@ mod tests {
             ResolvedTranslation::new("x", "X", 3, TranslationStage::Main, rule.clone())
                 .with_offset(1);
         assert_eq!(matcher.find("Axy", false), vec![translation]);
-        // boundary branch: no preceding letter needed, at the true start of input
+        // boundary branch: no preceding letter needed, at the true start of input, weighing
+        // as much as the character branch
         let translation = ResolvedTranslation::new("x", "X", 3, TranslationStage::Main, rule);
         assert_eq!(matcher.find("xy_", true), vec![translation]);
         // neither branch applies: not at the true start, and not preceded by an uppercase letter
         assert!(matcher.find("xy_", false).is_empty());
+    }
+
+    #[test]
+    fn end_of_input_weighs_like_a_boundary_character() {
+        // `%[_^]` after `chars`: a space, or the end of input. Both weigh the same, so the
+        // rule does not lose to a competitor just because the word ends the input.
+        let pre = PatternParser::new("-", Side::Pre).pattern().unwrap();
+        let post = PatternParser::new("%[_^]", Side::Post).pattern().unwrap();
+        let mut ctx = CharacterClasses::default();
+        ctx.insert(CharacterClass::Space, ' ');
+        let rule = fake_rule();
+        let mut builder = MatchPatternsBuilder::new();
+        builder.insert(&pre, "be", &post, "B", &rule, &ctx);
+        let matcher = builder.build();
+        let translation = ResolvedTranslation::new("be", "B", 3, TranslationStage::Main, rule);
+        assert_eq!(matcher.find("be ", false), vec![translation.clone()]);
+        assert_eq!(matcher.find("be", false), vec![translation]);
     }
 }

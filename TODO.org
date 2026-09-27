@@ -77,8 +77,10 @@
 * Known gaps
 - [ ] Two ~match~ rules of equal rank: we pick the last defined,
   liblouis the first. *Not an engine gap any more* — see below
-  - This is the forward half of the ~afr-za-g2~ cluster — 186 of that
-    file's 2663 real failures.
+  - This is the forward half of the ~afr-za-g2~ cluster, now 13
+    failures, all "senu…" (~[Ss] en [Uu]~ vs. ~!%3 en !%3~). The
+    "algemene" example below turned out not to be a tie: an end-of-input
+    boundary weighed less than a space, fixed in 02b3b05.
   - Decided against an engine-side fix: the ADR "Rule selection does
     not depend on table order" holds that candidates which tie after
     ~rank~ has spoken are an ill-formed table, so no ordering key is
@@ -130,8 +132,11 @@
     precomposes, and only their relative order tells them apart. The
     upstream fix is to stop the reordering rule matching what the
     precomposing rules cover.
-- [ ] Backward: lower-sign contraction cells satisfy a ~word~ rule's
+- [X] Backward: lower-sign contraction cells satisfy a ~word~ rule's
   space-or-punctuation boundary
+  - Fixed in 90c750c with the entry "Backward word-boundary checks ask
+    about a cell, not a position" below; ~afr-za-g2~ has no backward
+    failures left.
   - This is the backward half of the same ~afr-za-g2~ cluster: 2477 of
     its 2663 real failures.
   - Afrikaans's "lower sign group" contractions occupy the same dot
@@ -231,7 +236,12 @@
     word contraction instead of being spelled out (~AF-kontor~ →
     expected ~⡁⡋⠤⠅⠕⠝⠞⠭~, actual ~⡴⠤⠅⠕⠝⠞⠭~) and 1 backward
     equivalent (~⡙⠝⠅~ → "Dnk" rather than "Danmark").
-- [ ] Backward word-boundary checks ask about a cell, not a position
+- [X] Backward word-boundary checks ask about a cell, not a position
+  - Fixed: back-translation selects rules the way liblouis's
+    ~back_selectRule~ does (~src/translator/table/backward.rs~). The
+    before side reads the last output character with the text classes,
+    the after side is the next cell's attributes or ~isEndWord~'s scan,
+    and ~dots_classes~ no longer holds contraction cells.
   - Both sides of a backward boundary check are evaluated against the
     braille input via ~dots_classes~ (~PrimaryTable~'s ~trie_ctx~,
     ~src/translator/table/primary.rs~). liblouis is asymmetric

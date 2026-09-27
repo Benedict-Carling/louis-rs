@@ -1391,14 +1391,20 @@ above ("abandoning") -- not a tie at all, so the nondeterminism ADR's
 reasoning does not reach it, and options 1-4 are still undecided for
 it.
 
-**** [2026-09-27] A boundary that holds counts towards the weight
+**** [2026-09-27] "algemene" was not a tie after all
 
-Some equal weights were an artefact of counting only consumed
-characters: a ~%[_~^]~ that matches at the end of the input checks
-something but consumes nothing. Each start or end anchor that holds now
-adds one to the weight, so ~en-ueb-g2.ctb~'s ~match … be [B…](…)?%>*%[_~^] =~
-beats ~match … be [B…] 23~ on "beb" as it does in liblouis, on
-content rather than on order.
+The two ranks were equal only because a boundary satisfied by the end
+of input weighed nothing, while the same boundary satisfied by a space
+weighed one. liblouis treats the edges of the input like a space, so
+~Regexp::StartBoundary~/~EndBoundary~ now weigh as much as the
+character they stand in for. The spell-out rule then outranks the
+catch-all by one, "algemene" translates correctly, and so do the
+Afrikaans words that only failed at the end of the input ("bel",
+"debet", "tem"). The ties that remain in ~afr-za-g2.yaml~ ("senuwee",
+~[Ss] en [Uu]~ vs. ~!%3 en !%3~) are genuine ones.
+The same boundary weight settles ~en-ueb-g2.ctb~'s two rules for ~be~
+before a ~b~ (spell out a three-letter word, contract otherwise) on
+"beb".
 
 ** Decision Drivers
 
