@@ -148,7 +148,9 @@ mod tests {
     #[test]
     fn precompute_combines_indicators() {
         let mut num_builder = numeric::IndicatorBuilder::new();
-        num_builder.numeric_characters(HashSet::from(['1', '2', '3']));
+        num_builder
+            .runs()
+            .numeric_characters(HashSet::from(['1', '2', '3']));
         num_builder.numsign("⠼", &rule("numsign 3456"));
         let numeric = Indicator::Numeric(num_builder.build().unwrap());
 

@@ -13,6 +13,7 @@ use std::collections::HashSet;
 
 use crate::emphasis::EmphasisSpan;
 use crate::hyphenation::HyphenationTable;
+use crate::translator::indication::numeric::{NumericRuns, RunEvent};
 
 /// A rule-selection constraint that can be set at a character position.
 #[derive(EnumSetType, Debug)]
@@ -134,63 +135,39 @@ impl PositionConstraints {
     }
 }
 
-/// Detects numeric runs in the input and sets [`Constraint::DontContract`] at
-/// every character position that falls inside one.
+/// Sets [`Constraint::DontContract`] the way liblouis's `checkNumericMode` sets
+/// `dontContract`: from a digit starting a numeric run up to and including the next
+/// space or `seqdelimiter` character, and only when the table uses numeric mode and its
+/// nocontractsign is its nonumsign.
 #[derive(Debug, Clone)]
 pub struct NumericConstrainer {
-    numeric_chars: HashSet<char>,
-    extra_numeric_chars: HashSet<char>,
-    mid_numeric_chars: HashSet<char>,
-    /// Whether a number leaves the rest of its word uncontracted, and the characters that
-    /// end such a word. liblouis' `checkNumericMode` sets `dontContract` on entering a
-    /// number when the nocontractsign is the nonumsign, and only a space or a
-    /// `seqdelimiter` clears it.
-    word_end_chars: Option<HashSet<char>>,
+    runs: NumericRuns,
+    reset_chars: HashSet<char>,
 }
 
 impl NumericConstrainer {
     fn compute(&self, input: &str) -> Vec<Constraints> {
         let chars: Vec<char> = input.chars().collect();
-        let mut constraints: Vec<Constraints> = vec![Constraints::empty(); chars.len()];
-        let mut in_numeric = false;
-        let mut uncontracted_word = false;
-
-        for (pos, &c) in chars.iter().enumerate() {
-            if uncontracted_word {
-                constraints[pos].insert(Constraint::DontContract);
-                if self.word_end_chars.as_ref().is_some_and(|w| w.contains(&c)) {
-                    uncontracted_word = false;
+        let mut dont_contract = false;
+        self.runs
+            .events(&chars)
+            .into_iter()
+            .zip(&chars)
+            .map(|(event, c)| {
+                if event == (RunEvent::Start { by_digit: true }) {
+                    dont_contract = true;
                 }
-            }
-            let is_numeric = self.numeric_chars.contains(&c);
-            match (is_numeric, in_numeric) {
-                (false, false) => {}
-                (true, false) => {
-                    in_numeric = true;
-                    uncontracted_word = self.word_end_chars.is_some();
-                    constraints[pos].insert(Constraint::DontContract);
+                let constraints = if dont_contract {
+                    Constraints::only(Constraint::DontContract)
+                } else {
+                    Constraints::empty()
+                };
+                if self.reset_chars.contains(c) {
+                    dont_contract = false;
                 }
-                (true, true) => {
-                    constraints[pos].insert(Constraint::DontContract);
-                }
-                (false, true) if self.extra_numeric_chars.contains(&c) => {
-                    constraints[pos].insert(Constraint::DontContract);
-                }
-                (false, true)
-                    if self.extra_numeric_chars.is_empty()
-                        && self.mid_numeric_chars.contains(&c)
-                        && chars
-                            .get(pos + 1)
-                            .is_some_and(|nc| self.numeric_chars.contains(nc)) =>
-                {
-                    constraints[pos].insert(Constraint::DontContract);
-                }
-                (false, true) => {
-                    in_numeric = false;
-                }
-            }
-        }
-        constraints
+                constraints
+            })
+            .collect()
     }
 }
 
@@ -391,6 +368,8 @@ pub struct BackwardNumericConstrainer {
     numsign_dots: Option<String>,
     nonumsign_dots: Option<String>,
     digit_cells: HashSet<char>,
+    litdigit_cells: HashSet<char>,
+    continuation_dots: Vec<String>,
     letter_cells: HashSet<char>,
 }
 
@@ -401,6 +380,9 @@ impl BackwardNumericConstrainer {
         let mut constraints: Vec<Constraints> = vec![Constraints::empty(); n];
         let mut pos = 0;
         let mut in_number = false;
+        // liblouis only keeps a number going past a numeric mode character when the
+        // next cell is read as a `litdigit`
+        let mut after_continuation = false;
         while pos < n {
             if let Some(dots) = &self.numsign_dots
                 && matches_at(&chars, pos, dots)
@@ -408,6 +390,7 @@ impl BackwardNumericConstrainer {
             {
                 pos += dots.chars().count();
                 in_number = true;
+                after_continuation = false;
                 continue;
             }
             if in_number {
@@ -418,9 +401,26 @@ impl BackwardNumericConstrainer {
                     in_number = false;
                     continue;
                 }
-                if self.digit_cells.contains(&chars[pos]) {
+                let digit_cells = if after_continuation && !self.litdigit_cells.is_empty() {
+                    &self.litdigit_cells
+                } else {
+                    &self.digit_cells
+                };
+                if digit_cells.contains(&chars[pos]) {
                     constraints[pos].insert(Constraint::PreferDigit);
                     pos += 1;
+                    after_continuation = false;
+                    continue;
+                }
+                if !after_continuation
+                    && let Some(dots) = self
+                        .continuation_dots
+                        .iter()
+                        .filter(|d| matches_at(&chars, pos, d))
+                        .max_by_key(|d| d.chars().count())
+                {
+                    pos += dots.chars().count();
+                    after_continuation = true;
                     continue;
                 }
                 in_number = false;
@@ -563,32 +563,14 @@ impl Constrainers {
 /// A builder for [`Constrainer::Numeric`].
 #[derive(Debug, Default)]
 pub struct NumericConstrainerBuilder {
-    numeric_chars: HashSet<char>,
-    extra_numeric_chars: HashSet<char>,
-    mid_numeric_chars: HashSet<char>,
-    uses_numeric_mode: bool,
     nocontractsign: Option<String>,
     nonumsign: Option<String>,
+    reset_chars: HashSet<char>,
 }
 
 impl NumericConstrainerBuilder {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn numeric_characters(&mut self, chars: HashSet<char>) {
-        self.numeric_chars = chars;
-    }
-
-    pub fn numericmodechars(&mut self, s: &str) {
-        self.extra_numeric_chars = HashSet::from_iter(s.chars());
-        self.uses_numeric_mode = true;
-    }
-
-    /// `numericnocontchars` and `midendnumericmodechars` switch liblouis to its numeric
-    /// mode handling too.
-    pub fn uses_numeric_mode(&mut self) {
-        self.uses_numeric_mode = true;
     }
 
     pub fn nocontractsign(&mut self, dots: &str) {
@@ -599,25 +581,19 @@ impl NumericConstrainerBuilder {
         self.nonumsign = Some(dots.to_string());
     }
 
-    pub fn midnum(&mut self, s: &str) {
-        self.mid_numeric_chars.extend(s.chars());
+    /// Space and `seqdelimiter` characters, which end the no-contraction span
+    pub fn reset_chars(&mut self, chars: impl IntoIterator<Item = char>) {
+        self.reset_chars.extend(chars);
     }
 
-    /// `word_end_chars` are the table's space and `seqdelimiter` characters.
-    pub fn build(self, word_end_chars: HashSet<char>) -> Option<NumericConstrainer> {
-        if self.numeric_chars.is_empty() {
-            None
-        } else {
-            let uncontracted_word = self.uses_numeric_mode
-                && self.nocontractsign.is_some()
-                && self.nocontractsign == self.nonumsign;
-            Some(NumericConstrainer {
-                numeric_chars: self.numeric_chars,
-                extra_numeric_chars: self.extra_numeric_chars,
-                mid_numeric_chars: self.mid_numeric_chars,
-                word_end_chars: uncontracted_word.then_some(word_end_chars),
+    pub fn build(self, runs: NumericRuns) -> Option<NumericConstrainer> {
+        (runs.uses_numeric_mode()
+            && self.nocontractsign.is_some()
+            && self.nocontractsign == self.nonumsign)
+            .then_some(NumericConstrainer {
+                runs,
+                reset_chars: self.reset_chars,
             })
-        }
     }
 }
 
@@ -671,6 +647,8 @@ pub struct BackwardNumericConstrainerBuilder {
     numsign_dots: Option<String>,
     nonumsign_dots: Option<String>,
     digit_cells: HashSet<char>,
+    litdigit_cells: HashSet<char>,
+    continuation_dots: Vec<String>,
     letter_cells: HashSet<char>,
 }
 
@@ -691,6 +669,16 @@ impl BackwardNumericConstrainerBuilder {
         self.digit_cells = cells;
     }
 
+    pub fn litdigit_cells(&mut self, cells: HashSet<char>) {
+        self.litdigit_cells = cells;
+    }
+
+    /// Dots of the characters that keep a number going in back-translation, see
+    /// [`NumericRuns::continuation_chars`]
+    pub fn continuation_dots(&mut self, dots: Vec<String>) {
+        self.continuation_dots = dots;
+    }
+
     pub fn letter_cells(&mut self, cells: HashSet<char>) {
         self.letter_cells = cells;
     }
@@ -703,6 +691,8 @@ impl BackwardNumericConstrainerBuilder {
                 numsign_dots: self.numsign_dots,
                 nonumsign_dots: self.nonumsign_dots,
                 digit_cells: self.digit_cells,
+                litdigit_cells: self.litdigit_cells,
+                continuation_dots: self.continuation_dots,
                 letter_cells: self.letter_cells,
             })
         }
@@ -800,40 +790,28 @@ mod tests {
             .collect()
     }
 
-    fn numeric_constrainers(builder: NumericConstrainerBuilder) -> Constrainers {
-        Constrainers::new(vec![Constrainer::Numeric(
-            builder.build(HashSet::from([' ', '-'])).unwrap(),
-        )])
+    fn numeric_constrainers(runs: NumericRuns) -> Option<Constrainers> {
+        let mut builder = NumericConstrainerBuilder::new();
+        builder.nocontractsign("56");
+        builder.nonumsign("56");
+        builder.reset_chars([' ', '-']);
+        let constrainer = builder.build(runs)?;
+        Some(Constrainers::new(vec![Constrainer::Numeric(constrainer)]))
     }
 
-    #[test]
-    fn numeric_run() {
-        let mut builder = NumericConstrainerBuilder::new();
-        builder.numeric_characters(HashSet::from(['1', '2', '3']));
-        let c = numeric_constrainers(builder).precompute("ab12 a", &[]);
-        assert_eq!(
-            dont_contract(&c),
-            vec![false, false, true, true, false, false]
-        );
-    }
-
-    #[test]
-    fn midnum_extends_run() {
-        let mut builder = NumericConstrainerBuilder::new();
-        builder.numeric_characters(HashSet::from(['1', '2', '3']));
-        builder.midnum(".");
-        let c = numeric_constrainers(builder).precompute("1.2", &[]);
-        assert_eq!(dont_contract(&c), vec![true, true, true]);
+    fn digits() -> NumericRuns {
+        let mut runs = NumericRuns::default();
+        runs.numeric_characters(HashSet::from(['1', '2', '3']));
+        runs
     }
 
     #[test]
     fn number_leaves_rest_of_word_uncontracted() {
-        let mut builder = NumericConstrainerBuilder::new();
-        builder.numeric_characters(HashSet::from(['1', '2', '3']));
-        builder.numericmodechars(".");
-        builder.nocontractsign("56");
-        builder.nonumsign("56");
-        let c = numeric_constrainers(builder).precompute("a1bc d-1e-f", &[]);
+        let mut runs = digits();
+        runs.numericmodechars(".");
+        let c = numeric_constrainers(runs)
+            .unwrap()
+            .precompute("a1bc d-1e-f", &[]);
         assert_eq!(
             dont_contract(&c),
             vec![
@@ -843,13 +821,26 @@ mod tests {
     }
 
     #[test]
-    fn number_contracts_rest_of_word_without_numeric_mode() {
+    fn number_started_by_numericmodechars_stays_contractable() {
+        let mut runs = digits();
+        runs.numericmodechars(".");
+        let c = numeric_constrainers(runs).unwrap().precompute("a.1b", &[]);
+        assert_eq!(dont_contract(&c), vec![false, false, false, false]);
+    }
+
+    #[test]
+    fn number_contracts_without_numeric_mode() {
+        assert!(numeric_constrainers(digits()).is_none());
+    }
+
+    #[test]
+    fn number_contracts_when_nocontractsign_is_not_nonumsign() {
+        let mut runs = digits();
+        runs.numericnocontchars("abc");
         let mut builder = NumericConstrainerBuilder::new();
-        builder.numeric_characters(HashSet::from(['1', '2', '3']));
         builder.nocontractsign("56");
-        builder.nonumsign("56");
-        let c = numeric_constrainers(builder).precompute("1bc", &[]);
-        assert_eq!(dont_contract(&c), vec![true, false, false]);
+        builder.nonumsign("6");
+        assert!(builder.build(runs).is_none());
     }
 
     #[test]
@@ -991,6 +982,20 @@ mod tests {
         builder.digit_cells(HashSet::from(['1', '2']));
         let c = backward_numeric_constrainers(builder).precompute("N1X2", &[]);
         assert_eq!(prefer_digit(&c), vec![false, true, false, false]);
+    }
+
+    #[test]
+    fn continuation_cells_keep_the_number_going_into_a_litdigit() {
+        let mut builder = BackwardNumericConstrainerBuilder::new();
+        builder.numsign("N");
+        builder.digit_cells(HashSet::from(['1', '2', 'd']));
+        builder.litdigit_cells(HashSet::from(['1', '2']));
+        builder.continuation_dots(vec!["-".to_string()]);
+        let c = backward_numeric_constrainers(builder).precompute("N1-2-d1", &[]);
+        assert_eq!(
+            prefer_digit(&c),
+            vec![false, true, false, true, false, false, false]
+        );
     }
 
     #[test]

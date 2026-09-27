@@ -159,8 +159,8 @@ struct PrimaryTableBuilder {
     nocontract_indicator: nocontract::IndicatorBuilder,
     emphasis_indicator: emphasis::IndicatorBuilder,
     computer_braille_indicator: computer_braille::IndicatorBuilder,
-    numeric_constrainer: NumericConstrainerBuilder,
     backward_caps_constrainer: BackwardCapsConstrainerBuilder,
+    numeric_constrainer: NumericConstrainerBuilder,
     backward_numeric_constrainer: BackwardNumericConstrainerBuilder,
     backward_nocontract_constrainer: BackwardNoContractConstrainerBuilder,
     hyphenation_constrainer: HyphenationConstrainerBuilder,
@@ -191,8 +191,8 @@ impl PrimaryTableBuilder {
             nocontract_indicator: nocontract::IndicatorBuilder::new(),
             emphasis_indicator: emphasis::IndicatorBuilder::new(),
             computer_braille_indicator: computer_braille::IndicatorBuilder::new(),
-            numeric_constrainer: NumericConstrainerBuilder::new(),
             backward_caps_constrainer: BackwardCapsConstrainerBuilder::new(),
+            numeric_constrainer: NumericConstrainerBuilder::new(),
             backward_numeric_constrainer: BackwardNumericConstrainerBuilder::new(),
             backward_nocontract_constrainer: BackwardNoContractConstrainerBuilder::new(),
             hyphenation_constrainer: HyphenationConstrainerBuilder::new(),
@@ -348,8 +348,11 @@ impl PrimaryTableBuilder {
         }
     }
 
-    fn build(self, direction: Direction, ctx: &TableContext) -> PrimaryTable {
+    fn build(mut self, direction: Direction, ctx: &TableContext) -> PrimaryTable {
         let triggers = self.compbrl_triggers;
+        let numeric_constrainer = self
+            .numeric_constrainer
+            .build(self.numeric_indicator.runs().clone());
         let indicators = [
             // Computer braille must be first so begcomp appears before emphasis.
             self.computer_braille_indicator
@@ -386,15 +389,7 @@ impl PrimaryTableBuilder {
             constrainers: Constrainers::new(
                 [
                     Some(Constrainer::ComputerBraille(ComputerBrailleConstrainer {})),
-                    self.numeric_constrainer
-                        .build(
-                            [CharacterClass::Space, CharacterClass::Seqdelimiter]
-                                .iter()
-                                .filter_map(|class| ctx.character_classes().get(class))
-                                .flatten()
-                                .collect(),
-                        )
-                        .map(Constrainer::Numeric),
+                    numeric_constrainer.map(Constrainer::Numeric),
                     self.backward_caps_constrainer
                         .build()
                         .map(Constrainer::BackwardCaps),
@@ -540,8 +535,7 @@ impl PrimaryTable {
                     // must not get a second numsign.  Registering it as a midnum
                     // character achieves this via the numeric indicator and constrainer.
                     let s = character.to_string();
-                    builder.numeric_indicator.midnum(&s);
-                    builder.numeric_constrainer.midnum(&s);
+                    builder.numeric_indicator.runs().midnum(&s);
                 }
                 Rule::Hyphen {
                     character, dots, ..
@@ -657,15 +651,16 @@ impl PrimaryTable {
                     }
                 }
                 Rule::Numericnocontchars { chars } => {
-                    builder.numeric_indicator.numericnocontchars(chars);
-                    builder.numeric_constrainer.uses_numeric_mode();
-                }
-                Rule::Midendnumericmodechars { .. } => {
-                    builder.numeric_constrainer.uses_numeric_mode();
+                    builder.numeric_indicator.runs().numericnocontchars(chars);
                 }
                 Rule::Numericmodechars { chars } => {
-                    builder.numeric_indicator.numericmodechars(chars);
-                    builder.numeric_constrainer.numericmodechars(chars);
+                    builder.numeric_indicator.runs().numericmodechars(chars);
+                }
+                Rule::Midendnumericmodechars { chars } => {
+                    builder
+                        .numeric_indicator
+                        .runs()
+                        .midendnumericmodechars(chars);
                 }
                 Rule::Capsletter { dots, .. } => {
                     builder
@@ -888,6 +883,9 @@ impl PrimaryTable {
                     builder.nocontract_indicator.contraction(chars, rule);
                 }
                 Rule::Nocontractsign { dots, .. } => {
+                    builder
+                        .numeric_constrainer
+                        .nocontractsign(&dots.to_string());
                     builder
                         .nocontract_indicator
                         .nocontractsign(&dots.to_string(), rule);
@@ -1317,8 +1315,7 @@ impl PrimaryTable {
                     rule,
                 ),
                 Rule::Midnum { chars, dots, .. } => {
-                    builder.numeric_indicator.midnum(chars);
-                    builder.numeric_constrainer.midnum(chars);
+                    builder.numeric_indicator.runs().midnum(chars);
                     builder.get_trie_mut(rule).insert(
                         chars,
                         &dots.to_string(),
@@ -1433,10 +1430,13 @@ impl PrimaryTable {
             .unwrap_or_default();
         builder
             .numeric_indicator
-            .numeric_characters(numeric_chars.clone());
-        builder
-            .numeric_constrainer
+            .runs()
             .numeric_characters(numeric_chars);
+        for class in [CharacterClass::Space, CharacterClass::Seqdelimiter] {
+            builder
+                .numeric_constrainer
+                .reset_chars(ctx.character_classes().get(&class).unwrap_or_default());
+        }
         builder.uppercase_indicator.uppercase_characters(
             ctx.character_classes()
                 .get(&CharacterClass::Uppercase)
@@ -1498,18 +1498,30 @@ impl PrimaryTable {
             builder
                 .backward_nocontract_constrainer
                 .letter_cells(letter_cells);
+            let litdigit_cells = ctx
+                .dots_classes()
+                .get(&CharacterClass::Litdigit)
+                .unwrap_or_default();
             let mut digit_cells = ctx
                 .dots_classes()
                 .get(&CharacterClass::Digit)
                 .unwrap_or_default();
-            digit_cells.extend(
-                ctx.dots_classes()
-                    .get(&CharacterClass::Litdigit)
-                    .unwrap_or_default(),
-            );
+            digit_cells.extend(litdigit_cells.iter().copied());
+            builder
+                .backward_numeric_constrainer
+                .litdigit_cells(litdigit_cells);
             builder
                 .backward_numeric_constrainer
                 .digit_cells(digit_cells);
+            let continuation_dots = builder
+                .numeric_indicator
+                .runs()
+                .continuation_chars()
+                .filter_map(|c| ctx.character_definitions().get(c).cloned())
+                .collect();
+            builder
+                .backward_numeric_constrainer
+                .continuation_dots(continuation_dots);
         }
         Ok(builder.build(direction, ctx))
     }
@@ -1725,9 +1737,8 @@ impl PrimaryTable {
                 candidates.push(digit_translation.clone());
             }
 
-            // inside a numeric run, suppress multi-character contractions
             if constraints.dont_contract_at(char_pos) {
-                candidates.retain(|t| t.length() <= 1);
+                candidates.retain(|t| !t.rule().is_some_and(is_contraction));
             }
 
             // Backward no-contract mode: a letsign/nocontractsign/nonumsign says the
@@ -1885,6 +1896,32 @@ impl PrimaryTable {
             })
             .collect()
     }
+}
+
+/// The opcodes liblouis's `for_selectRule` skips while `dontContract` is set
+fn is_contraction(rule: &Rule) -> bool {
+    matches!(
+        rule,
+        Rule::Repeated { .. }
+            | Rule::Repword { .. }
+            | Rule::Rependword { .. }
+            | Rule::Nocont { .. }
+            | Rule::Always { .. }
+            | Rule::Largesign { .. }
+            | Rule::Word { .. }
+            | Rule::Partword { .. }
+            | Rule::Joinnum { .. }
+            | Rule::Lowword { .. }
+            | Rule::Joinword { .. }
+            | Rule::Sufword { .. }
+            | Rule::Prfword { .. }
+            | Rule::Begword { .. }
+            | Rule::Begmidword { .. }
+            | Rule::Midword { .. }
+            | Rule::Midendword { .. }
+            | Rule::Endword { .. }
+            | Rule::Match { .. }
+    )
 }
 
 /// Map a char to dots according to the North American Braille Computer Code (NABCC)
@@ -2394,6 +2431,32 @@ mod tests {
         assert_eq!(table.translate("123"), "⠼⠁⠃⠉");
         assert_eq!(table.translate("123foo"), "⠼⠁⠃⠉⠰⠄⠈⠈");
         assert_eq!(table.translate("foof"), "⠄⠈⠈⠄");
+    }
+
+    #[test]
+    fn number_suppresses_contractions_but_not_number_rules() {
+        let rules = [
+            parse_rule("lowercase f 3"),
+            parse_rule("lowercase o 4"),
+            parse_rule("punctuation - 36"),
+            parse_rule("digit 1 1"),
+            parse_rule("litdigit 1 1"),
+            parse_rule("numsign 3456"),
+            parse_rule("nonumsign 56"),
+            parse_rule("nocontractsign 56"),
+            parse_rule("numericnocontchars abcdefghij"),
+            parse_rule("midendnumericmodechars -"),
+            parse_rule("always oo 1246"),
+            parse_rule("endnum -fo 36-2"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("oo"), "⠫");
+        assert_eq!(table.translate("1oo"), "⠼⠁⠈⠈");
+        assert_eq!(table.translate("1-foo"), "⠼⠁⠤⠂⠈");
+        assert_eq!(table.translate("1-1"), "⠼⠁⠤⠁");
     }
 
     #[test]
