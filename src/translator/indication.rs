@@ -81,16 +81,34 @@ pub struct Indicators(Vec<Indicator>);
 /// Holds per-position braille translations to emit, indexed by
 /// character position (with one extra slot at index `n` for translations that
 /// must appear after all input characters, e.g. `endemph` at end of string).
-pub struct PrecomputedIndications {
-    translations: Vec<Vec<ResolvedTranslation>>,
+pub struct PrecomputedIndications<'a> {
+    /// The translations of the indicators before the numeric one, and after it
+    translations: Vec<(Vec<ResolvedTranslation>, Vec<ResolvedTranslation>)>,
     /// Positions with a caps indication. liblouis's `emphasisBuffer` also holds emphasis,
     /// but our emphasis indicator places some indications where liblouis has none.
     caps_changes: Vec<bool>,
+    /// A numeric indicator stepped as the translation loop visits positions
+    live_numeric: Option<&'a numeric::Indicator>,
+    in_numeric: bool,
+    chars: Vec<char>,
 }
 
-impl PrecomputedIndications {
-    pub fn translations_at(&self, pos: usize) -> Vec<ResolvedTranslation> {
-        self.translations.get(pos).cloned().unwrap_or_default()
+impl PrecomputedIndications<'_> {
+    /// The indications at `pos`. Call it once for each position the translation loop
+    /// visits, in order.
+    pub fn translations_at(&mut self, pos: usize) -> Vec<ResolvedTranslation> {
+        let numeric = self
+            .live_numeric
+            .and_then(|n| n.at(&mut self.in_numeric, &self.chars, pos));
+        match self.translations.get(pos) {
+            Some((before, after)) => before
+                .iter()
+                .cloned()
+                .chain(numeric)
+                .chain(after.iter().cloned())
+                .collect(),
+            None => numeric.into_iter().collect(),
+        }
     }
 
     /// Whether a caps indication falls strictly inside the `length` characters at `pos`
@@ -104,15 +122,20 @@ impl Indicators {
         Indicators(indicators)
     }
 
-    pub fn precompute(&self, input: &str, spans: &[EmphasisSpan]) -> PrecomputedIndications {
+    pub fn precompute(&self, input: &str, spans: &[EmphasisSpan]) -> PrecomputedIndications<'_> {
         let n = input.chars().count();
-        let mut indications: Vec<Vec<ResolvedTranslation>> = vec![vec![]; n + 1];
+        let mut translations = vec![(vec![], vec![]); n + 1];
         let mut caps_changes = vec![false; n + 1];
+        let mut live_numeric = None;
 
         for indicator in &self.0 {
             let pairs: Vec<(usize, ResolvedTranslation)> = match indicator {
                 Indicator::ComputerBraille(i) => i.precompute(input, spans),
                 Indicator::Emphasis(i) => i.precompute(input, spans),
+                Indicator::Numeric(i) if i.is_live() => {
+                    live_numeric = Some(i);
+                    continue;
+                }
                 Indicator::Numeric(i) => i.precompute(input),
                 Indicator::Uppercase(i) => i.precompute(input),
                 Indicator::Mode(i) => i.precompute(input),
@@ -122,13 +145,21 @@ impl Indicators {
             let is_caps = matches!(indicator, Indicator::Uppercase(_));
             for (pos, t) in pairs {
                 caps_changes[pos] |= is_caps;
-                indications[pos].push(t);
+                let (before, after) = &mut translations[pos];
+                if live_numeric.is_some() {
+                    after.push(t);
+                } else {
+                    before.push(t);
+                }
             }
         }
 
         PrecomputedIndications {
-            translations: indications,
+            translations,
             caps_changes,
+            live_numeric,
+            in_numeric: false,
+            chars: input.chars().collect(),
         }
     }
 }
@@ -177,9 +208,9 @@ mod tests {
         let uppercase = Indicator::Uppercase(cap_builder.build(&TableContext::default()).unwrap());
 
         let indicators = Indicators::new(vec![numeric, uppercase]);
-        let indications = indicators.precompute("A1", &[]);
+        let mut indications = indicators.precompute("A1", &[]);
 
-        let outputs_at = |pos| {
+        let mut outputs_at = |pos| {
             indications
                 .translations_at(pos)
                 .into_iter()

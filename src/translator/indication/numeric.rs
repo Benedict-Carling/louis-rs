@@ -82,42 +82,54 @@ impl NumericRuns {
     }
 
     pub fn events(&self, chars: &[char]) -> Vec<RunEvent> {
-        let numeric_mode = self.uses_numeric_mode();
         let mut in_numeric = false;
-        let mut events = Vec::with_capacity(chars.len());
-        for (pos, c) in chars.iter().enumerate() {
-            let event = if !in_numeric {
-                if self.numeric_chars.contains(c) {
-                    RunEvent::Start { by_digit: true }
-                } else if numeric_mode
-                    && self.mode_chars.contains(c)
-                    && chars[pos + 1..]
-                        .iter()
-                        .find(|c| !self.mode_chars.contains(c))
-                        .is_some_and(|c| self.numeric_chars.contains(c))
-                {
-                    RunEvent::Start { by_digit: false }
-                } else {
-                    RunEvent::Outside
-                }
-            } else if self.numeric_chars.contains(c)
-                || numeric_mode && (self.mode_chars.contains(c) || self.midend_chars.contains(c))
-                || !numeric_mode
-                    && self.mid_numeric_chars.contains(c)
-                    && chars
-                        .get(pos + 1)
-                        .is_some_and(|nc| self.numeric_chars.contains(nc))
+        (0..chars.len())
+            .map(|pos| {
+                let event = self.step(in_numeric, chars, pos);
+                in_numeric = event.in_numeric();
+                event
+            })
+            .collect()
+    }
+
+    /// What happens at `pos`, given whether a number is running before it
+    pub fn step(&self, in_numeric: bool, chars: &[char], pos: usize) -> RunEvent {
+        let numeric_mode = self.uses_numeric_mode();
+        let c = &chars[pos];
+        if !in_numeric {
+            if self.numeric_chars.contains(c) {
+                RunEvent::Start { by_digit: true }
+            } else if numeric_mode
+                && self.mode_chars.contains(c)
+                && chars[pos + 1..]
+                    .iter()
+                    .find(|c| !self.mode_chars.contains(c))
+                    .is_some_and(|c| self.numeric_chars.contains(c))
             {
-                RunEvent::Inside
+                RunEvent::Start { by_digit: false }
             } else {
-                RunEvent::End {
-                    nonumsign: self.nocont_chars.contains(c),
-                }
-            };
-            in_numeric = matches!(event, RunEvent::Start { .. } | RunEvent::Inside);
-            events.push(event);
+                RunEvent::Outside
+            }
+        } else if self.numeric_chars.contains(c)
+            || numeric_mode && (self.mode_chars.contains(c) || self.midend_chars.contains(c))
+            || !numeric_mode
+                && self.mid_numeric_chars.contains(c)
+                && chars
+                    .get(pos + 1)
+                    .is_some_and(|nc| self.numeric_chars.contains(nc))
+        {
+            RunEvent::Inside
+        } else {
+            RunEvent::End {
+                nonumsign: self.nocont_chars.contains(c),
+            }
         }
-        events
+    }
+}
+
+impl RunEvent {
+    pub fn in_numeric(self) -> bool {
+        matches!(self, RunEvent::Start { .. } | RunEvent::Inside)
     }
 }
 
@@ -177,21 +189,46 @@ pub struct Indicator {
 }
 
 impl Indicator {
+    /// liblouis's `checkNumericMode` looks at a character only where a rule starts, so
+    /// in numeric mode the translation loop steps the indicator itself via [`Self::at`]
+    /// instead of using [`Self::precompute`]. Without numeric mode liblouis's
+    /// `insertNumberSign` compares a digit with the character before it, which
+    /// precomputing does.
+    pub fn is_live(&self) -> bool {
+        self.runs.uses_numeric_mode()
+    }
+
+    /// The translation to emit where a rule starts at `pos`, updating `in_numeric`
+    pub fn at(
+        &self,
+        in_numeric: &mut bool,
+        chars: &[char],
+        pos: usize,
+    ) -> Option<ResolvedTranslation> {
+        if pos >= chars.len() {
+            return None;
+        }
+        let event = self.runs.step(*in_numeric, chars, pos);
+        *in_numeric = event.in_numeric();
+        self.translation(event)
+    }
+
+    fn translation(&self, event: RunEvent) -> Option<ResolvedTranslation> {
+        match event {
+            RunEvent::Start { .. } => self.start_translation.clone(),
+            RunEvent::End { nonumsign: true } => self.end_translation.clone(),
+            _ => None,
+        }
+    }
+
     /// Returns sparse `(position, translation)` pairs.
     pub fn precompute(&self, input: &str) -> Vec<(usize, ResolvedTranslation)> {
         let chars: Vec<char> = input.chars().collect();
-        let Some(start) = &self.start_translation else {
-            return Vec::new();
-        };
         self.runs
             .events(&chars)
             .into_iter()
             .enumerate()
-            .filter_map(|(pos, event)| match event {
-                RunEvent::Start { .. } => Some((pos, start.clone())),
-                RunEvent::End { nonumsign: true } => self.end_translation.clone().map(|t| (pos, t)),
-                _ => None,
-            })
+            .filter_map(|(pos, event)| self.translation(event).map(|t| (pos, t)))
             .collect()
     }
 }

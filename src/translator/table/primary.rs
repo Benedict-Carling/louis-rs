@@ -1673,7 +1673,7 @@ impl PrimaryTable {
             None => options.emphasis().to_vec(),
         };
 
-        let indications = self.indicators.precompute(input, &enriched_spans);
+        let mut indications = self.indicators.precompute(input, &enriched_spans);
         let constraints = self.constrainers.precompute(input, &enriched_spans);
         let input_chars: Vec<char> = match self.sequences {
             Some(_) => input.chars().collect(),
