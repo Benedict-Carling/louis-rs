@@ -2105,9 +2105,24 @@ impl PrimaryTable {
                 }
             } else if let Some(next_char) = chars.next() {
                 prev = Some(next_char);
+                let computer_braille = constraints.use_comp6_at(char_pos);
                 char_pos += 1;
                 // no translation rule found
-                if let Some(translation) = self.character_translations.get(&next_char) {
+                let definition = self
+                    .fallback_definitions
+                    .get(&next_char)
+                    .filter(|_| computer_braille && self.direction == Direction::Forward);
+                if let Some(dots) = definition {
+                    // liblouis puts a character's definition in computer braille
+                    translations.push(ResolvedTranslation::new(
+                        &next_char.to_string(),
+                        dots,
+                        1,
+                        TranslationStage::Main,
+                        None,
+                    ));
+                    delayed_translations = self.update_offsets(delayed_translations, 1);
+                } else if let Some(translation) = self.character_translations.get(&next_char) {
                     translations.push(translation.clone());
                     delayed_translations = self.update_offsets(delayed_translations, 1);
                 } else if let Some(ref replacement) = self.undefined {
@@ -3670,6 +3685,27 @@ mod tests {
                 .unwrap();
         assert_eq!(table.translate("a.1"), "⠁⠨⠁");
         assert_eq!(table.translate("a."), "⠁⠲");
+    }
+
+    #[test]
+    fn computer_braille_puts_definitions_without_indicators() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("digit 4 256"),
+            parse_rule("litdigit 4 145"),
+            parse_rule("numsign 3456"),
+            parse_rule("punctuation : 25"),
+            parse_rule("punctuation / 34"),
+            parse_rule("space \\s 0"),
+            parse_rule("begcomp 456-346"),
+            parse_rule("endcomp 456-156"),
+            parse_rule("compbrl ://"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("a://4 4"), "⠸⠬⠁⠒⠌⠌⠲⠸⠱⠀⠼⠙");
     }
 
     #[test]

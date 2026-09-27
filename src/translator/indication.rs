@@ -88,15 +88,21 @@ pub struct PrecomputedIndications<'a> {
     live_numeric: Option<&'a numeric::Indicator>,
     in_numeric: bool,
     chars: Vec<char>,
+    /// The positions in computer braille, where liblouis puts no other indicator
+    computer_braille: Vec<bool>,
 }
 
 impl PrecomputedIndications<'_> {
     /// The indications at `pos`. Call it once for each position the translation loop
     /// visits, in order.
     pub fn translations_at(&mut self, pos: usize) -> Vec<ResolvedTranslation> {
-        let numeric = self
-            .live_numeric
-            .and_then(|n| n.at(&mut self.in_numeric, &self.chars, pos));
+        let numeric = if self.computer_braille.get(pos).copied().unwrap_or(false) {
+            self.in_numeric = false;
+            None
+        } else {
+            self.live_numeric
+                .and_then(|n| n.at(&mut self.in_numeric, &self.chars, pos))
+        };
         match self.translations.get(pos) {
             Some((before, after)) => before
                 .iter()
@@ -126,6 +132,12 @@ impl Indicators {
         let n = input.chars().count();
         let mut translations = vec![(vec![], vec![]); n + 1];
         let mut live_numeric = None;
+        let mut computer_braille = vec![false; n + 1];
+        for span in spans.iter().filter(|s| s.class == "computer_braille") {
+            for pos in span.range.start..span.range.end.min(n) {
+                computer_braille[pos] = true;
+            }
+        }
 
         for indicator in &self.0 {
             let pairs: Vec<(usize, ResolvedTranslation)> = match indicator {
@@ -142,6 +154,9 @@ impl Indicators {
                 Indicator::NoContract(i) => i.precompute(input),
             };
             for (pos, t) in pairs {
+                if computer_braille[pos] && !matches!(indicator, Indicator::ComputerBraille(_)) {
+                    continue;
+                }
                 let (before, after) = &mut translations[pos];
                 if live_numeric.is_some() {
                     after.push(t);
@@ -156,6 +171,7 @@ impl Indicators {
             live_numeric,
             in_numeric: false,
             chars: input.chars().collect(),
+            computer_braille,
         }
     }
 }
