@@ -544,15 +544,25 @@ impl PrimaryTable {
             })
             .collect();
 
-        // decpoint and hyphen take precedence over other character definition rules, so insert
-        // them first
+        // hyphen takes precedence over other character definition rules, so insert it first
         for rule in rules {
             match &rule.rule {
                 Rule::Decpoint {
                     character, dots, ..
                 } => {
+                    // liblouis only takes a decimal point before a digit
                     if direction == Direction::Forward {
-                        builder.insert_character(*character, &dots.to_string(), direction, rule);
+                        builder.get_trie_mut(rule).insert(
+                            &character.to_string(),
+                            &dots.to_string(),
+                            None,
+                            Some(Transition::End(vec![CharacterClass::Digit])),
+                            direction,
+                            rule.precedence(),
+                            vec![],
+                            TranslationStage::Main,
+                            rule,
+                        );
                     }
                     // A decimal point extends the numeric run: digits that follow it
                     // must not get a second numsign.  Registering it as a midnum
@@ -3644,6 +3654,22 @@ mod tests {
         assert_eq!(translate("noback context \"ab\"$l @6", "abc"), "⠠");
         // indexed under none, it overrides "ab"
         assert_eq!(translate("noback context $l\"b\" @6", "ab"), "⠠");
+    }
+
+    #[test]
+    fn decpoint_only_before_a_digit() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("digit 1 1"),
+            parse_rule("punctuation . 256"),
+            parse_rule("decpoint . 46"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("a.1"), "⠁⠨⠁");
+        assert_eq!(table.translate("a."), "⠁⠲");
     }
 
     #[test]
