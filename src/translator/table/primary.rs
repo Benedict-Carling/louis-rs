@@ -20,10 +20,9 @@ use crate::{
         },
         match_pattern::{MatchPatterns, MatchPatternsBuilder},
         position_constraints::{
-            BackwardCapsConstrainerBuilder, BackwardNoContractConstrainerBuilder,
-            BackwardNumericConstrainerBuilder, ComputerBrailleConstrainer, Constrainer,
-            Constrainers, HyphenationConstrainerBuilder, NumericConstrainerBuilder,
-            PositionConstraints, PunctuationConstrainerBuilder,
+            BackwardCapsConstrainerBuilder, ComputerBrailleConstrainer, Constrainer, Constrainers,
+            HyphenationConstrainerBuilder, NumericConstrainerBuilder, PositionConstraints,
+            PunctuationConstrainerBuilder,
         },
         sequence::{Sequences, whole_word_boundaries},
         table::{
@@ -135,12 +134,6 @@ pub struct PrimaryTable {
     /// Detects compbrl-triggered computer braille regions.
     compbrl_scanner: Option<CompbrlScanner>,
     direction: Direction,
-    /// Backward-only: overrides the trie's default (letter) reading for a braille cell
-    /// that is shared between a digit and a letter, keyed by the cell itself. Consulted
-    /// only inside a `numsign` span (see [`Constraint::PreferDigit`]).
-    ///
-    /// [`Constraint::PreferDigit`]: crate::translator::position_constraints::Constraint::PreferDigit
-    backward_digit_overrides: HashMap<char, ResolvedTranslation>,
     /// Forward-only: the standing-alone check for `word` and `contraction` rules.
     sequences: Option<Sequences>,
     /// Backward-only: picks among the rules the trie finds at a position.
@@ -166,11 +159,8 @@ struct PrimaryTableBuilder {
     computer_braille_indicator: computer_braille::IndicatorBuilder,
     numeric_constrainer: NumericConstrainerBuilder,
     backward_caps_constrainer: BackwardCapsConstrainerBuilder,
-    backward_numeric_constrainer: BackwardNumericConstrainerBuilder,
-    backward_nocontract_constrainer: BackwardNoContractConstrainerBuilder,
     hyphenation_constrainer: HyphenationConstrainerBuilder,
     punctuation_constrainer: PunctuationConstrainerBuilder,
-    backward_digit_overrides: HashMap<char, ResolvedTranslation>,
     compbrl_triggers: Vec<String>,
     sequences: Option<Sequences>,
     backward: Option<BackwardSelector>,
@@ -205,11 +195,8 @@ impl PrimaryTableBuilder {
             computer_braille_indicator: computer_braille::IndicatorBuilder::new(),
             numeric_constrainer: NumericConstrainerBuilder::new(),
             backward_caps_constrainer: BackwardCapsConstrainerBuilder::new(),
-            backward_numeric_constrainer: BackwardNumericConstrainerBuilder::new(),
-            backward_nocontract_constrainer: BackwardNoContractConstrainerBuilder::new(),
             hyphenation_constrainer: HyphenationConstrainerBuilder::new(),
             punctuation_constrainer: PunctuationConstrainerBuilder::new(),
-            backward_digit_overrides: HashMap::new(),
             compbrl_triggers: Vec::new(),
             sequences: None,
             backward: None,
@@ -278,34 +265,6 @@ impl PrimaryTableBuilder {
         );
     }
 
-    /// Like [`Self::insert_backward_indicator`], but only consumes the cell when the
-    /// *next* cell is a letter or sign cell.
-    ///
-    /// `letsign`'s dots are routinely shared with an ordinary punctuation character
-    /// (English defines both `letsign 56` and `punctuation ; 56`), so an unguarded
-    /// backward indicator would swallow every `;`.
-    fn insert_backward_indicator_before_letter(&mut self, dots: &str, rule: &AnchoredRule) {
-        self.trie.insert(
-            "",
-            dots,
-            None,
-            // liblouis resolves the same ambiguity with `!(beforeAttributes &
-            // CTC_Letter) && (afterAttributes & (CTC_Letter | CTC_Sign))`
-            // (lou_backTranslateString.c), which it labels "just a heuristic test".
-            // Only the lookahead half is reproduced here: there is no negated
-            // `CharacterClass`, so the lookbehind has no `Transition` counterpart.
-            Some(Transition::End(vec![
-                CharacterClass::Letter,
-                CharacterClass::Sign,
-            ])),
-            Direction::Backward,
-            rule.precedence(),
-            vec![],
-            TranslationStage::Main,
-            rule,
-        );
-    }
-
     /// Returns whether `opcode`'s `dots` are safe to register as a backward indicator:
     /// some tables include a shared subtable purely for other opcodes (e.g.
     /// Malayalam/Punjabi including `en-in-g1.ctb`), whose `capsletter`/`begcapsword`/
@@ -328,38 +287,6 @@ impl PrimaryTableBuilder {
             false
         } else {
             true
-        }
-    }
-
-    /// If `dots` is shared with a letter definition (common in six-dot literary codes,
-    /// where digits 1-9,0 conventionally reuse letter cells a-j), records the digit
-    /// reading as a backward override for that cell — consulted only inside a
-    /// `numsign` span (see `Constraint::PreferDigit`). Only meaningful for
-    /// `Direction::Backward`.
-    ///
-    /// A digit is always a single braille cell, so `dots` normally has length 1; this
-    /// is skipped (rather than assumed) for any rule where that doesn't hold, mirroring
-    /// `CharacterClasses::insert_dots`.
-    fn register_backward_digit_override(
-        &mut self,
-        character: char,
-        dots: &BrailleChars,
-        letter_dots: &HashSet<String>,
-        rule: &AnchoredRule,
-    ) {
-        let dots_str = dots.to_string();
-        if dots.len() == 1 && letter_dots.contains(&dots_str) {
-            let cell = dots.iter().next().unwrap().to_unicode();
-            self.backward_digit_overrides.insert(
-                cell,
-                ResolvedTranslation::new(
-                    &dots_str,
-                    &character.to_string(),
-                    1,
-                    TranslationStage::Main,
-                    rule.clone(),
-                ),
-            );
         }
     }
 
@@ -413,12 +340,6 @@ impl PrimaryTableBuilder {
                     self.backward_caps_constrainer
                         .build()
                         .map(Constrainer::BackwardCaps),
-                    self.backward_numeric_constrainer
-                        .build()
-                        .map(Constrainer::BackwardNumeric),
-                    self.backward_nocontract_constrainer
-                        .build()
-                        .map(Constrainer::BackwardNoContract),
                     // liblouis's `nocross`/hyphenation-based syllable-break check is a
                     // forward-translation-only mechanism (lou_backTranslateString.c never
                     // consults it); a nocross rule is always an unrestricted candidate
@@ -442,7 +363,6 @@ impl PrimaryTableBuilder {
                 triggers,
                 character_classes: ctx.character_classes.clone(),
             }),
-            backward_digit_overrides: self.backward_digit_overrides,
             sequences: self.sequences,
             backward: self.backward,
         }
@@ -524,12 +444,8 @@ impl PrimaryTable {
             HashSet::new()
         };
 
-        // Backward-only: digit dots can coincide with a letter's dots (six-dot literary
-        // codes conventionally reuse letter cells a-j for digits 1-9,0). Collect the set
-        // of dots used by letter definitions so digit/litdigit rules below can detect the
-        // collision and register a numsign-scoped override (see
-        // `register_backward_digit_override`), without disturbing the trie's normal
-        // (letter) reading used outside a numeric run.
+        // Backward-only: the dots of letter definitions, which an indicator may not share
+        // (see `backward_indicator_dots_available`).
         let letter_dots: HashSet<String> = if direction == Direction::Backward {
             rules
                 .iter()
@@ -600,27 +516,11 @@ impl PrimaryTable {
                     if !litdigit_chars.contains(character) {
                         builder.insert_character(*character, &dots.to_string(), direction, rule);
                     }
-                    if direction == Direction::Backward {
-                        builder.register_backward_digit_override(
-                            *character,
-                            dots,
-                            &letter_dots,
-                            rule,
-                        );
-                    }
                 }
                 Rule::Litdigit {
                     character, dots, ..
                 } => {
                     builder.insert_character(*character, &dots.to_string(), direction, rule);
-                    if direction == Direction::Backward {
-                        builder.register_backward_digit_override(
-                            *character,
-                            dots,
-                            &letter_dots,
-                            rule,
-                        );
-                    }
                 }
                 Rule::Letter {
                     character, dots, ..
@@ -658,9 +558,6 @@ impl PrimaryTable {
                         )
                     {
                         builder.insert_backward_indicator(&dots.to_string(), rule);
-                        builder
-                            .backward_numeric_constrainer
-                            .numsign(&dots.to_string());
                     }
                 }
                 Rule::Nonumsign { dots, .. } => {
@@ -674,12 +571,6 @@ impl PrimaryTable {
                         )
                     {
                         builder.insert_backward_indicator(&dots.to_string(), rule);
-                        builder
-                            .backward_numeric_constrainer
-                            .nonumsign(&dots.to_string());
-                        builder
-                            .backward_nocontract_constrainer
-                            .indicator(&dots.to_string());
                     }
                 }
                 Rule::Numericnocontchars { chars } => {
@@ -876,10 +767,7 @@ impl PrimaryTable {
                             &letter_dots,
                         )
                     {
-                        builder.insert_backward_indicator_before_letter(&dots.to_string(), rule);
-                        builder
-                            .backward_nocontract_constrainer
-                            .indicator(&dots.to_string());
+                        builder.insert_backward_indicator(&dots.to_string(), rule);
                     }
                 }
                 Rule::Multind { dots, .. } if direction == Direction::Backward => {
@@ -930,10 +818,7 @@ impl PrimaryTable {
                             &letter_dots,
                         )
                     {
-                        builder.insert_backward_indicator_before_letter(&dots.to_string(), rule);
-                        builder
-                            .backward_nocontract_constrainer
-                            .indicator(&dots.to_string());
+                        builder.insert_backward_indicator(&dots.to_string(), rule);
                     }
                 }
                 // liblouis defines no back-translation rule for a base character
@@ -1520,27 +1405,7 @@ impl PrimaryTable {
                     letter_cells.extend(dots.to_string().chars());
                 }
             }
-            builder
-                .backward_numeric_constrainer
-                .letter_cells(letter_cells.clone());
-            builder
-                .backward_caps_constrainer
-                .letter_cells(letter_cells.clone());
-            builder
-                .backward_nocontract_constrainer
-                .letter_cells(letter_cells);
-            let mut digit_cells = ctx
-                .dots_classes()
-                .get(&CharacterClass::Digit)
-                .unwrap_or_default();
-            digit_cells.extend(
-                ctx.dots_classes()
-                    .get(&CharacterClass::Litdigit)
-                    .unwrap_or_default(),
-            );
-            builder
-                .backward_numeric_constrainer
-                .digit_cells(digit_cells);
+            builder.backward_caps_constrainer.letter_cells(letter_cells);
         }
         if direction == Direction::Backward {
             builder.backward = Some(BackwardSelector::new(

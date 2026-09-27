@@ -41,12 +41,6 @@ pub enum Constraint {
     /// character (e.g. the Hungarian `sz` digraph), only the first is capitalized
     /// (`Sz`, not `SZ`), matching liblouis.
     TitleCase,
-    /// Prefer a digit reading over a letter reading at this position, in backward
-    /// translation.
-    ///
-    /// Set for every digit cell inside a `numsign`/`nonumsign` span, disambiguating
-    /// dots shared between a digit and a letter (common in six-dot literary codes).
-    PreferDigit,
     /// There's a valid hyphenation break between this character and the next, in
     /// forward translation.
     ///
@@ -54,13 +48,6 @@ pub enum Constraint {
     /// class) that the word's hyphenation dictionary marks as a valid break point.
     /// Consulted to decide whether a `nocross` rule may cross this gap.
     HyphenationBreak,
-    /// Suppress the word-family rules at this position, in backward translation.
-    ///
-    /// Set for the run of letter cells following a `letsign`/`nocontractsign`/
-    /// `nonumsign` indicator. Those indicators exist precisely to say "read the
-    /// following cells as letters, not as a contraction", so the `word`, `sufword`,
-    /// `prfword` and `begword` rules must not fire inside their scope.
-    NoContract,
     /// A `prepunc` rule may fire on the punctuation character at this position, in
     /// forward translation.
     PrepuncOk,
@@ -85,12 +72,6 @@ impl PositionConstraints {
             .is_some_and(|f| f.contains(Constraint::DontContract))
     }
 
-    pub fn no_contract_at(&self, pos: usize) -> bool {
-        self.0
-            .get(pos)
-            .is_some_and(|f| f.contains(Constraint::NoContract))
-    }
-
     pub fn use_comp6_at(&self, pos: usize) -> bool {
         self.0
             .get(pos)
@@ -107,12 +88,6 @@ impl PositionConstraints {
         self.0
             .get(pos)
             .is_some_and(|f| f.contains(Constraint::TitleCase))
-    }
-
-    pub fn prefer_digit_at(&self, pos: usize) -> bool {
-        self.0
-            .get(pos)
-            .is_some_and(|f| f.contains(Constraint::PreferDigit))
     }
 
     pub fn hyphenation_break_at(&self, pos: usize) -> bool {
@@ -376,130 +351,6 @@ impl BackwardCapsConstrainer {
     }
 }
 
-/// Detects `numsign`/`nonumsign` indicator dots in backward input and sets
-/// [`Constraint::PreferDigit`] at every digit cell of the numeric run, disambiguating
-/// dots shared between a digit and a letter.
-///
-/// `numsign`'s dots are not necessarily exclusive to the indicator: some tables (e.g.
-/// Punjabi, which shares the common `3456` numsign convention with the unrelated
-/// Gurmukhi letter `ਣ`, disambiguated in liblouis via a `midendword` position
-/// constraint) also use them for an ordinary, frequently-occurring letter. A genuine
-/// numsign is never preceded by a letter cell — mid-word occurrences are excluded to
-/// avoid false positives on such tables.
-#[derive(Debug, Clone)]
-pub struct BackwardNumericConstrainer {
-    numsign_dots: Option<String>,
-    nonumsign_dots: Option<String>,
-    digit_cells: HashSet<char>,
-    letter_cells: HashSet<char>,
-}
-
-impl BackwardNumericConstrainer {
-    fn compute(&self, input: &str) -> Vec<Constraints> {
-        let chars: Vec<char> = input.chars().collect();
-        let n = chars.len();
-        let mut constraints: Vec<Constraints> = vec![Constraints::empty(); n];
-        let mut pos = 0;
-        let mut in_number = false;
-        while pos < n {
-            if let Some(dots) = &self.numsign_dots
-                && matches_at(&chars, pos, dots)
-                && (pos == 0 || !self.letter_cells.contains(&chars[pos - 1]))
-            {
-                pos += dots.chars().count();
-                in_number = true;
-                continue;
-            }
-            if in_number {
-                if let Some(dots) = &self.nonumsign_dots
-                    && matches_at(&chars, pos, dots)
-                {
-                    pos += dots.chars().count();
-                    in_number = false;
-                    continue;
-                }
-                if self.digit_cells.contains(&chars[pos]) {
-                    constraints[pos].insert(Constraint::PreferDigit);
-                    pos += 1;
-                    continue;
-                }
-                in_number = false;
-            }
-            pos += 1;
-        }
-        constraints
-    }
-}
-
-/// Detects `letsign`/`nocontractsign`/`nonumsign` indicator dots in backward
-/// (braille -> text) input and sets [`Constraint::NoContract`] on the run of letter
-/// cells that follows, so the word-family rules cannot claim cells the indicator has
-/// declared to be plain letters.
-#[derive(Debug, Clone)]
-pub struct BackwardNoContractConstrainer {
-    indicator_dots: Vec<String>,
-    letter_cells: HashSet<char>,
-}
-
-impl BackwardNoContractConstrainer {
-    fn compute(&self, input: &str) -> Vec<Constraints> {
-        let chars: Vec<char> = input.chars().collect();
-        let n = chars.len();
-        let mut constraints: Vec<Constraints> = vec![Constraints::empty(); n];
-        let mut pos = 0;
-        while pos < n {
-            // Longest first: one indicator's dots are often a prefix of another's.
-            if let Some(dots) = self
-                .indicator_dots
-                .iter()
-                .filter(|d| matches_at(&chars, pos, d))
-                .max_by_key(|d| d.chars().count())
-            {
-                pos += dots.chars().count();
-                while pos < n && self.letter_cells.contains(&chars[pos]) {
-                    constraints[pos].insert(Constraint::NoContract);
-                    pos += 1;
-                }
-                continue;
-            }
-            pos += 1;
-        }
-        constraints
-    }
-}
-
-/// A builder for [`Constrainer::BackwardNoContract`].
-#[derive(Debug, Default)]
-pub struct BackwardNoContractConstrainerBuilder {
-    indicator_dots: Vec<String>,
-    letter_cells: HashSet<char>,
-}
-
-impl BackwardNoContractConstrainerBuilder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn indicator(&mut self, dots: &str) {
-        self.indicator_dots.push(dots.to_string());
-    }
-
-    pub fn letter_cells(&mut self, cells: HashSet<char>) {
-        self.letter_cells = cells;
-    }
-
-    pub fn build(self) -> Option<BackwardNoContractConstrainer> {
-        if self.indicator_dots.is_empty() {
-            None
-        } else {
-            Some(BackwardNoContractConstrainer {
-                indicator_dots: self.indicator_dots,
-                letter_cells: self.letter_cells,
-            })
-        }
-    }
-}
-
 /// A single analysis pass that contributes to [`PositionConstraints`].
 #[derive(Debug, Clone)]
 pub enum Constrainer {
@@ -510,11 +361,6 @@ pub enum Constrainer {
     /// Detects backward `capsletter`/`begcapsword`/`endcapsword` dots and sets
     /// [`Constraint::Uppercase`].
     BackwardCaps(BackwardCapsConstrainer),
-    /// Detects backward `numsign`/`nonumsign` dots and sets [`Constraint::PreferDigit`].
-    BackwardNumeric(BackwardNumericConstrainer),
-    /// Detects backward `letsign`/`nocontractsign`/`nonumsign` dots and sets
-    /// [`Constraint::NoContract`].
-    BackwardNoContract(BackwardNoContractConstrainer),
     /// Detects hyphenation-dictionary breaks and sets [`Constraint::HyphenationBreak`].
     Hyphenation(HyphenationConstrainer),
     /// Detects `prepunc`/`postpunc` scan eligibility and sets
@@ -528,8 +374,6 @@ impl Constrainer {
             Constrainer::Numeric(c) => c.compute(input),
             Constrainer::ComputerBraille(c) => c.compute(input, spans),
             Constrainer::BackwardCaps(c) => c.compute(input),
-            Constrainer::BackwardNoContract(c) => c.compute(input),
-            Constrainer::BackwardNumeric(c) => c.compute(input),
             Constrainer::Hyphenation(c) => c.compute(input),
             Constrainer::Punctuation(c) => c.compute(input),
         }
@@ -659,50 +503,6 @@ impl BackwardCapsConstrainerBuilder {
                 capsletter_dots: self.capsletter_dots,
                 begcapsword_dots: self.begcapsword_dots,
                 endcapsword_dots: self.endcapsword_dots,
-                letter_cells: self.letter_cells,
-            })
-        }
-    }
-}
-
-/// A builder for [`Constrainer::BackwardNumeric`].
-#[derive(Debug, Default)]
-pub struct BackwardNumericConstrainerBuilder {
-    numsign_dots: Option<String>,
-    nonumsign_dots: Option<String>,
-    digit_cells: HashSet<char>,
-    letter_cells: HashSet<char>,
-}
-
-impl BackwardNumericConstrainerBuilder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn numsign(&mut self, dots: &str) {
-        self.numsign_dots = Some(dots.to_string());
-    }
-
-    pub fn nonumsign(&mut self, dots: &str) {
-        self.nonumsign_dots = Some(dots.to_string());
-    }
-
-    pub fn digit_cells(&mut self, cells: HashSet<char>) {
-        self.digit_cells = cells;
-    }
-
-    pub fn letter_cells(&mut self, cells: HashSet<char>) {
-        self.letter_cells = cells;
-    }
-
-    pub fn build(self) -> Option<BackwardNumericConstrainer> {
-        if self.numsign_dots.is_none() {
-            None
-        } else {
-            Some(BackwardNumericConstrainer {
-                numsign_dots: self.numsign_dots,
-                nonumsign_dots: self.nonumsign_dots,
-                digit_cells: self.digit_cells,
                 letter_cells: self.letter_cells,
             })
         }
@@ -882,56 +682,8 @@ mod tests {
             .collect()
     }
 
-    fn prefer_digit(c: &PositionConstraints) -> Vec<bool> {
-        c.0.iter()
-            .map(|f| f.contains(Constraint::PreferDigit))
-            .collect()
-    }
-
     fn backward_caps_constrainers(builder: BackwardCapsConstrainerBuilder) -> Constrainers {
         Constrainers::new(vec![Constrainer::BackwardCaps(builder.build().unwrap())])
-    }
-
-    fn backward_numeric_constrainers(builder: BackwardNumericConstrainerBuilder) -> Constrainers {
-        Constrainers::new(vec![Constrainer::BackwardNumeric(builder.build().unwrap())])
-    }
-
-    fn no_contract(c: &PositionConstraints) -> Vec<bool> {
-        c.0.iter()
-            .map(|f| f.contains(Constraint::NoContract))
-            .collect()
-    }
-
-    fn backward_nocontract_constrainers(
-        builder: BackwardNoContractConstrainerBuilder,
-    ) -> Constrainers {
-        Constrainers::new(vec![Constrainer::BackwardNoContract(
-            builder.build().unwrap(),
-        )])
-    }
-
-    #[test]
-    fn letsign_marks_letters_until_non_letter_cell() {
-        let mut builder = BackwardNoContractConstrainerBuilder::new();
-        builder.indicator("L");
-        builder.letter_cells(HashSet::from(['a', 'b', 'c']));
-        let c = backward_nocontract_constrainers(builder).precompute("Lab cLc", &[]);
-        assert_eq!(
-            no_contract(&c),
-            vec![false, true, true, false, false, false, true]
-        );
-    }
-
-    #[test]
-    fn longest_indicator_wins() {
-        // `nonumsign 56` and `nocontractsign 56-56` in one table: the two-cell
-        // indicator must not be read as the one-cell one followed by a letter cell.
-        let mut builder = BackwardNoContractConstrainerBuilder::new();
-        builder.indicator("N");
-        builder.indicator("NN");
-        builder.letter_cells(HashSet::from(['a', 'N']));
-        let c = backward_nocontract_constrainers(builder).precompute("NNa", &[]);
-        assert_eq!(no_contract(&c), vec![false, false, true]);
     }
 
     #[test]
@@ -972,38 +724,5 @@ mod tests {
         let c = backward_caps_constrainers(builder).precompute("CCab ", &[]);
         assert_eq!(uppercase(&c), vec![false, false, true, true, false]);
         assert_eq!(titlecase(&c), vec![false, false, false, false, false]);
-    }
-
-    #[test]
-    fn numsign_marks_digit_cells_until_non_digit() {
-        let mut builder = BackwardNumericConstrainerBuilder::new();
-        builder.numsign("N");
-        builder.digit_cells(HashSet::from(['1', '2']));
-        let c = backward_numeric_constrainers(builder).precompute("N12a1", &[]);
-        assert_eq!(prefer_digit(&c), vec![false, true, true, false, false]);
-    }
-
-    #[test]
-    fn nonumsign_ends_the_run_explicitly() {
-        let mut builder = BackwardNumericConstrainerBuilder::new();
-        builder.numsign("N");
-        builder.nonumsign("X");
-        builder.digit_cells(HashSet::from(['1', '2']));
-        let c = backward_numeric_constrainers(builder).precompute("N1X2", &[]);
-        assert_eq!(prefer_digit(&c), vec![false, true, false, false]);
-    }
-
-    #[test]
-    fn numsign_ignored_when_preceded_by_a_letter_cell() {
-        // Regression: Punjabi shares the common numsign dots ("N" here) with the
-        // unrelated, frequently-occurring Gurmukhi letter "ਣ" (disambiguated in
-        // liblouis by word position). A mid-word occurrence must not start a numeric
-        // run and corrupt the digit-cell-colliding letters that follow it.
-        let mut builder = BackwardNumericConstrainerBuilder::new();
-        builder.numsign("N");
-        builder.digit_cells(HashSet::from(['1', '2']));
-        builder.letter_cells(HashSet::from(['x']));
-        let c = backward_numeric_constrainers(builder).precompute("xN12", &[]);
-        assert_eq!(prefer_digit(&c), vec![false, false, false, false]);
     }
 }
