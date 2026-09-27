@@ -40,7 +40,7 @@ pub enum TranslationError {
     SwapClassNotDefined(String),
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct CharacterDefinition(HashMap<char, String>);
 
 impl CharacterDefinition {

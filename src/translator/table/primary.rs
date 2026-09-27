@@ -218,7 +218,8 @@ impl PrimaryTableBuilder {
             postpunc_trie: Trie::new().with_context(trie_ctx.clone()),
             nocross_trie: Trie::new().with_context(trie_ctx),
             match_patterns: MatchPatternsBuilder::new(),
-            context_patterns: ContextPatternsBuilder::new(),
+            context_patterns: ContextPatternsBuilder::new()
+                .putting_captures(direction == Direction::Forward),
             numeric_indicator: numeric::IndicatorBuilder::new(),
             uppercase_indicator: uppercase::IndicatorBuilder::new(),
             mode_indicator: mode::IndicatorBuilder::new(),
@@ -3573,6 +3574,20 @@ mod tests {
             PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
                 .unwrap();
         assert_eq!(table.translate("0i"), "⠁⠠⠠⠊");
+    }
+
+    #[test]
+    fn context_copy_outputs_character_definitions() {
+        let rules = [
+            parse_rule("lowercase α 1"),
+            parse_rule("attribute greek α"),
+            parse_rule("context %greek @56*"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("α"), "⠰⠁");
     }
 
     #[test]

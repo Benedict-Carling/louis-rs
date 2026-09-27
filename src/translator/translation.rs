@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::{
     parser::{AnchoredRule, Precedence, Rule},
-    translator::{effect::Effect, regexp::CharacterRange, swap::Swapper},
+    translator::{CharacterDefinition, effect::Effect, regexp::CharacterRange, swap::Swapper},
 };
 
 /// A translation can have multiple stages.
@@ -54,6 +55,9 @@ pub enum TranslationTarget {
     Capture,
     /// Translate to the result of a capture but also apply the mapping defined in the [`Swapper`]
     Swap(Swapper),
+    /// Translate to the characters of a capture, each by its character definition (liblouis's
+    /// `putCharacter`), as a `context` rule's copy does
+    Put(Arc<CharacterDefinition>),
 }
 
 impl std::fmt::Display for TranslationTarget {
@@ -74,6 +78,17 @@ impl TranslationTarget {
             TranslationTarget::Literal(_) => self,
             TranslationTarget::Capture => TranslationTarget::Literal(captured.to_string()),
             TranslationTarget::Swap(swapper) => TranslationTarget::Literal(swapper.swap(captured)),
+            TranslationTarget::Put(definitions) => TranslationTarget::Literal(
+                captured
+                    .chars()
+                    .map(|c| {
+                        definitions
+                            .get(&c)
+                            .cloned()
+                            .unwrap_or_else(|| c.to_string())
+                    })
+                    .collect(),
+            ),
         }
     }
 }
@@ -121,6 +136,17 @@ impl UnresolvedTranslation {
             stage,
             effects: effects.to_vec(),
             origin: origin.into(),
+        }
+    }
+}
+
+impl UnresolvedTranslation {
+    /// Output each captured character by its character definition instead of verbatim
+    pub fn put_captures(&mut self, definitions: &Arc<CharacterDefinition>) {
+        for target in &mut self.output {
+            if *target == TranslationTarget::Capture {
+                *target = TranslationTarget::Put(definitions.clone());
+            }
         }
     }
 }

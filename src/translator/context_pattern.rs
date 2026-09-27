@@ -1,6 +1,7 @@
 //! Store and find context rules using a simple regexp engine ([`Regexp`](crate::translator::regexp))
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::parser::multipass::test::Operator;
 use crate::parser::{Action, ActionInstruction, HasPrecedence, Quantifier, Test, TestInstruction};
@@ -13,7 +14,9 @@ use crate::translator::table::TableContext;
 use crate::translator::translation::{
     Translation, TranslationTarget, TranslationTargets, UnresolvedTranslation,
 };
-use crate::translator::{ResolvedTranslation, TranslationError, TranslationStage};
+use crate::translator::{
+    CharacterDefinition, ResolvedTranslation, TranslationError, TranslationStage,
+};
 
 impl Regexp {
     fn from_test(test: &Test, whole_match: bool, ctx: &CharacterClasses) -> Self {
@@ -203,12 +206,25 @@ impl Effects {
 #[derive(Debug)]
 pub struct ContextPatternsBuilder {
     regexps: Vec<CompiledRegexp>,
+    put_captures: bool,
+    definitions: Option<Arc<CharacterDefinition>>,
 }
 
 impl ContextPatternsBuilder {
     pub fn new() -> Self {
         Self {
             regexps: Vec::new(),
+            put_captures: false,
+            definitions: None,
+        }
+    }
+
+    /// Whether a copy in the action outputs the characters by their definitions, as a
+    /// forward `context` rule's does in liblouis
+    pub fn putting_captures(self, put_captures: bool) -> Self {
+        Self {
+            put_captures,
+            ..self
         }
     }
 
@@ -239,8 +255,14 @@ impl ContextPatternsBuilder {
         stage: TranslationStage,
         ctx: &TableContext,
     ) -> Result<(), TranslationError> {
-        let translation =
-            Translation::Unresolved(self.translation(action, origin, stage, ctx.swap_classes())?);
+        let mut translation = self.translation(action, origin, stage, ctx.swap_classes())?;
+        if self.put_captures {
+            let definitions = self
+                .definitions
+                .get_or_insert_with(|| Arc::new(ctx.character_definitions().clone()));
+            translation.put_captures(definitions);
+        }
+        let translation = Translation::Unresolved(translation);
         let test = test.clone().add_implicit_replace();
         // for the multipass stages where we translate from braille to braille the character classes
         // need to be the dots_classes
