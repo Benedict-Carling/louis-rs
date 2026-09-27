@@ -61,6 +61,9 @@ pub enum Transition {
     /// Non-consuming lookahead: the character immediately after the match must be in one of
     /// these classes. Inserted at the end of the path (after character transitions).
     End(Vec<CharacterClass>),
+    /// Non-consuming lookahead: the character immediately after the match must not be in
+    /// any of these classes. A missing neighbor counts as a space.
+    NotEnd(Vec<CharacterClass>),
     /// Non-consuming lookahead on the whole rest of the word: whether the position right
     /// after the match ends the word (liblouis's backward `isEndWord`). Evaluated against the
     /// word ends passed to [`Trie::find_translations_with_word_ends`].
@@ -74,6 +77,7 @@ enum ResolvedTransition {
     Character(char),
     Start(ResolvedClasses),
     End(ResolvedClasses),
+    NotEnd(ResolvedClasses),
     EndWord(bool),
 }
 
@@ -174,6 +178,9 @@ impl Trie {
             }
             Transition::End(classes) => {
                 ResolvedTransition::End(ResolvedClasses::resolve(&self.ctx, &classes))
+            }
+            Transition::NotEnd(classes) => {
+                ResolvedTransition::NotEnd(ResolvedClasses::resolve(&self.ctx, &classes))
             }
             Transition::EndWord(end) => ResolvedTransition::EndWord(end),
         }
@@ -346,6 +353,7 @@ impl Trie {
             let matches = match transition {
                 ResolvedTransition::Start(resolved) => resolved.matches(prev),
                 ResolvedTransition::End(resolved) => resolved.matches(c),
+                ResolvedTransition::NotEnd(resolved) => !resolved.matches(c),
                 ResolvedTransition::EndWord(end) => {
                     word_ends.get(offset).copied().unwrap_or(true) == *end
                 }

@@ -1386,13 +1386,24 @@ impl PrimaryTable {
                         rule,
                     );
                 }
-                Rule::Joinword { chars, dots, .. } | Rule::Lowword { chars, dots, .. } => {
+                Rule::Lowword { chars, dots, .. } => builder.get_trie_mut(rule).insert(
+                    chars,
+                    &dots.to_string(),
+                    Some(Transition::Start(vec![CharacterClass::Space])),
+                    Some(Transition::End(vec![CharacterClass::Space])),
+                    direction,
+                    rule.precedence(),
+                    vec![],
+                    TranslationStage::Main,
+                    rule,
+                ),
+                Rule::Joinword { chars, dots, .. } => {
                     builder.get_trie_mut(rule).insert(
                         chars,
                         &dots.to_string(),
-                        // FIXME: joinword, lowword, prepunc and postpunc need more
-                        // advanced scaning of the input. Just checking for before and
-                        // after classes as below is too simplistic
+                        // FIXME: joinword, prepunc and postpunc need more advanced
+                        // scaning of the input. Just checking for before and after
+                        // classes as below is too simplistic
                         Some(Transition::Start(vec![
                             CharacterClass::Space,
                             CharacterClass::Punctuation,
@@ -1445,7 +1456,8 @@ impl PrimaryTable {
                         chars,
                         &dots,
                         Some(Transition::Start(vec![CharacterClass::Digit])),
-                        None,
+                        // liblouis ends a number backward only before a non-digit cell
+                        backward.then(|| Transition::NotEnd(vec![CharacterClass::Litdigit])),
                         direction,
                         rule.precedence(),
                         vec![],
@@ -2426,6 +2438,26 @@ mod tests {
     }
 
     #[test]
+    fn lowword_needs_space_on_both_sides() {
+        let rules = [
+            parse_rule("lowercase t 2345"),
+            parse_rule("lowercase e 15"),
+            parse_rule("punctuation . 256"),
+            parse_rule("space \\s 0"),
+            parse_rule("lowword te 235"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let forward =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(forward.translate("te"), "⠖");
+        assert_eq!(forward.translate(" te "), "⠀⠖⠀");
+        assert_eq!(forward.translate("te."), "⠞⠑⠲");
+        let backward = backward_table(&rules);
+        assert_eq!(backward.translate("⠖"), "te");
+    }
+
+    #[test]
     fn base() {
         let rules = [
             parse_rule("lowercase a 1"),
@@ -2939,6 +2971,21 @@ mod tests {
         ]);
         assert_eq!(table.translate("⠰⠃⠤⠃"), "b-b");
         assert_eq!(table.translate("⠰⠃⠀⠃"), "b but");
+    }
+
+    #[test]
+    fn backward_endnum_only_before_a_non_digit() {
+        let table = backward_table(&[
+            parse_rule("numsign 3456"),
+            parse_rule("digit 1 1"),
+            parse_rule("litdigit 1 1"),
+            parse_rule("lowercase h 125"),
+            parse_rule("punctuation - 36"),
+            parse_rule("punctuation \\x2014 36-36"),
+            parse_rule("endnum \\x2013 36-36"),
+        ]);
+        assert_eq!(table.translate("⠼⠁⠤⠤⠓"), "1–h");
+        assert_eq!(table.translate("⠼⠁⠤⠤⠁"), "1—1");
     }
 
     #[test]
