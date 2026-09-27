@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use crate::parser::multipass::test::{Operator, split_trailing_lookback};
+use crate::parser::multipass::test::{Operator, split_leading_lookback, split_trailing_lookback};
 use crate::parser::{Action, ActionInstruction, HasPrecedence, Quantifier, Test, TestInstruction};
 
 use crate::parser::{AnchoredRule, Attribute, CharacterClass, CharacterClasses};
@@ -20,18 +20,24 @@ impl Regexp {
         if !whole_match {
             return Regexp::from_instructions(test.tests(), whole_match, ctx);
         }
-        // `*` advances to where the test ends, so a trailing `_N` leaves the last N
-        // characters checked but not consumed
-        let (consumed, checked) = split_trailing_lookback(test.tests());
-        let regexp = Regexp::Consume(Box::new(Regexp::from_instructions(consumed, true, ctx)));
-        if checked.is_empty() {
-            regexp
-        } else {
-            Regexp::Concat(
+        // `*` consumes from the rule's position to where the test ends, so the characters a
+        // leading or trailing `_N` steps back over are checked but not consumed
+        let (before, rest) = split_leading_lookback(test.tests());
+        let (consumed, after) = split_trailing_lookback(rest);
+        let mut regexp = Regexp::Consume(Box::new(Regexp::from_instructions(consumed, true, ctx)));
+        if !before.is_empty() {
+            regexp = Regexp::Concat(
+                Box::new(Regexp::from_instructions(before, true, ctx)),
                 Box::new(regexp),
-                Box::new(Regexp::from_instructions(checked, true, ctx)),
-            )
+            );
         }
+        if !after.is_empty() {
+            regexp = Regexp::Concat(
+                Box::new(regexp),
+                Box::new(Regexp::from_instructions(after, true, ctx)),
+            );
+        }
+        regexp
     }
 
     fn from_instructions(

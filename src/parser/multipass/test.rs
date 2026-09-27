@@ -74,17 +74,19 @@ impl Test {
             .any(|t| matches!(t, TestInstruction::Replace { .. }))
     }
 
-    /// Without `[` and `]` liblouis replaces all the test matched, up to where it ends
+    /// Without `[` and `]` liblouis replaces from the rule's position to where the test ends
     pub fn add_implicit_replace(self) -> Self {
         if self.has_replace() {
             return self;
         }
-        let (replaced, checked) = split_trailing_lookback(&self.tests);
-        let mut tests = vec![TestInstruction::Replace {
+        let (before, rest) = split_leading_lookback(&self.tests);
+        let (replaced, after) = split_trailing_lookback(rest);
+        let mut tests = before.to_vec();
+        tests.push(TestInstruction::Replace {
             tests: replaced.to_vec(),
-        }];
-        if !checked.is_empty() {
-            tests.extend_from_slice(checked);
+        });
+        if !after.is_empty() {
+            tests.extend_from_slice(after);
             tests.extend(self.tests.last().cloned());
         }
         Self { tests }
@@ -133,6 +135,30 @@ pub fn split_trailing_lookback(
         }
     }
     (tests, &[])
+}
+
+/// Split `tests` starting with `_N` into that and the tests checking the N characters before
+/// the rule's position, and the rest
+pub fn split_leading_lookback(
+    tests: &[TestInstruction],
+) -> (&[TestInstruction], &[TestInstruction]) {
+    let Some((TestInstruction::Lookback { len }, rest)) = tests.split_first() else {
+        return (&[], tests);
+    };
+    let mut width = 0;
+    for (end, test) in rest.iter().enumerate() {
+        match fixed_width(test) {
+            Some(w) => width += w,
+            None => break,
+        }
+        if width == *len as usize {
+            return tests.split_at(end + 2);
+        }
+        if width > *len as usize {
+            break;
+        }
+    }
+    (&[], tests)
 }
 
 impl IsLiteral for Test {
@@ -725,6 +751,27 @@ mod tests {
                     test: Box::new(TestInstruction::String { s: "c".into() })
                 },
                 TestInstruction::Lookback { len: 1 },
+            ])
+        );
+    }
+
+    #[test]
+    fn implicit_replace_starts_after_leading_lookback() {
+        let test = |test: &str| Parser::new(test).tests().unwrap();
+        assert_eq!(
+            test(r#"_$l"c"~"#).add_implicit_replace(),
+            Test::new(vec![
+                TestInstruction::Lookback { len: 1 },
+                TestInstruction::Attributes {
+                    attrs: HashSet::from([Attribute::Class(CharacterClass::Letter)]),
+                    quantifier: None,
+                },
+                TestInstruction::Replace {
+                    tests: vec![
+                        TestInstruction::String { s: "c".into() },
+                        TestInstruction::AtEnd
+                    ]
+                },
             ])
         );
     }
