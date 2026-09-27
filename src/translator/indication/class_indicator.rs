@@ -68,6 +68,7 @@ struct Word {
 #[derive(Debug, Clone)]
 pub(super) struct ClassIndicator {
     active_chars: HashSet<char>,
+    emphasizable_chars: Option<HashSet<char>>,
     letter_chars: HashSet<char>,
     mode_chars: HashSet<char>,
     character_classes: CharacterClasses,
@@ -89,6 +90,7 @@ impl ClassIndicator {
     pub(super) fn new() -> Self {
         ClassIndicator {
             active_chars: HashSet::default(),
+            emphasizable_chars: None,
             letter_chars: HashSet::default(),
             mode_chars: HashSet::default(),
             character_classes: CharacterClasses::default(),
@@ -158,6 +160,11 @@ impl ClassIndicator {
 
     /// Characters transparent to word-boundary detection (`capsmodechars` for uppercase; no
     /// generic opcode sets this for any other mode).
+    /// The characters the mode can be indicated on, if not every letter
+    pub(super) fn emphasizable_characters(&mut self, chars: HashSet<char>) {
+        self.emphasizable_chars = Some(chars);
+    }
+
     pub(super) fn mode_characters(&mut self, chars: HashSet<char>) {
         self.mode_chars = chars;
     }
@@ -176,6 +183,13 @@ impl ClassIndicator {
 
     fn is_active(&self, c: char) -> bool {
         self.active_chars.contains(&c)
+    }
+
+    /// Whether the mode is indicated on `c` at all: liblouis' `isEmphasizable`
+    fn is_emphasizable(&self, c: char) -> bool {
+        self.emphasizable_chars
+            .as_ref()
+            .is_none_or(|chars| chars.contains(&c))
     }
 
     fn is_word_char(&self, c: char) -> bool {
@@ -198,7 +212,7 @@ impl ClassIndicator {
         let mut last_letter = None;
         let mut active_count = 0;
         for (i, &c) in chars.iter().enumerate().take(end).skip(start) {
-            if self.is_letter(c) {
+            if self.is_letter(c) && self.is_emphasizable(c) {
                 active_count += usize::from(self.is_active(c));
                 first_letter.get_or_insert(i);
                 last_letter = Some(i);
@@ -236,7 +250,7 @@ impl ClassIndicator {
                     if j >= end {
                         break;
                     }
-                    if self.is_letter(chars[j]) {
+                    if self.is_letter(chars[j]) && self.is_emphasizable(chars[j]) {
                         if self.is_active(chars[j]) {
                             close = j + 1;
                             active_count += 1;
@@ -253,7 +267,7 @@ impl ClassIndicator {
                 let mut close_trigger = close;
                 let mut k = close;
                 while k < end {
-                    if self.is_letter(chars[k]) {
+                    if self.is_letter(chars[k]) && self.is_emphasizable(chars[k]) {
                         needs_close = true;
                         close_trigger = k;
                         break;

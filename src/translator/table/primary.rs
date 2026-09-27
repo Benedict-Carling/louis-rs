@@ -1459,6 +1459,15 @@ impl PrimaryTable {
                 .get(&CharacterClass::Letter)
                 .unwrap_or_default(),
         );
+        let cased = [CharacterClass::Uppercase, CharacterClass::Lowercase]
+            .iter()
+            .flat_map(|class| ctx.character_classes().get(class).unwrap_or_default())
+            .chain(rules.iter().filter_map(|rule| match &rule.rule {
+                Rule::Base { name, base, .. } if name == "uppercase" => Some(*base),
+                _ => None,
+            }))
+            .collect();
+        builder.uppercase_indicator.cased_characters(cased);
         builder.hyphenation_constrainer.letter_characters(
             ctx.character_classes()
                 .get(&CharacterClass::Letter)
