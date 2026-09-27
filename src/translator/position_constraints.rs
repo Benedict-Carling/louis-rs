@@ -41,12 +41,6 @@ pub enum Constraint {
     /// character (e.g. the Hungarian `sz` digraph), only the first is capitalized
     /// (`Sz`, not `SZ`), matching liblouis.
     TitleCase,
-    /// Prefer a digit reading over a letter reading at this position, in backward
-    /// translation.
-    ///
-    /// Set for every digit cell inside a `numsign`/`nonumsign` span, disambiguating
-    /// dots shared between a digit and a letter (common in six-dot literary codes).
-    PreferDigit,
     /// There's a valid hyphenation break between this character and the next, in
     /// forward translation.
     ///
@@ -54,12 +48,6 @@ pub enum Constraint {
     /// class) that the word's hyphenation dictionary marks as a valid break point.
     /// Consulted to decide whether a `nocross` rule may cross this gap.
     HyphenationBreak,
-    /// The word does not end right before this position, in backward translation.
-    ///
-    /// liblouis's `isEndWord`: scanning on from here, a letter cell comes before any space
-    /// cell, or a cell carrying a multi-character contraction does (see
-    /// [`BackwardWordEndConstrainer`]).
-    NotEndWord,
     /// A `prepunc` rule may fire on the punctuation character at this position, in
     /// forward translation.
     PrepuncOk,
@@ -84,14 +72,6 @@ impl PositionConstraints {
             .is_some_and(|f| f.contains(Constraint::DontContract))
     }
 
-    /// Whether the word ends right before `pos`; true at and past the end of input.
-    pub fn end_word_at(&self, pos: usize) -> bool {
-        !self
-            .0
-            .get(pos)
-            .is_some_and(|f| f.contains(Constraint::NotEndWord))
-    }
-
     pub fn use_comp6_at(&self, pos: usize) -> bool {
         self.0
             .get(pos)
@@ -108,12 +88,6 @@ impl PositionConstraints {
         self.0
             .get(pos)
             .is_some_and(|f| f.contains(Constraint::TitleCase))
-    }
-
-    pub fn prefer_digit_at(&self, pos: usize) -> bool {
-        self.0
-            .get(pos)
-            .is_some_and(|f| f.contains(Constraint::PreferDigit))
     }
 
     pub fn hyphenation_break_at(&self, pos: usize) -> bool {
@@ -377,102 +351,6 @@ impl BackwardCapsConstrainer {
     }
 }
 
-/// Detects `numsign`/`nonumsign` indicator dots in backward input and sets
-/// [`Constraint::PreferDigit`] at every digit cell of the numeric run, disambiguating
-/// dots shared between a digit and a letter.
-///
-/// `numsign`'s dots are not necessarily exclusive to the indicator: some tables (e.g.
-/// Punjabi, which shares the common `3456` numsign convention with the unrelated
-/// Gurmukhi letter `ਣ`, disambiguated in liblouis via a `midendword` position
-/// constraint) also use them for an ordinary, frequently-occurring letter. A genuine
-/// numsign is never preceded by a letter cell — mid-word occurrences are excluded to
-/// avoid false positives on such tables.
-#[derive(Debug, Clone)]
-pub struct BackwardNumericConstrainer {
-    numsign_dots: Option<String>,
-    nonumsign_dots: Option<String>,
-    digit_cells: HashSet<char>,
-    letter_cells: HashSet<char>,
-}
-
-impl BackwardNumericConstrainer {
-    fn compute(&self, input: &str) -> Vec<Constraints> {
-        let chars: Vec<char> = input.chars().collect();
-        let n = chars.len();
-        let mut constraints: Vec<Constraints> = vec![Constraints::empty(); n];
-        let mut pos = 0;
-        let mut in_number = false;
-        while pos < n {
-            if let Some(dots) = &self.numsign_dots
-                && matches_at(&chars, pos, dots)
-                && (pos == 0 || !self.letter_cells.contains(&chars[pos - 1]))
-            {
-                pos += dots.chars().count();
-                in_number = true;
-                continue;
-            }
-            if in_number {
-                if let Some(dots) = &self.nonumsign_dots
-                    && matches_at(&chars, pos, dots)
-                {
-                    pos += dots.chars().count();
-                    in_number = false;
-                    continue;
-                }
-                if self.digit_cells.contains(&chars[pos]) {
-                    constraints[pos].insert(Constraint::PreferDigit);
-                    pos += 1;
-                    continue;
-                }
-                in_number = false;
-            }
-            pos += 1;
-        }
-        constraints
-    }
-}
-
-/// Sets [`Constraint::NotEndWord`] where liblouis's backward `isEndWord` would say the
-/// word goes on. The cells are classified by what the table defines for them on their own,
-/// as liblouis classifies them by the rules attached to a single cell.
-#[derive(Debug, Clone, Default)]
-pub struct BackwardWordEndConstrainer {
-    /// Cells defined as a letter.
-    pub letter_cells: HashSet<char>,
-    /// Cells defined as a space.
-    pub space_cells: HashSet<char>,
-    /// Cells a multi-character backward rule other than `begword`/`midword` translates on
-    /// their own.
-    pub contraction_cells: HashSet<char>,
-    /// Cells of a `postpunc` rule, which do not count as a contraction.
-    pub postpunc_cells: HashSet<char>,
-    /// Cells of a `hyphen` rule, which always end the word.
-    pub hyphen_cells: HashSet<char>,
-}
-
-impl BackwardWordEndConstrainer {
-    fn compute(&self, input: &str) -> Vec<Constraints> {
-        let chars: Vec<char> = input.chars().collect();
-        let mut constraints: Vec<Constraints> = vec![Constraints::empty(); chars.len()];
-        let mut end_word = true;
-        for (pos, c) in chars.iter().enumerate().rev() {
-            if self.space_cells.contains(c) {
-                end_word = true;
-            } else if self.letter_cells.contains(c) {
-                end_word = false;
-            } else if self.hyphen_cells.contains(c) {
-                end_word = true;
-            } else if self.contraction_cells.contains(c) && !self.postpunc_cells.contains(c) {
-                end_word = false;
-            }
-            if !end_word {
-                constraints[pos].insert(Constraint::NotEndWord);
-            }
-        }
-        constraints
-    }
-}
-
 /// A single analysis pass that contributes to [`PositionConstraints`].
 #[derive(Debug, Clone)]
 pub enum Constrainer {
@@ -483,10 +361,6 @@ pub enum Constrainer {
     /// Detects backward `capsletter`/`begcapsword`/`endcapsword` dots and sets
     /// [`Constraint::Uppercase`].
     BackwardCaps(BackwardCapsConstrainer),
-    /// Detects backward `numsign`/`nonumsign` dots and sets [`Constraint::PreferDigit`].
-    BackwardNumeric(BackwardNumericConstrainer),
-    /// Sets [`Constraint::NotEndWord`] where a word goes on, in backward translation.
-    BackwardWordEnd(BackwardWordEndConstrainer),
     /// Detects hyphenation-dictionary breaks and sets [`Constraint::HyphenationBreak`].
     Hyphenation(HyphenationConstrainer),
     /// Detects `prepunc`/`postpunc` scan eligibility and sets
@@ -500,8 +374,6 @@ impl Constrainer {
             Constrainer::Numeric(c) => c.compute(input),
             Constrainer::ComputerBraille(c) => c.compute(input, spans),
             Constrainer::BackwardCaps(c) => c.compute(input),
-            Constrainer::BackwardWordEnd(c) => c.compute(input),
-            Constrainer::BackwardNumeric(c) => c.compute(input),
             Constrainer::Hyphenation(c) => c.compute(input),
             Constrainer::Punctuation(c) => c.compute(input),
         }
@@ -631,50 +503,6 @@ impl BackwardCapsConstrainerBuilder {
                 capsletter_dots: self.capsletter_dots,
                 begcapsword_dots: self.begcapsword_dots,
                 endcapsword_dots: self.endcapsword_dots,
-                letter_cells: self.letter_cells,
-            })
-        }
-    }
-}
-
-/// A builder for [`Constrainer::BackwardNumeric`].
-#[derive(Debug, Default)]
-pub struct BackwardNumericConstrainerBuilder {
-    numsign_dots: Option<String>,
-    nonumsign_dots: Option<String>,
-    digit_cells: HashSet<char>,
-    letter_cells: HashSet<char>,
-}
-
-impl BackwardNumericConstrainerBuilder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn numsign(&mut self, dots: &str) {
-        self.numsign_dots = Some(dots.to_string());
-    }
-
-    pub fn nonumsign(&mut self, dots: &str) {
-        self.nonumsign_dots = Some(dots.to_string());
-    }
-
-    pub fn digit_cells(&mut self, cells: HashSet<char>) {
-        self.digit_cells = cells;
-    }
-
-    pub fn letter_cells(&mut self, cells: HashSet<char>) {
-        self.letter_cells = cells;
-    }
-
-    pub fn build(self) -> Option<BackwardNumericConstrainer> {
-        if self.numsign_dots.is_none() {
-            None
-        } else {
-            Some(BackwardNumericConstrainer {
-                numsign_dots: self.numsign_dots,
-                nonumsign_dots: self.nonumsign_dots,
-                digit_cells: self.digit_cells,
                 letter_cells: self.letter_cells,
             })
         }
@@ -854,18 +682,8 @@ mod tests {
             .collect()
     }
 
-    fn prefer_digit(c: &PositionConstraints) -> Vec<bool> {
-        c.0.iter()
-            .map(|f| f.contains(Constraint::PreferDigit))
-            .collect()
-    }
-
     fn backward_caps_constrainers(builder: BackwardCapsConstrainerBuilder) -> Constrainers {
         Constrainers::new(vec![Constrainer::BackwardCaps(builder.build().unwrap())])
-    }
-
-    fn backward_numeric_constrainers(builder: BackwardNumericConstrainerBuilder) -> Constrainers {
-        Constrainers::new(vec![Constrainer::BackwardNumeric(builder.build().unwrap())])
     }
 
     #[test]
@@ -906,59 +724,5 @@ mod tests {
         let c = backward_caps_constrainers(builder).precompute("CCab ", &[]);
         assert_eq!(uppercase(&c), vec![false, false, true, true, false]);
         assert_eq!(titlecase(&c), vec![false, false, false, false, false]);
-    }
-
-    #[test]
-    fn numsign_marks_digit_cells_until_non_digit() {
-        let mut builder = BackwardNumericConstrainerBuilder::new();
-        builder.numsign("N");
-        builder.digit_cells(HashSet::from(['1', '2']));
-        let c = backward_numeric_constrainers(builder).precompute("N12a1", &[]);
-        assert_eq!(prefer_digit(&c), vec![false, true, true, false, false]);
-    }
-
-    #[test]
-    fn nonumsign_ends_the_run_explicitly() {
-        let mut builder = BackwardNumericConstrainerBuilder::new();
-        builder.numsign("N");
-        builder.nonumsign("X");
-        builder.digit_cells(HashSet::from(['1', '2']));
-        let c = backward_numeric_constrainers(builder).precompute("N1X2", &[]);
-        assert_eq!(prefer_digit(&c), vec![false, true, false, false]);
-    }
-
-    #[test]
-    fn numsign_ignored_when_preceded_by_a_letter_cell() {
-        // Regression: Punjabi shares the common numsign dots ("N" here) with the
-        // unrelated, frequently-occurring Gurmukhi letter "ਣ" (disambiguated in
-        // liblouis by word position). A mid-word occurrence must not start a numeric
-        // run and corrupt the digit-cell-colliding letters that follow it.
-        let mut builder = BackwardNumericConstrainerBuilder::new();
-        builder.numsign("N");
-        builder.digit_cells(HashSet::from(['1', '2']));
-        builder.letter_cells(HashSet::from(['x']));
-        let c = backward_numeric_constrainers(builder).precompute("xN12", &[]);
-        assert_eq!(prefer_digit(&c), vec![false, false, false, false]);
-    }
-
-    #[test]
-    fn word_end_scans_to_the_next_letter_or_space() {
-        let constrainer = BackwardWordEndConstrainer {
-            letter_cells: HashSet::from(['a']),
-            space_cells: HashSet::from([' ']),
-            contraction_cells: HashSet::from(['c', 'p']),
-            postpunc_cells: HashSet::from(['p']),
-            hyphen_cells: HashSet::from(['-']),
-        };
-        let c = Constrainers::new(vec![Constrainer::BackwardWordEnd(constrainer)])
-            .precompute("a,a a, c p, -a", &[]);
-        let ends: Vec<bool> = (0..=14).map(|pos| c.end_word_at(pos)).collect();
-        assert_eq!(
-            ends,
-            vec![
-                false, false, false, true, false, true, true, false, true, true, true, true, true,
-                false, true
-            ]
-        );
     }
 }

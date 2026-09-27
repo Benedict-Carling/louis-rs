@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use crate::{
     parser::{AnchoredRule, Precedence, Rule},
     translator::{effect::Effect, regexp::CharacterRange, swap::Swapper},
@@ -219,6 +221,8 @@ pub struct TranslationSubset {
     output: String,
     length: usize,
     weight: usize,
+    /// Where the originating rule is defined, so that two rules translating alike stay apart.
+    source: Option<(Option<PathBuf>, usize)>,
 }
 
 impl From<&ResolvedTranslation> for TranslationSubset {
@@ -228,6 +232,10 @@ impl From<&ResolvedTranslation> for TranslationSubset {
             output: translation.output(),
             length: translation.length(),
             weight: translation.weight(),
+            source: translation
+                .origin
+                .as_ref()
+                .map(|rule| (rule.path().map(Path::to_path_buf), rule.line())),
         }
     }
 }
@@ -351,6 +359,23 @@ impl ResolvedTranslation {
 mod tests {
     use super::*;
     use crate::translator::swap::Swapper;
+
+    #[test]
+    fn subset_tells_rules_apart() {
+        let rule = crate::parser::RuleParser::new("always a 1").rule().unwrap();
+        let first = AnchoredRule::new(rule.clone(), None, 1);
+        let second = AnchoredRule::new(rule, None, 2);
+        let translation =
+            |origin| ResolvedTranslation::new("", "x", 1, TranslationStage::Main, origin);
+        assert_eq!(
+            TranslationSubset::from(&translation(first.clone())),
+            TranslationSubset::from(&translation(first.clone()))
+        );
+        assert_ne!(
+            TranslationSubset::from(&translation(first)),
+            TranslationSubset::from(&translation(second))
+        );
+    }
 
     #[test]
     fn resolve_literal() {

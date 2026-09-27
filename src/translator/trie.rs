@@ -61,15 +61,6 @@ pub enum Transition {
     /// Non-consuming lookahead: the character immediately after the match must be in one of
     /// these classes. Inserted at the end of the path (after character transitions).
     End(Vec<CharacterClass>),
-    /// Non-consuming lookahead: the character immediately after the match must not be in
-    /// any of these classes. A missing neighbor counts as a space.
-    NotEnd(Vec<CharacterClass>),
-    /// Non-consuming lookahead on the whole rest of the word: whether the position right
-    /// after the match ends the word (liblouis's backward `isEndWord`). Evaluated against the
-    /// word ends passed to [`Trie::find_translations_with_word_ends`].
-    EndWord(bool),
-    /// The wrapped check, without the weight a check normally adds to a rule.
-    Unweighted(Box<Transition>),
 }
 
 /// The resolved, trie-internal counterpart of [`Transition`] plus the character transitions
@@ -79,8 +70,6 @@ enum ResolvedTransition {
     Character(char),
     Start(ResolvedClasses),
     End(ResolvedClasses),
-    NotEnd(ResolvedClasses),
-    EndWord(bool),
 }
 
 /// A class-based constraint attached to a rule via the liblouis `before`/`after` keywords.
@@ -104,6 +93,8 @@ struct TrieNode {
     // to hash every member of its `ResolvedClasses` (whose own layout is chosen for the same
     // comparison -- see `ResolvedClasses::chars`).
     transitions: BTreeMap<ResolvedTransition, TrieNode>,
+    /// Every translation inserted at this node, in a [`Trie::keep_all`] trie.
+    alternatives: Vec<ResolvedTranslation>,
 }
 
 impl TrieNode {
@@ -130,15 +121,13 @@ pub struct Trie {
     /// `StartClass`/`EndClass` constraint checks. Set to text classes for forward translation,
     /// braille classes for backward.
     ctx: CharacterClasses,
-    /// Character classes for the lookbehind checks (`Transition::Start`,
-    /// `ClassConstraint::Start`) when they differ from `ctx`. Backward translation sets this
-    /// to the text classes, since liblouis classifies the preceding side by the output
-    /// produced so far (`back_setBefore`), not by the preceding braille cell.
-    before_ctx: Option<CharacterClasses>,
     /// When true, character transitions are matched on the exact character instead of
     /// being lowercased first. Needed for `comp6`, where `comp6 a 1` and `comp6 A 17`
     /// are independent rules.
     case_sensitive: bool,
+    /// When true, every translation is kept instead of one per path, and boundary checks
+    /// are left to the caller.
+    keep_all: bool,
 }
 
 impl Trie {
@@ -146,24 +135,22 @@ impl Trie {
         Trie {
             root: TrieNode::default(),
             ctx: CharacterClasses::default(),
-            before_ctx: None,
             case_sensitive: false,
+            keep_all: false,
+        }
+    }
+
+    /// Keep every rule inserted along a path, ignoring its `Transition`s and
+    /// `ClassConstraint`s, so the caller can select among them itself.
+    pub fn keep_all(self) -> Self {
+        Trie {
+            keep_all: true,
+            ..self
         }
     }
 
     pub fn with_context(self, ctx: CharacterClasses) -> Self {
         Trie { ctx, ..self }
-    }
-
-    pub fn with_before_context(self, before_ctx: CharacterClasses) -> Self {
-        Trie {
-            before_ctx: Some(before_ctx),
-            ..self
-        }
-    }
-
-    fn before_ctx(&self) -> &CharacterClasses {
-        self.before_ctx.as_ref().unwrap_or(&self.ctx)
     }
 
     pub fn case_sensitive(self) -> Self {
@@ -175,17 +162,12 @@ impl Trie {
 
     fn resolve_transition(&self, transition: Transition) -> ResolvedTransition {
         match transition {
-            Transition::Unweighted(transition) => self.resolve_transition(*transition),
             Transition::Start(classes) => {
-                ResolvedTransition::Start(ResolvedClasses::resolve(self.before_ctx(), &classes))
+                ResolvedTransition::Start(ResolvedClasses::resolve(&self.ctx, &classes))
             }
             Transition::End(classes) => {
                 ResolvedTransition::End(ResolvedClasses::resolve(&self.ctx, &classes))
             }
-            Transition::NotEnd(classes) => {
-                ResolvedTransition::NotEnd(ResolvedClasses::resolve(&self.ctx, &classes))
-            }
-            Transition::EndWord(end) => ResolvedTransition::EndWord(end),
         }
     }
     pub fn insert_char(
@@ -238,15 +220,34 @@ impl Trie {
             "Cannot insert empty `from` string (or `to` string in case of backward translation) - this causes infinite loops when translating"
         );
 
-        let weighs = |t: &Option<Transition>| {
-            t.as_ref()
-                .is_some_and(|t| !matches!(t, Transition::Unweighted(_)))
-        };
-        let (before_weighs, after_weighs) = (weighs(&before), weighs(&after));
+        if self.keep_all {
+            let mut node = &mut self.root;
+            for c in from.chars() {
+                node = node
+                    .transitions
+                    .entry(ResolvedTransition::Character(c))
+                    .or_default();
+            }
+            if !node
+                .alternatives
+                .iter()
+                .any(|t| t.rule() == Some(&origin.rule))
+            {
+                let length = from.chars().count();
+                node.alternatives.push(ResolvedTranslation::new(
+                    from,
+                    to,
+                    length,
+                    stage,
+                    origin.clone(),
+                ));
+            }
+            return;
+        }
+
         let before = before.map(|t| self.resolve_transition(t));
         let after = after.map(|t| self.resolve_transition(t));
 
-        let before_ctx = self.before_ctx.as_ref().unwrap_or(&self.ctx);
         let mut current_node = &mut self.root;
         let mut length = from.chars().count();
 
@@ -254,7 +255,7 @@ impl Trie {
         for constraint in &class_constraints {
             if let ClassConstraint::Start(class) = constraint {
                 length += 1;
-                let resolved = ResolvedClasses::resolve(before_ctx, &[class.clone()]);
+                let resolved = ResolvedClasses::resolve(&self.ctx, &[class.clone()]);
                 current_node = current_node
                     .transitions
                     .entry(ResolvedTransition::Start(resolved))
@@ -263,9 +264,7 @@ impl Trie {
         }
 
         if let Some(t) = before {
-            if before_weighs {
-                length += 1;
-            }
+            length += 1;
             current_node = current_node.transitions.entry(t).or_default();
         }
 
@@ -277,9 +276,7 @@ impl Trie {
         }
 
         if let Some(t) = after {
-            if after_weighs {
-                length += 1;
-            }
+            length += 1;
             current_node = current_node.transitions.entry(t).or_default();
         }
 
@@ -333,8 +330,6 @@ impl Trie {
         input: &str,
         prev: Option<char>,
         node: &TrieNode,
-        word_ends: &[bool],
-        offset: usize,
     ) -> Vec<ResolvedTranslation> {
         let mut matching_rules = Vec::new();
         let mut chars = input.chars();
@@ -344,6 +339,7 @@ impl Trie {
             let translation = translation.clone();
             matching_rules.push(translation)
         }
+        matching_rules.extend(node.alternatives.iter().cloned());
         let c = chars.next();
         if let Some(c) = c {
             let bytes = c.len_utf8();
@@ -352,8 +348,6 @@ impl Trie {
                     &input[bytes..],
                     Some(c),
                     node,
-                    word_ends,
-                    offset + 1,
                 ));
             }
         }
@@ -362,38 +356,39 @@ impl Trie {
         // already resolved at insert time (see `ResolvedClasses::resolve`), so this is a plain
         // binary search, not a `CharacterClasses` lookup.
         for (transition, child_node) in &node.transitions {
-            let matches = match transition {
-                ResolvedTransition::Start(resolved) => resolved.matches(prev),
-                ResolvedTransition::End(resolved) => resolved.matches(c),
-                ResolvedTransition::NotEnd(resolved) => !resolved.matches(c),
-                ResolvedTransition::EndWord(end) => {
-                    word_ends.get(offset).copied().unwrap_or(true) == *end
+            match transition {
+                ResolvedTransition::Start(resolved) => {
+                    if resolved.matches(prev) {
+                        matching_rules
+                            .extend(self.find_translations_from_node(input, prev, child_node));
+                    }
+                }
+                ResolvedTransition::End(resolved) => {
+                    if resolved.matches(c) {
+                        matching_rules
+                            .extend(self.find_translations_from_node(input, prev, child_node));
+                    }
                 }
                 // Character transitions have been dealt with above, ignore.
-                ResolvedTransition::Character(_) => false,
-            };
-            if matches {
-                matching_rules.extend(
-                    self.find_translations_from_node(input, prev, child_node, word_ends, offset),
-                );
+                ResolvedTransition::Character(_) => {}
             }
         }
         matching_rules
     }
 
-    pub fn find_translations(&self, input: &str, prev: Option<char>) -> Vec<ResolvedTranslation> {
-        self.find_translations_from_node(input, prev, &self.root, &[], 0)
+    /// The translations kept for every single character path, in a [`Trie::keep_all`] trie.
+    pub fn single_char_alternatives(&self) -> impl Iterator<Item = (char, &[ResolvedTranslation])> {
+        self.root
+            .transitions
+            .iter()
+            .filter_map(|(transition, node)| match transition {
+                ResolvedTransition::Character(c) => Some((*c, node.alternatives.as_slice())),
+                _ => None,
+            })
     }
 
-    /// Like [`Self::find_translations`], with `word_ends[i]` telling whether the position `i`
-    /// characters into `input` ends a word, for [`Transition::EndWord`] checks.
-    pub fn find_translations_with_word_ends(
-        &self,
-        input: &str,
-        prev: Option<char>,
-        word_ends: &[bool],
-    ) -> Vec<ResolvedTranslation> {
-        self.find_translations_from_node(input, prev, &self.root, word_ends, 0)
+    pub fn find_translations(&self, input: &str, prev: Option<char>) -> Vec<ResolvedTranslation> {
+        self.find_translations_from_node(input, prev, &self.root)
     }
 }
 
@@ -416,6 +411,34 @@ mod tests {
             trie.find_translations("foo", None),
             Vec::<ResolvedTranslation>::new()
         );
+    }
+
+    #[test]
+    fn keep_all_keeps_every_rule_for_a_path() {
+        let mut trie = Trie::new().keep_all();
+        let letter = AnchoredRule::new(RuleParser::new("letter b 12").rule().unwrap(), None, 0);
+        let word = AnchoredRule::new(RuleParser::new("word but 12").rule().unwrap(), None, 0);
+        for (rule, to) in [(&letter, "b"), (&word, "but")] {
+            trie.insert(
+                "⠃",
+                to,
+                Some(Transition::Start(vec![CharacterClass::Space])),
+                None,
+                Direction::Forward,
+                Precedence::Default,
+                vec![],
+                TranslationStage::Main,
+                rule,
+            );
+        }
+        let outputs: Vec<String> = trie
+            .find_translations("⠃", Some('x'))
+            .iter()
+            .map(|t| t.output())
+            .collect();
+        assert_eq!(outputs, ["b", "but"]);
+        let single: Vec<char> = trie.single_char_alternatives().map(|(c, _)| c).collect();
+        assert_eq!(single, ['⠃']);
     }
 
     #[test]
@@ -887,61 +910,5 @@ mod tests {
         );
         assert_eq!(trie.find_translations("foo", Some(' ')), empty);
         assert_eq!(trie.find_translations("foo", None), empty);
-    }
-
-    #[test]
-    fn find_translations_with_end_word() {
-        let mut trie = Trie::new();
-        let rule = fake_rule();
-        let ends = ResolvedTranslation::new("b", "but", 2, TranslationStage::Main, rule.clone());
-        let goes_on = ResolvedTranslation::new("b", "be", 2, TranslationStage::Main, rule.clone());
-        for (to, end) in [("but", true), ("be", false)] {
-            trie.insert(
-                "b",
-                to,
-                None,
-                Some(Transition::EndWord(end)),
-                Direction::Forward,
-                Precedence::Default,
-                vec![],
-                TranslationStage::Main,
-                &rule,
-            );
-        }
-        assert_eq!(
-            trie.find_translations_with_word_ends("bx", None, &[false, true]),
-            vec![ends.clone()]
-        );
-        assert_eq!(
-            trie.find_translations_with_word_ends("bx", None, &[false, false]),
-            vec![goes_on]
-        );
-        assert_eq!(trie.find_translations("b", None), vec![ends]);
-    }
-
-    #[test]
-    fn find_translations_with_before_context() {
-        // lookbehind checks resolve against their own classes, lookahead against `ctx`
-        let ctx = CharacterClasses::new(&[(CharacterClass::Letter, &['1'])]);
-        let before_ctx = CharacterClasses::new(&[(CharacterClass::Letter, &['a'])]);
-        let mut trie = Trie::new()
-            .with_context(ctx)
-            .with_before_context(before_ctx);
-        let rule = fake_rule();
-        let foo = ResolvedTranslation::new("foo", "F", 5, TranslationStage::Main, rule.clone());
-        trie.insert(
-            "foo",
-            "F",
-            Some(Transition::Start(vec![CharacterClass::Letter])),
-            Some(Transition::End(vec![CharacterClass::Letter])),
-            Direction::Forward,
-            Precedence::Default,
-            vec![],
-            TranslationStage::Main,
-            &rule,
-        );
-        assert_eq!(trie.find_translations("foo1", Some('a')), vec![foo]);
-        assert!(trie.find_translations("foo1", Some('1')).is_empty());
-        assert!(trie.find_translations("fooa", Some('a')).is_empty());
     }
 }

@@ -2502,6 +2502,14 @@ impl AnchoredRule {
     pub fn new(rule: Rule, path: Option<PathBuf>, line: usize) -> Self {
         Self { rule, path, line }
     }
+
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    pub fn line(&self) -> usize {
+        self.line
+    }
 }
 
 impl HasDirection for AnchoredRule {

@@ -53,12 +53,15 @@ pub struct TranslationPipeline {
 }
 
 impl TranslationPipeline {
-    pub fn compile(rules: &[AnchoredRule], direction: Direction) -> Result<Self, TranslationError> {
-        let ctx = TableContext::compile(rules)?;
+    pub fn compile(
+        all_rules: &[AnchoredRule],
+        direction: Direction,
+    ) -> Result<Self, TranslationError> {
+        let ctx = TableContext::compile(all_rules)?;
         let mut steps = Vec::new();
 
         // ignore rules that aren't meant for the given direction
-        let rules: Vec<_> = rules
+        let rules: Vec<_> = all_rules
             .iter()
             .filter(|r| r.is_direction(direction))
             .cloned()
@@ -80,7 +83,8 @@ impl TranslationPipeline {
             direction,
             TranslationStage::Main,
             &context,
-        )?;
+        )?
+        .with_all_definitions(all_rules, &ctx);
         steps.push(Transformation::Primary(transform));
         let pass2_rules: Vec<AnchoredRule> = rules
             .iter()

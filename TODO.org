@@ -237,9 +237,10 @@
     expected ~⡁⡋⠤⠅⠕⠝⠞⠭~, actual ~⡴⠤⠅⠕⠝⠞⠭~) and 1 backward
     equivalent (~⡙⠝⠅~ → "Dnk" rather than "Danmark").
 - [X] Backward word-boundary checks ask about a cell, not a position
-  - Fixed in 90c750c and 09b095b: lookbehind checks read the last
-    output character with the text classes, the word-family rules check
-    ~Transition::EndWord~ against ~BackwardWordEndConstrainer~'s scan,
+  - Fixed: back-translation selects rules the way liblouis's
+    ~back_selectRule~ does (~src/translator/table/backward.rs~). The
+    before side reads the last output character with the text classes,
+    the after side is the next cell's attributes or ~isEndWord~'s scan,
     and ~dots_classes~ no longer holds contraction cells.
   - Both sides of a backward boundary check are evaluated against the
     braille input via ~dots_classes~ (~PrimaryTable~'s ~trie_ctx~,

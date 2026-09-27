@@ -124,12 +124,11 @@ a few hundred either way on the million-assertion files.
 
 | Area                                                | Failing | Root cause                                                                                                                                                                       | Size |
 |-----------------------------------------------------|--------:|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------|
-| `en-ueb-g2-dictionary_harness`, `afr-za-g2` forward |    ≈300 | Match-rule candidate selection. See ADR about "Match-rule candidate selection" and ADR Rule selection does not depend on table order. | L    |
-| `ml`, `pa`, `hi`, `ta`, `fa`, `th`, `bn`            |  ≈2 600 | Complex scripts: conjunct and reph forms, and stacked combining marks firing an indicator each instead of once per grapheme cluster.                                             | L    |
-| `da-dk-g28-dictionary_harness`                      |      15 | Forward: an all-caps word takes a word contraction instead of being spelled out, and a letter sign is missing before two-letter words (`ii`, `ik`). Backward: a capital after a letter sign in a two-cell letter. | S    |
-| `en-ueb-computer-code`                              |       3 | Two rules for `dis` after an opening quote tie on rank (`match %[^_~]%<* dis …` and `match !%[^_~a] dis …`, `en-ueb-g2.ctb:887`/`:890`); liblouis takes the one defined first. See ADR Rule selection does not depend on table order. The rest of the file was standing-alone sequences, `match` pre patterns starting inside a consumed contraction, and the uncontracted rest of a word after a number, now fixed. | — |
+| `afr-za-g2` forward                                 |      13 | Not yet surveyed. The dictionary harness it shared this row with passes since back-translation selects rules as liblouis does and a boundary that holds counts towards a `match` rule's weight. | M    |
+| `ml`, `pa`, `hi`, `ta`, `fa`, `th`, `bn`            |    ≈950 | Complex scripts: conjunct and reph forms, and stacked combining marks firing an indicator each instead of once per grapheme cluster.                                             | L    |
+| `da-dk-g28-dictionary_harness`                      |       9 | Not yet surveyed; the backward `letsign` ambiguity that made up most of it went with the back-translation rule selection. | S    |
 | `hu-hu-g1_dictionary_special_consonants`            |  ≈1 100 | `nocross` asks "can this hyphenate anywhere?" instead of liblouis's positional `syllableBreak()`.                                                                                | L    |
-| `sw-ke-dictionary`, `sw-ke`                         |    ≈850 | Backward lookup splices in unrelated dictionary words ("wote" → "wizaraote"); single-letter words pick up a spurious letter sign.                                                | M    |
+| `sw-ke-dictionary`, `sw-ke`                         |      37 | Not yet surveyed; the backward lookup that spliced in unrelated dictionary words went with the back-translation rule selection.                                                                    | M    |
 | `en-g3`, `en-ueb`                                   |    ≈600 | A literal hyphen breaks per-segment contraction in compounds — "do-it-yourself" gives `do-x-y\|rself`, not `d-x-yrf`.                                                            | M    |
 | `rw-rw-g1`, `numericmode`                           |    ≈500 | Letters used as pseudo-digits still get a capital sign. Related: `endmode`/`endmodeword` don't fire across a `base` character chain.                                             | M    |
 | `de-g0-detailed-specs`, `de-g1-…`                   |    ≈280 | `capsletter` vs. `begcapsword` tier selection. Needs `uppercase.rs` and `emphasis.rs` unified into one tier model — a blanket engine fix was tried and disproven.                | L    |
@@ -137,19 +136,21 @@ a few hundred either way on the million-assertion files.
 
 Two cross-cutting items have no single file behind them:
 
-- **Backward direction, generally.** Caps passages and emphasis have no backward
-  path at all. Backward boundary checks follow liblouis's asymmetry
-  (`lou_backTranslateString.c`): the before side classifies the last character of the
-  output produced so far with the text classes (`back_setBefore`, `isBegWord`), and
-  the word-family rules, `postpunc` and `prepunc` check the after side by scanning on
-  through the rest of the word (`isEndWord`). What is left is rule *order*: liblouis
-  takes the first valid rule of a cell in definition order, and we rank by weight, so
-  two rules on the same cells that liblouis tells apart only by order (e.g. `punctuation
-  ’ 6-356` and `postpunc ‛ 6-356` in German) can come out the other way.
+- **Backward direction, generally.** Rule selection follows liblouis's
+  `back_selectRule` (`src/translator/table/backward.rs`): the side before a rule is the
+  last character of the text produced so far, classified by the text classes; the side
+  after is the next cell's attributes or `isEndWord`'s scan; rules are tried in
+  liblouis's order; and `itsANumber` and `noContractMode` are state set by the rules
+  applied. Caps passages and emphasis still have no backward path, and capitalization
+  is still precomputed from the input rather than carried as liblouis's `nextUpper`/
+  `allUpper` state. *(M)*
 - **Engine debt.** Regexp negation of concatenation and alternation is wrong
   (`!(e1e2)` ≠ `(!e1!e2)`); `Attribute::ByOrder` and `Any` are no-ops in
   `match_pattern.rs` and all three are no-ops in `context_pattern.rs`; the
-  `syllable` opcode's cross-boundary restriction is unimplemented. *(M)*
+  `syllable` opcode's cross-boundary restriction is unimplemented. In multipass and
+  `context` tests a negated test consumes a character where liblouis's consumes none,
+  and `_N` is dropped rather than looking back, which is why `no-no-g2`'s pass4 rule
+  `_!$sp[@6@6]` rewrites `⠰⠠⠠` differently and back-translating `NVV` fails. *(M)*
 
 ## Forty-four blocks that never run
 
