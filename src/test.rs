@@ -140,6 +140,8 @@ pub enum PositionDiff {
 /// A group of [`Tests`](Test) that share the same braille table(s), display table and test mode.
 #[derive(Debug)]
 pub struct TestMatrix<'a> {
+    /// Where the tables are looked up
+    search_path: &'a SearchPath,
     /// The display table used for the translation tests
     display: &'a Option<Display>,
     /// The braille table(s) used for the translation tests
@@ -152,12 +154,14 @@ pub struct TestMatrix<'a> {
 
 impl<'a> TestMatrix<'a> {
     pub fn new(
+        search_path: &'a SearchPath,
         display: &'a Option<Display>,
         tables: &'a Vec<Table>,
         mode: &'a TestMode,
         tests: &'a Vec<Test>,
     ) -> Self {
         TestMatrix {
+            search_path,
             display,
             tables,
             mode,
@@ -166,17 +170,17 @@ impl<'a> TestMatrix<'a> {
     }
 
     fn display_table(&self, direction: Direction) -> Result<DisplayTable, TestError> {
-        let search_path = SearchPath::new_or("LOUIS_TABLE_PATH", ".");
+        let search_path = self.search_path;
         let display_rules = match self.display {
-            Some(Display::Simple(path)) => parser::table_expanded_in(path.as_path(), &search_path)?,
+            Some(Display::Simple(path)) => parser::table_expanded_in(path.as_path(), search_path)?,
             Some(Display::Inline(text)) => {
                 let rules = parser::table(text, None)?;
-                parser::expand_includes(rules, &search_path, &[])?
+                parser::expand_includes(rules, search_path, &[])?
             }
             Some(Display::List(paths)) => {
                 let mut rules = Vec::new();
                 for path in paths {
-                    rules.extend(parser::table_expanded_in(path, &search_path)?);
+                    rules.extend(parser::table_expanded_in(path, search_path)?);
                 }
                 rules
             }
@@ -185,20 +189,20 @@ impl<'a> TestMatrix<'a> {
         Ok(DisplayTable::compile(&display_rules, direction))
     }
 
-    fn rules(table: &Table) -> Result<Vec<AnchoredRule>, TestError> {
-        let search_path = SearchPath::new_or("LOUIS_TABLE_PATH", ".");
+    fn rules(&self, table: &Table) -> Result<Vec<AnchoredRule>, TestError> {
+        let search_path = self.search_path;
         Ok(match table {
-            Table::Simple(path) => parser::table_expanded_in(path.as_path(), &search_path)?,
+            Table::Simple(path) => parser::table_expanded_in(path.as_path(), search_path)?,
             Table::List(paths) => {
                 let mut rules = Vec::new();
                 for path in paths {
-                    rules.extend(parser::table_expanded_in(path, &search_path)?);
+                    rules.extend(parser::table_expanded_in(path, search_path)?);
                 }
                 rules
             }
             Table::Inline(text) => {
                 let rules = parser::table(text, None)?;
-                parser::expand_includes(rules, &search_path, &[])?
+                parser::expand_includes(rules, search_path, &[])?
             }
             Table::Query(query) => {
                 let index =
@@ -208,7 +212,7 @@ impl<'a> TestMatrix<'a> {
                     index.find(query.clone()).into_iter().cloned().collect();
                 match matches.as_slice() {
                     [] => return Err(TestError::NoTableForQuery(query.to_string())),
-                    [path] => parser::table_expanded_in(path, &search_path)?,
+                    [path] => parser::table_expanded_in(path, search_path)?,
                     several => {
                         return Err(TestError::AmbiguousTableQuery(
                             query.to_string(),
@@ -227,7 +231,7 @@ impl<'a> TestMatrix<'a> {
         table: &Table,
         direction: Direction,
     ) -> Result<(TranslationPipeline, Option<ImpliedDisplay>), TestError> {
-        let rules = Self::rules(table)?;
+        let rules = self.rules(table)?;
         let pipeline = TranslationPipeline::compile(&rules, direction)?;
         Ok(match self.display {
             // the display table is a pipeline stage on the braille side, so the pipeline
@@ -299,7 +303,7 @@ impl<'a> TestMatrix<'a> {
             }
             TestMode::Display => {
                 for table in self.tables {
-                    let table = CharToDots::compile(&Self::rules(table)?);
+                    let table = CharToDots::compile(&self.rules(table)?);
                     results.extend(self.tests.iter().map(|test| test.check_display(&table)));
                 }
             }

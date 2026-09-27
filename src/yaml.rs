@@ -1,10 +1,17 @@
 //! A parser for [liblouis](https://liblouis.io) YAML test files
 
-use std::{collections::HashMap, fs::File, iter::Peekable, num::ParseIntError, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs::File,
+    iter::Peekable,
+    num::ParseIntError,
+    path::{Path, PathBuf},
+};
 
 use crate::{parser, parser::EscapingContext, parser::unescape};
 
 use libyaml::{Encoding, Event, Parser, ParserIter, ScalarStyle};
+use search_path::SearchPath;
 
 use crate::emphasis::EmphasisSpan;
 use crate::parser::Direction;
@@ -60,6 +67,7 @@ pub enum ParseError {
 
 pub struct YAMLParser<'a> {
     events: Peekable<ParserIter<'a>>,
+    search_path: SearchPath,
 }
 
 impl YAMLParser<'_> {
@@ -67,7 +75,15 @@ impl YAMLParser<'_> {
         let parser = Parser::new(reader)?;
         Ok(Self {
             events: parser.into_iter().peekable(),
+            search_path: SearchPath::new_or("LOUIS_TABLE_PATH", "."),
         })
+    }
+
+    /// Look tables up in `dir` before the search path, as lou_checkyaml does by changing into the
+    /// YAML file's directory.
+    pub fn in_dir(mut self, dir: &Path) -> Self {
+        self.search_path.prepend(dir.to_path_buf());
+        self
     }
 
     fn scalar(&mut self) -> Result<String, ParseError> {
@@ -526,6 +542,7 @@ impl YAMLParser<'_> {
                 "tests" => {
                     let tests = self.tests()?;
                     let suite = TestMatrix::new(
+                        &self.search_path,
                         &current_display_table,
                         &current_tables,
                         &test_mode,
@@ -567,7 +584,9 @@ mod tests {
             .unwrap()
             .write_all(yaml.as_bytes())
             .unwrap();
-        let results = YAMLParser::new(File::open(&path).unwrap())?.yaml();
+        let results = YAMLParser::new(File::open(&path).unwrap())?
+            .in_dir(&std::env::temp_dir())
+            .yaml();
         let _ = std::fs::remove_file(&path);
         results
     }
