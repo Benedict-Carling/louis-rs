@@ -1431,10 +1431,10 @@ impl PrimaryTable {
                 _ => (),
             }
         }
-        let numeric_chars = ctx
-            .character_classes()
-            .get(&CharacterClass::Litdigit)
-            .unwrap_or_default();
+        let numeric_chars: HashSet<char> = [CharacterClass::Digit, CharacterClass::Litdigit]
+            .iter()
+            .flat_map(|class| ctx.character_classes().get(class).unwrap_or_default())
+            .collect();
         builder
             .numeric_indicator
             .numeric_characters(numeric_chars.clone());
@@ -2501,6 +2501,20 @@ mod tests {
         assert_eq!(table.translate("aa"), "⠁⠁");
         assert_eq!(table.translate("aa;aa"), "⠁⠁⠸⠁⠁");
         assert_eq!(table.translate("aa:aa;aa"), "⠁⠁⠇⠄⠄⠸⠁⠁");
+    }
+
+    #[test]
+    fn numsign_before_a_digit() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("digit 1 1"),
+            parse_rule("numsign 3456"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("1a1"), "⠼⠁⠁⠼⠁");
     }
 
     #[test]
