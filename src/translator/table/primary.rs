@@ -1663,6 +1663,39 @@ impl PrimaryTable {
             .partition(|t| t.offset() == 0)
     }
 
+    /// liblouis's `compbrlStart`..`compbrlEnd`: the word under the cursor, or up to the
+    /// cursor with `compbrlLeftCursor`, or the cursor's character when it is a space.
+    fn cursor_word(
+        &self,
+        input: &str,
+        options: &TranslationOptions,
+    ) -> Option<std::ops::Range<usize>> {
+        let left = options.mode().contains(TranslationMode::CompbrlLeftCursor);
+        if self.direction != Direction::Forward
+            || !(left || options.mode().contains(TranslationMode::CompbrlAtCursor))
+        {
+            return None;
+        }
+        let chars: Vec<char> = input.chars().collect();
+        let cursor = options.cursor_pos()?;
+        let is_space = |pos: usize| self.space_chars.contains(&chars[pos]);
+        if cursor >= chars.len() || is_space(cursor) {
+            return Some(cursor..cursor + 1);
+        }
+        let start = (0..cursor)
+            .rev()
+            .find(|&pos| is_space(pos))
+            .map_or(0, |pos| pos + 1);
+        let end = if left {
+            cursor
+        } else {
+            (cursor..chars.len())
+                .find(|&pos| is_space(pos))
+                .unwrap_or(chars.len())
+        };
+        Some(start..end)
+    }
+
     fn context_candidates(
         &self,
         input: &str,
@@ -1724,6 +1757,10 @@ impl PrimaryTable {
 
         let mut indications = self.indicators.precompute(input, &enriched_spans);
         let constraints = self.constrainers.precompute(input, &enriched_spans);
+        let constraints = match self.cursor_word(input, options) {
+            Some(range) => constraints.with_comp6(range),
+            None => constraints,
+        };
         let input_chars: Vec<char> = input.chars().collect();
         let stands_alone = |t: &ResolvedTranslation, pos: usize| match &self.sequences {
             Some(sequences)
@@ -1867,7 +1904,7 @@ impl PrimaryTable {
                     .cloned();
                 context_candidates.retain(|t| !is_pass_rule(t));
                 context_delayed.retain(|t| !is_pass_rule(t));
-                if forced.is_none() {
+                if forced.is_none() && !constraints.use_comp6_at(char_pos) {
                     forced = pass_rule;
                 }
             }
@@ -3585,6 +3622,34 @@ mod tests {
                 .unwrap();
         assert_eq!(table.translate("abc"), "⠁⠂");
         assert_eq!(table.translate("cabc"), "⠉⠁⠂");
+    }
+
+    /// `compbrlAtCursor` spells out the word under the cursor character by character,
+    /// with no computer braille indicators; `compbrlLeftCursor` only up to the cursor
+    #[test]
+    fn compbrl_at_cursor_spells_out_the_word() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("space \\s 0"),
+            parse_rule("always ab 3456"),
+            parse_rule("begcomp 456"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        let options = |mode: TranslationMode, cursor: usize| {
+            let mut modes = crate::translator::options::TranslationModes::empty();
+            modes.insert(mode);
+            TranslationOptions::default()
+                .with_mode(modes)
+                .with_cursor_pos(cursor)
+        };
+        let at = options(TranslationMode::CompbrlAtCursor, 4);
+        assert_eq!(table.translate_with_options("ab abab", &at), "⠼⠀⠁⠃⠁⠃");
+        let left = options(TranslationMode::CompbrlLeftCursor, 4);
+        assert_eq!(table.translate_with_options("ab abab", &left), "⠼⠀⠁⠃⠼");
     }
 
     #[test]

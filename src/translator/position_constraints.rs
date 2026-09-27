@@ -62,6 +62,17 @@ impl PositionConstraints {
             .is_some_and(|f| f.contains(Constraint::DontContract))
     }
 
+    /// Translate `range` in computer braille, as liblouis's `compbrlAtCursor` does for the
+    /// word under the cursor.
+    pub fn with_comp6(mut self, range: std::ops::Range<usize>) -> Self {
+        for pos in range {
+            if let Some(constraints) = self.0.get_mut(pos) {
+                constraints.insert(Constraint::UseComp6);
+            }
+        }
+        self
+    }
+
     pub fn use_comp6_at(&self, pos: usize) -> bool {
         self.0
             .get(pos)
