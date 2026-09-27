@@ -1,4 +1,3 @@
-use crate::parser::multipass::ConsumesInput;
 use crate::translator::ResolvedTranslation;
 use crate::translator::context_pattern::{ContextPatterns, ContextPatternsBuilder};
 use crate::translator::effect::Environment;
