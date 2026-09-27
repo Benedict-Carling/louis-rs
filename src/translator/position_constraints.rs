@@ -5,7 +5,8 @@
 //! to decide which rules are eligible at each character position.
 //!
 //! The constrainer types are:
-//! * [`Constrainer::Numeric`]: detects digit runs and sets [`Constraint::DontContract`]
+//! * [`Constrainer::Numeric`]: sets [`Constraint::DontContract`] after a number, as liblouis's
+//!   numeric mode does
 //! * [`Constrainer::ComputerBraille`]: maps computer-braille spans to [`Constraint::UseComp6`]
 
 use enumset::{EnumSet, EnumSetType};
@@ -19,8 +20,8 @@ use crate::hyphenation::HyphenationTable;
 pub enum Constraint {
     /// Suppress multi-character (contraction) rules at this position.
     ///
-    /// Set for every character inside a numeric run so that contractions are
-    /// not applied to digit sequences.
+    /// Set from the character after a number's first digit up to the next space, in
+    /// tables where liblouis's numeric mode switches contractions off.
     DontContract,
     /// Activate comp6 rules and suppress normal translation rules at this position.
     ///
@@ -134,60 +135,48 @@ impl PositionConstraints {
     }
 }
 
-/// Detects numeric runs in the input and sets [`Constraint::DontContract`] at
-/// every character position that falls inside one.
+/// Mirrors liblouis's `checkNumericMode`: in a table that uses numeric mode and whose
+/// `nocontractsign` equals its `nonumsign`, entering a number switches contractions off
+/// until the next space or `seqdelimiter` character. The rule at the first digit is
+/// selected before that happens, so [`Constraint::DontContract`] starts at the character
+/// after it.
 #[derive(Debug, Clone)]
 pub struct NumericConstrainer {
     numeric_chars: HashSet<char>,
-    extra_numeric_chars: HashSet<char>,
-    mid_numeric_chars: HashSet<char>,
-    /// Whether a number leaves the rest of its word uncontracted, and the characters that
-    /// end such a word. liblouis' `checkNumericMode` sets `dontContract` on entering a
-    /// number when the nocontractsign is the nonumsign, and only a space or a
-    /// `seqdelimiter` clears it.
-    word_end_chars: Option<HashSet<char>>,
+    numeric_mode_chars: HashSet<char>,
+    midend_numeric_mode_chars: HashSet<char>,
+    word_end_chars: HashSet<char>,
 }
 
 impl NumericConstrainer {
     fn compute(&self, input: &str) -> Vec<Constraints> {
         let chars: Vec<char> = input.chars().collect();
         let mut constraints: Vec<Constraints> = vec![Constraints::empty(); chars.len()];
-        let mut in_numeric = false;
-        let mut uncontracted_word = false;
+        let mut dont_contract = false;
+        let mut numeric_mode = false;
 
         for (pos, &c) in chars.iter().enumerate() {
-            if uncontracted_word {
+            if dont_contract {
                 constraints[pos].insert(Constraint::DontContract);
-                if self.word_end_chars.as_ref().is_some_and(|w| w.contains(&c)) {
-                    uncontracted_word = false;
-                }
             }
-            let is_numeric = self.numeric_chars.contains(&c);
-            match (is_numeric, in_numeric) {
-                (false, false) => {}
-                (true, false) => {
-                    in_numeric = true;
-                    uncontracted_word = self.word_end_chars.is_some();
-                    constraints[pos].insert(Constraint::DontContract);
+            if !numeric_mode {
+                if self.numeric_chars.contains(&c) {
+                    numeric_mode = true;
+                    dont_contract = true;
+                } else if self.numeric_mode_chars.contains(&c) {
+                    numeric_mode = chars[pos + 1..]
+                        .iter()
+                        .find(|c| !self.numeric_mode_chars.contains(c))
+                        .is_some_and(|c| self.numeric_chars.contains(c));
                 }
-                (true, true) => {
-                    constraints[pos].insert(Constraint::DontContract);
-                }
-                (false, true) if self.extra_numeric_chars.contains(&c) => {
-                    constraints[pos].insert(Constraint::DontContract);
-                }
-                (false, true)
-                    if self.extra_numeric_chars.is_empty()
-                        && self.mid_numeric_chars.contains(&c)
-                        && chars
-                            .get(pos + 1)
-                            .is_some_and(|nc| self.numeric_chars.contains(nc)) =>
-                {
-                    constraints[pos].insert(Constraint::DontContract);
-                }
-                (false, true) => {
-                    in_numeric = false;
-                }
+            } else if !(self.numeric_chars.contains(&c)
+                || self.numeric_mode_chars.contains(&c)
+                || self.midend_numeric_mode_chars.contains(&c))
+            {
+                numeric_mode = false;
+            }
+            if self.word_end_chars.contains(&c) {
+                dont_contract = false;
             }
         }
         constraints
@@ -564,8 +553,8 @@ impl Constrainers {
 #[derive(Debug, Default)]
 pub struct NumericConstrainerBuilder {
     numeric_chars: HashSet<char>,
-    extra_numeric_chars: HashSet<char>,
-    mid_numeric_chars: HashSet<char>,
+    numeric_mode_chars: HashSet<char>,
+    midend_numeric_mode_chars: HashSet<char>,
     uses_numeric_mode: bool,
     nocontractsign: Option<String>,
     nonumsign: Option<String>,
@@ -581,12 +570,16 @@ impl NumericConstrainerBuilder {
     }
 
     pub fn numericmodechars(&mut self, s: &str) {
-        self.extra_numeric_chars = HashSet::from_iter(s.chars());
+        self.numeric_mode_chars.extend(s.chars());
         self.uses_numeric_mode = true;
     }
 
-    /// `numericnocontchars` and `midendnumericmodechars` switch liblouis to its numeric
-    /// mode handling too.
+    pub fn midendnumericmodechars(&mut self, s: &str) {
+        self.midend_numeric_mode_chars.extend(s.chars());
+        self.uses_numeric_mode = true;
+    }
+
+    /// `numericnocontchars` switches liblouis to its numeric mode handling too.
     pub fn uses_numeric_mode(&mut self) {
         self.uses_numeric_mode = true;
     }
@@ -599,24 +592,18 @@ impl NumericConstrainerBuilder {
         self.nonumsign = Some(dots.to_string());
     }
 
-    pub fn midnum(&mut self, s: &str) {
-        self.mid_numeric_chars.extend(s.chars());
-    }
-
     /// `word_end_chars` are the table's space and `seqdelimiter` characters.
     pub fn build(self, word_end_chars: HashSet<char>) -> Option<NumericConstrainer> {
-        if self.numeric_chars.is_empty() {
-            None
-        } else {
-            let uncontracted_word = self.uses_numeric_mode
-                && self.nocontractsign.is_some()
-                && self.nocontractsign == self.nonumsign;
+        let signs_equal = self.nocontractsign.is_some() && self.nocontractsign == self.nonumsign;
+        if self.uses_numeric_mode && signs_equal && !self.numeric_chars.is_empty() {
             Some(NumericConstrainer {
                 numeric_chars: self.numeric_chars,
-                extra_numeric_chars: self.extra_numeric_chars,
-                mid_numeric_chars: self.mid_numeric_chars,
-                word_end_chars: uncontracted_word.then_some(word_end_chars),
+                numeric_mode_chars: self.numeric_mode_chars,
+                midend_numeric_mode_chars: self.midend_numeric_mode_chars,
+                word_end_chars,
             })
+        } else {
+            None
         }
     }
 }
@@ -806,50 +793,52 @@ mod tests {
         )])
     }
 
-    #[test]
-    fn numeric_run() {
-        let mut builder = NumericConstrainerBuilder::new();
-        builder.numeric_characters(HashSet::from(['1', '2', '3']));
-        let c = numeric_constrainers(builder).precompute("ab12 a", &[]);
-        assert_eq!(
-            dont_contract(&c),
-            vec![false, false, true, true, false, false]
-        );
-    }
-
-    #[test]
-    fn midnum_extends_run() {
-        let mut builder = NumericConstrainerBuilder::new();
-        builder.numeric_characters(HashSet::from(['1', '2', '3']));
-        builder.midnum(".");
-        let c = numeric_constrainers(builder).precompute("1.2", &[]);
-        assert_eq!(dont_contract(&c), vec![true, true, true]);
-    }
-
-    #[test]
-    fn number_leaves_rest_of_word_uncontracted() {
+    fn ueb_like_builder() -> NumericConstrainerBuilder {
         let mut builder = NumericConstrainerBuilder::new();
         builder.numeric_characters(HashSet::from(['1', '2', '3']));
         builder.numericmodechars(".");
         builder.nocontractsign("56");
         builder.nonumsign("56");
-        let c = numeric_constrainers(builder).precompute("a1bc d-1e-f", &[]);
+        builder
+    }
+
+    #[test]
+    fn number_leaves_rest_of_word_uncontracted() {
+        let c = numeric_constrainers(ueb_like_builder()).precompute("a1bc d-1e-f", &[]);
         assert_eq!(
             dont_contract(&c),
             vec![
-                false, true, true, true, true, false, false, true, true, true, false
+                false, false, true, true, true, false, false, false, true, true, false
             ]
         );
     }
 
     #[test]
-    fn number_contracts_rest_of_word_without_numeric_mode() {
+    fn first_digit_may_still_contract() {
+        let c = numeric_constrainers(ueb_like_builder()).precompute("12", &[]);
+        assert_eq!(dont_contract(&c), vec![false, true]);
+    }
+
+    #[test]
+    fn number_entered_through_numeric_mode_char_keeps_contractions() {
+        let c = numeric_constrainers(ueb_like_builder()).precompute(".1a", &[]);
+        assert_eq!(dont_contract(&c), vec![false, false, false]);
+    }
+
+    #[test]
+    fn no_constraint_when_signs_differ() {
+        let mut builder = ueb_like_builder();
+        builder.nonumsign("6");
+        assert!(builder.build(HashSet::from([' '])).is_none());
+    }
+
+    #[test]
+    fn no_constraint_without_numeric_mode() {
         let mut builder = NumericConstrainerBuilder::new();
         builder.numeric_characters(HashSet::from(['1', '2', '3']));
         builder.nocontractsign("56");
         builder.nonumsign("56");
-        let c = numeric_constrainers(builder).precompute("1bc", &[]);
-        assert_eq!(dont_contract(&c), vec![true, false, false]);
+        assert!(builder.build(HashSet::from([' '])).is_none());
     }
 
     #[test]

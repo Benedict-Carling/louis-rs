@@ -543,7 +543,6 @@ impl PrimaryTable {
                     // character achieves this via the numeric indicator and constrainer.
                     let s = character.to_string();
                     builder.numeric_indicator.midnum(&s);
-                    builder.numeric_constrainer.midnum(&s);
                 }
                 Rule::Hyphen {
                     character, dots, ..
@@ -662,8 +661,8 @@ impl PrimaryTable {
                     builder.numeric_indicator.numericnocontchars(chars);
                     builder.numeric_constrainer.uses_numeric_mode();
                 }
-                Rule::Midendnumericmodechars { .. } => {
-                    builder.numeric_constrainer.uses_numeric_mode();
+                Rule::Midendnumericmodechars { chars } => {
+                    builder.numeric_constrainer.midendnumericmodechars(chars);
                 }
                 Rule::Numericmodechars { chars } => {
                     builder.numeric_indicator.numericmodechars(chars);
@@ -1320,7 +1319,6 @@ impl PrimaryTable {
                 ),
                 Rule::Midnum { chars, dots, .. } => {
                     builder.numeric_indicator.midnum(chars);
-                    builder.numeric_constrainer.midnum(chars);
                     builder.get_trie_mut(rule).insert(
                         chars,
                         &dots.to_string(),
