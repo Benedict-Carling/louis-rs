@@ -21,9 +21,8 @@ use crate::{
         },
         match_pattern::{MatchPatterns, MatchPatternsBuilder},
         position_constraints::{
-            BackwardCapsConstrainerBuilder, ComputerBrailleConstrainer, Constrainer, Constrainers,
-            DontContractConstrainerBuilder, HyphenationConstrainerBuilder, PositionConstraints,
-            PunctuationConstrainerBuilder,
+            ComputerBrailleConstrainer, Constrainer, Constrainers, DontContractConstrainerBuilder,
+            HyphenationConstrainerBuilder, PositionConstraints, PunctuationConstrainerBuilder,
         },
         sequence::{Sequences, whole_word_boundaries},
         table::{
@@ -169,7 +168,6 @@ struct PrimaryTableBuilder {
     nocontract_indicator: nocontract::IndicatorBuilder,
     emphasis_indicator: emphasis::IndicatorBuilder,
     computer_braille_indicator: computer_braille::IndicatorBuilder,
-    backward_caps_constrainer: BackwardCapsConstrainerBuilder,
     dont_contract_constrainer: DontContractConstrainerBuilder,
     hyphenation_constrainer: HyphenationConstrainerBuilder,
     punctuation_constrainer: PunctuationConstrainerBuilder,
@@ -226,7 +224,6 @@ impl PrimaryTableBuilder {
             nocontract_indicator: nocontract::IndicatorBuilder::new(),
             emphasis_indicator: emphasis::IndicatorBuilder::new(),
             computer_braille_indicator: computer_braille::IndicatorBuilder::new(),
-            backward_caps_constrainer: BackwardCapsConstrainerBuilder::new(),
             dont_contract_constrainer: DontContractConstrainerBuilder::new(),
             hyphenation_constrainer: HyphenationConstrainerBuilder::new(),
             punctuation_constrainer: PunctuationConstrainerBuilder::new(),
@@ -405,9 +402,6 @@ impl PrimaryTableBuilder {
                 [
                     Some(Constrainer::ComputerBraille(ComputerBrailleConstrainer {})),
                     dont_contract_constrainer.map(Constrainer::DontContract),
-                    self.backward_caps_constrainer
-                        .build()
-                        .map(Constrainer::BackwardCaps),
                     // liblouis's `nocross`/hyphenation-based syllable-break check is a
                     // forward-translation-only mechanism (lou_backTranslateString.c never
                     // consults it); a nocross rule is always an unrestricted candidate
@@ -687,9 +681,6 @@ impl PrimaryTable {
                         )
                     {
                         builder.insert_backward_indicator(&dots.to_string(), rule);
-                        builder
-                            .backward_caps_constrainer
-                            .capsletter(&dots.to_string());
                     }
                 }
                 Rule::Begcapsword { dots, .. } => {
@@ -704,9 +695,6 @@ impl PrimaryTable {
                         )
                     {
                         builder.insert_backward_indicator(&dots.to_string(), rule);
-                        builder
-                            .backward_caps_constrainer
-                            .begcapsword(&dots.to_string());
                     }
                 }
                 Rule::Endcapsword { dots, .. } => {
@@ -721,9 +709,6 @@ impl PrimaryTable {
                         )
                     {
                         builder.insert_backward_indicator(&dots.to_string(), rule);
-                        builder
-                            .backward_caps_constrainer
-                            .endcapsword(&dots.to_string());
                     }
                 }
                 Rule::Begcaps { dots } => {
@@ -1546,40 +1531,6 @@ impl PrimaryTable {
                 .unwrap_or_default(),
         );
         if direction == Direction::Backward {
-            let mut letter_cells = ctx
-                .direction_dots_classes()
-                .get(&CharacterClass::Letter)
-                .unwrap_or_default();
-            // Contractions spelling letters (e.g. Hungarian "sz"/"cs" digraphs) define
-            // their own dots, which are no letter by definition; a begcapsword span must
-            // still treat them as letters.
-            for rule in rules {
-                match &rule.rule {
-                    Rule::Always { chars, dots, .. }
-                    | Rule::Word { chars, dots, .. }
-                    | Rule::Sufword { chars, dots, .. }
-                    | Rule::Prfword { chars, dots, .. }
-                    | Rule::Begword { chars, dots, .. }
-                    | Rule::Begmidword { chars, dots, .. }
-                    | Rule::Midword { chars, dots, .. }
-                    | Rule::Midendword { chars, dots, .. }
-                    | Rule::Endword { chars, dots, .. }
-                    | Rule::Partword { chars, dots, .. }
-                        if chars.chars().all(|c| c.is_alphabetic()) =>
-                    {
-                        letter_cells.extend(dots.to_string().chars());
-                    }
-                    Rule::Lowword { chars, dots, .. } | Rule::Joinword { chars, dots, .. }
-                        if chars.chars().all(|c| c.is_alphabetic()) =>
-                    {
-                        letter_cells.extend(dots.to_string().chars());
-                    }
-                    _ => (),
-                }
-            }
-            builder.backward_caps_constrainer.letter_cells(letter_cells);
-        }
-        if direction == Direction::Backward {
             builder.backward = Some(BackwardSelector::new(
                 rules,
                 ctx,
@@ -1976,39 +1927,6 @@ impl PrimaryTable {
                 candidates.extend(self.comp6_trie.find_translations(chars.as_str(), prev));
             }
 
-            // Backward caps mode: capitalize the output of whichever candidate wins below.
-            // `Uppercase` (begcapsword span) capitalizes every character a cell resolves
-            // to; `TitleCase` (capsletter) capitalizes only the first — a cell can
-            // resolve to more than one character (e.g. a digraph rule), and capsletter
-            // marks a single capitalized letter, not a whole capitalized word.
-            let is_backward = self.direction == Direction::Backward;
-            let uppercase_here = is_backward && constraints.uppercase_at(char_pos);
-            let titlecase_here = is_backward && constraints.titlecase_at(char_pos);
-            let to_uppercase = |c: char| -> String {
-                match &self.backward {
-                    Some(selector) => selector.to_uppercase(c),
-                    None => c.to_uppercase().collect(),
-                }
-            };
-            let uppercase_if_needed =
-                move |translation: ResolvedTranslation| -> ResolvedTranslation {
-                    if uppercase_here {
-                        let upper: String =
-                            translation.output().chars().map(to_uppercase).collect();
-                        translation.with_output(&upper)
-                    } else if titlecase_here {
-                        let output = translation.output();
-                        let mut chars = output.chars();
-                        let titled = match chars.next() {
-                            Some(c) => to_uppercase(c) + chars.as_str(),
-                            None => String::new(),
-                        };
-                        translation.with_output(&titled)
-                    } else {
-                        translation
-                    }
-                };
-
             // drop translation candidates that we have applied already at this position in the
             // input
             let unseen = candidates
@@ -2049,7 +1967,6 @@ impl PrimaryTable {
                 && candidate.is_none_or(|t| nocross.rank() >= t.rank())
             {
                 let translation = nocross.clone();
-                let translation = uppercase_if_needed(translation);
                 let consumed = chars.as_str();
                 // move the iterator forward by the number of characters in the translation
                 chars.nth(nocross.length() - 1);
@@ -2085,12 +2002,15 @@ impl PrimaryTable {
                     prev = t.input().chars().last();
                     char_pos += t.length();
                 }
-                if let Some(selector) = &self.backward {
-                    selector.applied(&mut backward_state, t.rule());
-                }
                 // there is a matching translation rule
-                let translation = t.clone();
-                let translation = uppercase_if_needed(translation);
+                let translation = match &self.backward {
+                    Some(selector) => {
+                        selector.applied(&mut backward_state, t.rule());
+                        let output = selector.capitalize(&mut backward_state, &t.output());
+                        t.clone().with_output(&output)
+                    }
+                    None => t.clone(),
+                };
                 translations.push(translation);
                 delayed_translations = self.update_offsets(delayed_translations, t.length());
                 delayed_translations.extend(self.match_candidates_within(consumed, t.length()));
@@ -3797,6 +3717,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(table.translate("⠨⠃"), "B");
+    }
+
+    /// liblouis ends a caps word on the rules applied and the text produced, as its
+    /// `allUpper` state, not on the cells: a blank cell the table also defines as a letter
+    /// still ends it, being a space rule
+    #[test]
+    fn backward_capsword_ends_at_space_rule_and_non_letter_output() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("base uppercase A a"),
+            parse_rule("base uppercase B b"),
+            parse_rule("space \\s 0"),
+            parse_rule("letter \\x00df 0"),
+            parse_rule("punctuation - 36"),
+            parse_rule("capsletter 46"),
+            parse_rule("begcapsword 46-46"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table = PrimaryTable::compile(
+            &rules,
+            Direction::Backward,
+            TranslationStage::Main,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(table.translate("⠨⠨⠁⠃⠀⠁⠃"), "AB ab");
+        assert_eq!(table.translate("⠨⠨⠁⠃⠤⠁⠃"), "AB-ab");
+        assert_eq!(table.translate("⠨⠁⠃"), "Ab");
     }
 
     #[test]
