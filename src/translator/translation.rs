@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use crate::{
     parser::{AnchoredRule, Precedence, Rule},
     translator::{effect::Effect, regexp::CharacterRange, swap::Swapper},
@@ -219,6 +221,8 @@ pub struct TranslationSubset {
     output: String,
     length: usize,
     weight: usize,
+    /// Where the originating rule is defined, so that two rules translating alike stay apart.
+    source: Option<(Option<PathBuf>, usize)>,
 }
 
 impl From<&ResolvedTranslation> for TranslationSubset {
@@ -228,6 +232,10 @@ impl From<&ResolvedTranslation> for TranslationSubset {
             output: translation.output(),
             length: translation.length(),
             weight: translation.weight(),
+            source: translation
+                .origin
+                .as_ref()
+                .map(|rule| (rule.path().map(Path::to_path_buf), rule.line())),
         }
     }
 }
