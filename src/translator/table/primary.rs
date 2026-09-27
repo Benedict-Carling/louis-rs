@@ -143,6 +143,7 @@ pub struct PrimaryTable {
     sequences: Option<Sequences>,
     case: CaseClasses,
     capsletter_defined: bool,
+    syllables: Vec<Vec<char>>,
     space_chars: HashSet<char>,
     letter_or_litdigit_chars: HashSet<char>,
 }
@@ -174,6 +175,7 @@ struct PrimaryTableBuilder {
     compbrl_triggers: Vec<String>,
     sequences: Option<Sequences>,
     capsletter_defined: bool,
+    syllables: Vec<Vec<char>>,
 }
 
 impl PrimaryTableBuilder {
@@ -221,6 +223,7 @@ impl PrimaryTableBuilder {
             compbrl_triggers: Vec::new(),
             sequences: None,
             capsletter_defined: false,
+            syllables: Vec::new(),
         }
     }
 
@@ -402,6 +405,7 @@ impl PrimaryTableBuilder {
             fallback_definitions: ctx.character_definitions().clone(),
             case: CaseClasses::from_context(ctx),
             capsletter_defined: self.capsletter_defined,
+            syllables: self.syllables,
             space_chars: ctx
                 .character_classes()
                 .get(&CharacterClass::Space)
@@ -1002,6 +1006,11 @@ impl PrimaryTable {
                 //
                 // TODO: Implement the cross-boundary restriction.
                 Rule::Syllable { chars, dots } => {
+                    if direction == Direction::Forward {
+                        builder
+                            .syllables
+                            .push(chars.to_lowercase().chars().collect());
+                    }
                     let dots = ctx
                         .character_definitions()
                         .braille_to_unicode(dots, chars)?;
@@ -1651,6 +1660,44 @@ impl PrimaryTable {
         Some(t.with_weight(weight))
     }
 
+    /// liblouis's `markSyllables`: each `syllable` match, and everything after it up to the
+    /// next one, gets one of two alternating marks, so no rule can span a syllable boundary.
+    fn syllable_marks(&self, chars: &[char]) -> Vec<u64> {
+        const MARKS: [u64; 2] = [1 << 61, 1 << 62];
+        let mut marks = vec![0; chars.len()];
+        if self.syllables.is_empty() {
+            return marks;
+        }
+        let (mut current, mut next) = (0, 0);
+        let mut pos = 0;
+        while pos < chars.len() {
+            let len = self
+                .syllables
+                .iter()
+                .filter(|s| {
+                    s.len() <= chars.len() - pos
+                        && s.iter()
+                            .zip(&chars[pos..])
+                            .all(|(s, c)| c.to_lowercase().eq(std::iter::once(*s)))
+                })
+                .map(|s| s.len())
+                .max();
+            match len {
+                Some(len) if len > 0 => {
+                    current = MARKS[next];
+                    next = 1 - next;
+                    marks[pos..pos + len].iter_mut().for_each(|m| *m |= current);
+                    pos += len;
+                }
+                _ => {
+                    marks[pos] |= current;
+                    pos += 1;
+                }
+            }
+        }
+        marks
+    }
+
     fn match_candidates(
         &self,
         input: &str,
@@ -1739,6 +1786,7 @@ impl PrimaryTable {
             .iter()
             .map(|s| s.class.as_str())
             .collect();
+        let syllable_marks = self.syllable_marks(&input_chars);
         let typebuf: Vec<u64> = (0..input_chars.len())
             .map(|pos| {
                 let caps = self.capsletter_defined && self.case.is_uppercase(input_chars[pos]);
@@ -1747,7 +1795,9 @@ impl PrimaryTable {
                     .iter()
                     .filter(|span| span.range.contains(&pos))
                     .filter_map(|span| classes.iter().position(|c| *c == span.class))
-                    .fold(caps as u64, |bits, i| bits | 2 << i.min(62))
+                    .fold(caps as u64 | syllable_marks[pos], |bits, i| {
+                        bits | 2 << i.min(58)
+                    })
             })
             .collect();
         let valid_match = |t: &ResolvedTranslation, pos: usize| {
@@ -2807,6 +2857,28 @@ mod tests {
         assert_eq!(table.translate(":b"), "⠒⠰⠃");
         // the letter sign before a contraction ignores noletsign
         assert_eq!(table.translate("ib"), "⠰⠊⠃");
+    }
+
+    #[test]
+    fn no_rule_spans_a_syllable_boundary() {
+        let rules = [
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase i 24"),
+            parse_rule("lowercase g 1245"),
+            parse_rule("lowercase h 125"),
+            parse_rule("lowercase e 15"),
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase d 145"),
+            parse_rule("always gh 126"),
+            parse_rule("always ea 2"),
+            parse_rule("syllable head 125-2-145"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("bigh"), "⠃⠊⠣");
+        assert_eq!(table.translate("bighead"), "⠃⠊⠛⠓⠂⠙");
     }
 
     #[test]
