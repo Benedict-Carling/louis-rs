@@ -3810,6 +3810,19 @@ mod tests {
         assert_eq!(table.translate("ab"), "⠁⠃");
     }
 
+    #[test]
+    fn sufword_before_a_seqdelimiter() {
+        let table = context_table(&[
+            "lowercase f 124",
+            "lowercase o 135",
+            "lowercase r 1235",
+            "math / 34",
+            "seqdelimiter /",
+            "sufword for 1246",
+        ]);
+        assert_eq!(table.translate("for/f"), "⠫⠌⠋");
+    }
+
     /// Backward, liblouis tries its pass-list context rules after each rule, on the cells
     #[test]
     fn backward_context_rule_after_a_rule() {
