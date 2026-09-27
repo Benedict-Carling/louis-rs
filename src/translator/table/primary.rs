@@ -1455,21 +1455,37 @@ impl PrimaryTable {
                     TranslationStage::Main,
                     rule,
                 ),
-                Rule::Joinword { chars, dots, .. } => {
+                Rule::Joinnum { chars, dots, .. } if direction == Direction::Forward => {
                     builder.get_trie_mut(rule).insert(
                         chars,
                         &dots.to_string(),
-                        // FIXME: joinword, prepunc and postpunc need more advanced
-                        // scaning of the input. Just checking for before and after
-                        // classes as below is too simplistic
                         Some(Transition::Start(vec![
                             CharacterClass::Space,
                             CharacterClass::Punctuation,
                         ])),
-                        Some(Transition::End(vec![
+                        Some(Transition::End(vec![CharacterClass::Space])),
+                        direction,
+                        rule.precedence(),
+                        vec![],
+                        TranslationStage::Main,
+                        rule,
+                    )
+                }
+                Rule::Joinword { chars, dots, .. } => {
+                    builder.get_trie_mut(rule).insert(
+                        chars,
+                        &dots.to_string(),
+                        // forward, `joins_ahead` checks the word it joins onto
+                        Some(Transition::Start(vec![
                             CharacterClass::Space,
                             CharacterClass::Punctuation,
                         ])),
+                        Some(Transition::End(match direction {
+                            Direction::Forward => vec![CharacterClass::Space],
+                            Direction::Backward => {
+                                vec![CharacterClass::Space, CharacterClass::Punctuation]
+                            }
+                        })),
                         direction,
                         rule.precedence(),
                         vec![],
@@ -1963,8 +1979,26 @@ impl PrimaryTable {
                 Some(Rule::Postpunc { .. }) => {
                     self.direction == Direction::Backward || constraints.postpunc_ok_at(char_pos)
                 }
+                Some(Rule::Joinword { .. } | Rule::Joinnum { .. })
+                    if self.direction == Direction::Forward =>
+                {
+                    self.joins_ahead(t, chars.as_str())
+                }
                 _ => stands_alone(t, char_pos),
             });
+            // the word a joinword or joinnum joins onto is one more condition it checks
+            if self.direction == Direction::Forward {
+                candidates = candidates
+                    .into_iter()
+                    .map(|t| match t.rule() {
+                        Some(Rule::Joinword { .. } | Rule::Joinnum { .. }) => {
+                            let weight = t.weight() + 1;
+                            t.with_weight(weight)
+                        }
+                        _ => t,
+                    })
+                    .collect();
+            }
 
             // Backward numeric mode: prefer the digit reading of a cell shared with a
             // letter (common in six-dot literary codes). Rather than out-weighing the
@@ -2079,6 +2113,26 @@ impl PrimaryTable {
                 translations.push(translation);
                 delayed_translations = self.update_offsets(delayed_translations, t.length());
                 delayed_translations.extend(self.match_candidates_within(consumed, t.length()));
+                // liblouis drops the spaces after a joinword or joinnum
+                if self.direction == Direction::Forward
+                    && matches!(t.rule(), Some(Rule::Joinword { .. } | Rule::Joinnum { .. }))
+                {
+                    while let Some(space) = chars.clone().next()
+                        && self.text_classes.is_whitespace(space)
+                    {
+                        chars.next();
+                        prev = Some(space);
+                        char_pos += 1;
+                        translations.push(ResolvedTranslation::new(
+                            &space.to_string(),
+                            "",
+                            1,
+                            TranslationStage::Main,
+                            None,
+                        ));
+                        delayed_translations = self.update_offsets(delayed_translations, 1);
+                    }
+                }
 
                 // update the environment if needed
                 if !t.effects().is_empty() {
@@ -2124,6 +2178,34 @@ impl PrimaryTable {
             }
         }
         translations
+    }
+
+    /// liblouis's forward check for `joinword` (`onlyLettersAhead`) and `joinnum`: the
+    /// match is followed by spaces and then by a letter, or a digit for `joinnum`.
+    fn joins_ahead(&self, t: &ResolvedTranslation, input: &str) -> bool {
+        let mut rest = input.chars().skip(t.length()).peekable();
+        if !rest
+            .peek()
+            .is_some_and(|&c| self.text_classes.is_whitespace(c))
+        {
+            return false;
+        }
+        let Some(next) = rest.find(|&c| !self.text_classes.is_whitespace(c)) else {
+            return false;
+        };
+        match t.rule() {
+            Some(Rule::Joinnum { .. }) => self
+                .text_classes
+                .get(&CharacterClass::Digit)
+                .is_some_and(|digits| digits.contains(&next)),
+            _ => {
+                self.text_classes.is_word(next)
+                    || self
+                        .text_classes
+                        .get(&CharacterClass::Litdigit)
+                        .is_some_and(|digits| digits.contains(&next))
+            }
+        }
     }
 
     fn handle_undefined_char(&self, ch: char) -> String {
@@ -2750,6 +2832,47 @@ mod tests {
         assert_eq!(table.translate("cd"), "⠠⠉⠙");
         assert_eq!(table.translate("abcd"), "⠁⠃⠉⠙");
         assert_eq!(table.translate("ef"), "⠑⠋");
+    }
+
+    fn forward_table(rules: &[&str]) -> PrimaryTable {
+        let rules: Vec<AnchoredRule> = rules.iter().map(|r| parse_rule(r)).collect();
+        let context = TableContext::compile(&rules).unwrap();
+        PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context).unwrap()
+    }
+
+    #[test]
+    fn joinnum_joins_onto_a_following_number() {
+        let table = forward_table(&[
+            "space \\s 0",
+            "digit 1 1",
+            "digit 2 12",
+            "litdigit 1 1",
+            "litdigit 2 12",
+            "lowercase a 1",
+            "numsign 3456",
+            "math + 235",
+            "joinnum + 56-235",
+        ]);
+        assert_eq!(table.translate("1 + 2"), "⠼⠁⠀⠰⠖⠼⠃");
+        assert_eq!(table.translate("1 + a"), "⠼⠁⠀⠖⠀⠁");
+        assert_eq!(table.translate("+"), "⠖");
+    }
+
+    #[test]
+    fn joinword_joins_onto_a_following_word() {
+        let table = forward_table(&[
+            "space \\s 0",
+            "lowercase c 14",
+            "lowercase e 15",
+            "lowercase h 125",
+            "lowercase t 2345",
+            "punctuation . 256",
+            "joinword the 2346",
+            "word the 2346",
+        ]);
+        assert_eq!(table.translate("the cet"), "⠮⠉⠑⠞");
+        assert_eq!(table.translate("the"), "⠮");
+        assert_eq!(table.translate("the. cet"), "⠮⠲⠀⠉⠑⠞");
     }
 
     #[test]
