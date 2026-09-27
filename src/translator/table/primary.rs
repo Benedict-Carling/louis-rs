@@ -1221,18 +1221,20 @@ impl PrimaryTable {
                         .character_definitions()
                         .braille_to_unicode(dots, chars)?;
                     let class_constraints = Self::resolve_class_constraints(ctx, with_classes);
-                    // a prfword is basically syntactic sugar for a word rule combined with an
-                    // endword rule. So just make the two appropriate insertions in the trie
+                    // a prfword is a word rule combined with an endword rule, and like a word
+                    // it may stand next to a seqdelimiter
                     builder.get_trie_mut(rule).insert(
                         chars,
                         &dots,
                         Some(Transition::Start(vec![
                             CharacterClass::Space,
                             CharacterClass::Punctuation,
+                            CharacterClass::Seqdelimiter,
                         ])),
                         Some(Transition::End(vec![
                             CharacterClass::Space,
                             CharacterClass::Punctuation,
+                            CharacterClass::Seqdelimiter,
                         ])),
                         direction,
                         rule.precedence(),
@@ -1247,6 +1249,7 @@ impl PrimaryTable {
                         Some(Transition::End(vec![
                             CharacterClass::Space,
                             CharacterClass::Punctuation,
+                            CharacterClass::Seqdelimiter,
                         ])),
                         direction,
                         rule.precedence(),
@@ -1265,18 +1268,20 @@ impl PrimaryTable {
                         .character_definitions()
                         .braille_to_unicode(dots, chars)?;
                     let class_constraints = Self::resolve_class_constraints(ctx, with_classes);
-                    // a sufword is basically syntactic sugar for a word rule combined with an
-                    // begword rule. So just make the two appropriate insertions in the trie
+                    // a sufword is a word rule combined with a begword rule, and like a word
+                    // it may stand next to a seqdelimiter
                     builder.get_trie_mut(rule).insert(
                         chars,
                         &dots,
                         Some(Transition::Start(vec![
                             CharacterClass::Space,
                             CharacterClass::Punctuation,
+                            CharacterClass::Seqdelimiter,
                         ])),
                         Some(Transition::End(vec![
                             CharacterClass::Space,
                             CharacterClass::Punctuation,
+                            CharacterClass::Seqdelimiter,
                         ])),
                         direction,
                         rule.precedence(),
@@ -1290,6 +1295,7 @@ impl PrimaryTable {
                         Some(Transition::Start(vec![
                             CharacterClass::Space,
                             CharacterClass::Punctuation,
+                            CharacterClass::Seqdelimiter,
                         ])),
                         Some(Transition::End(vec![CharacterClass::Letter])),
                         direction,
