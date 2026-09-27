@@ -13,6 +13,7 @@ pub struct TableContext {
     character_classes: CharacterClasses,
     dots_classes: CharacterClasses,
     swap_classes: SwapClasses,
+    seq_after_patterns: Vec<String>,
 }
 
 impl TableContext {
@@ -27,6 +28,7 @@ impl TableContext {
             character_classes,
             dots_classes,
             swap_classes,
+            seq_after_patterns: Vec::new(),
         }
     }
 
@@ -46,11 +48,16 @@ impl TableContext {
         &self.swap_classes
     }
 
+    pub fn seq_after_patterns(&self) -> &[String] {
+        &self.seq_after_patterns
+    }
+
     pub fn compile(rules: &[AnchoredRule]) -> Result<TableContext, TranslationError> {
         let mut character_definitions = CharacterDefinition::new();
         let mut character_classes = CharacterClasses::default();
         let mut dots_classes = CharacterClasses::default();
         let mut swap_classes = SwapClasses::default();
+        let mut seq_after_patterns = Vec::new();
 
         // First pass: everything that later rules need to *look up*. These include
         // character definitions (`space`, `letter`, `digit`, …), because `Rule::Base` and
@@ -254,6 +261,9 @@ impl TableContext {
                         );
                     }
                 }
+                Rule::Seqafterpattern { chars } => {
+                    seq_after_patterns.push(chars.clone());
+                }
                 Rule::Swapcc {
                     name,
                     chars,
@@ -312,6 +322,7 @@ impl TableContext {
             character_classes,
             dots_classes,
             swap_classes,
+            seq_after_patterns,
         })
     }
 }

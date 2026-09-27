@@ -37,7 +37,13 @@ impl Regexp {
             Pattern::Group(patterns) => {
                 Regexp::Group(Box::new(Regexp::from_patterns(patterns, ctx)))
             }
-            Pattern::Negate(pattern) => Regexp::from_pattern(pattern, ctx).negate(),
+            // liblouis negates only the attribute test: a character must still be there
+            Pattern::Negate(pattern) => match pattern.as_ref() {
+                Pattern::AttributesOrBoundary(hash_set, _) => {
+                    Regexp::from_attributes(hash_set, ctx).negate()
+                }
+                pattern => Regexp::from_pattern(pattern, ctx).negate(),
+            },
             Pattern::Optional(pattern) => {
                 Regexp::Optional(Box::new(Regexp::from_pattern(pattern, ctx)))
             }
@@ -123,12 +129,14 @@ impl Regexp {
 #[derive(Debug)]
 pub struct MatchPatternsBuilder {
     regexps: Vec<CompiledRegexp>,
+    with_pre: Vec<usize>,
 }
 
 impl MatchPatternsBuilder {
     pub fn new() -> Self {
         Self {
             regexps: Vec::new(),
+            with_pre: Vec::new(),
         }
     }
 
@@ -150,12 +158,16 @@ impl MatchPatternsBuilder {
         ));
         let regexp = Regexp::from_match_rule(pre, chars.to_string(), post, ctx)
             .compile_with_payload(translation);
+        if !pre.iter().all(|p| matches!(p, Pattern::Empty)) {
+            self.with_pre.push(self.regexps.len());
+        }
         self.regexps.push(regexp);
     }
 
     pub fn build(self) -> MatchPatterns {
         MatchPatterns {
             regexps: self.regexps,
+            with_pre: self.with_pre,
         }
     }
 }
@@ -163,6 +175,8 @@ impl MatchPatternsBuilder {
 #[derive(Debug)]
 pub struct MatchPatterns {
     regexps: Vec<CompiledRegexp>,
+    /// Indices into `regexps` of the rules with a `pre` pattern.
+    with_pre: Vec<usize>,
 }
 
 impl MatchPatterns {
@@ -172,6 +186,15 @@ impl MatchPatterns {
         self.regexps
             .iter()
             .flat_map(|r| r.find_anchored(input, &Environment::new(), at_start))
+            .collect()
+    }
+
+    /// Like [`find`](MatchPatterns::find) at a position that is not the start of the input,
+    /// but only for the rules whose `pre` pattern could have started here.
+    pub fn find_with_pre(&self, input: &str) -> Vec<ResolvedTranslation> {
+        self.with_pre
+            .iter()
+            .flat_map(|&i| self.regexps[i].find_anchored(input, &Environment::new(), false))
             .collect()
     }
 }

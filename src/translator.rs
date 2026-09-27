@@ -23,6 +23,7 @@ mod pipeline;
 mod position_constraints;
 mod positions;
 mod regexp;
+mod sequence;
 mod swap;
 mod table;
 mod translation;

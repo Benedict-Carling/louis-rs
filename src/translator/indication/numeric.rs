@@ -21,6 +21,7 @@ impl IndicatorBuilder {
         IndicatorBuilder(Indicator {
             numeric_chars: HashSet::default(),
             extra_numeric_chars: HashSet::default(),
+            mid_end_numeric_chars: HashSet::default(),
             mid_numeric_chars: HashSet::default(),
             start_translation: None,
             end_translation: None,
@@ -66,9 +67,13 @@ impl IndicatorBuilder {
         self.0.uses_numeric_mode = true;
     }
 
-    /// `numericmodechars` and `midendnumericmodechars`: both keep a numeric run going
     pub fn numericmodechars(&mut self, s: &str) {
         self.0.extra_numeric_chars.extend(s.chars());
+        self.0.uses_numeric_mode = true;
+    }
+
+    pub fn midendnumericmodechars(&mut self, s: &str) {
+        self.0.mid_end_numeric_chars.extend(s.chars());
         self.0.uses_numeric_mode = true;
     }
 
@@ -84,6 +89,8 @@ pub struct Indicator {
     /// Characters that extend a numeric run without being digits themselves
     /// (e.g. `numericmodechars`)
     extra_numeric_chars: HashSet<char>,
+    /// Characters that extend a numeric run but never start one (`midendnumericmodechars`)
+    mid_end_numeric_chars: HashSet<char>,
     /// Characters that extend a numeric run only when sandwiched between two
     /// digits (`midnum`)
     mid_numeric_chars: HashSet<char>,
@@ -113,6 +120,12 @@ impl Indicator {
         for (pos, &c) in chars.iter().enumerate() {
             let is_numeric = self.numeric_chars.contains(&c);
             match (is_numeric, in_numeric) {
+                (false, false) if self.starts_numeric_mode(&chars[pos..]) => {
+                    in_numeric = true;
+                    if let Some(t) = &self.start_translation {
+                        translations.push((pos, t.clone()));
+                    }
+                }
                 (false, false) => {}
                 (true, false) => {
                     in_numeric = true;
@@ -121,7 +134,9 @@ impl Indicator {
                     }
                 }
                 (true, true) => {}
-                (false, true) if self.extra_numeric_chars.contains(&c) => {}
+                (false, true)
+                    if self.extra_numeric_chars.contains(&c)
+                        || self.mid_end_numeric_chars.contains(&c) => {}
                 (false, true)
                     if !self.uses_numeric_mode
                         && self.mid_numeric_chars.contains(&c)
@@ -140,6 +155,16 @@ impl Indicator {
         }
 
         translations
+    }
+
+    /// A run of `numericmodechars` followed by a digit enters numeric mode at its first
+    /// character, as liblouis' `checkNumericMode` does.
+    fn starts_numeric_mode(&self, chars: &[char]) -> bool {
+        chars
+            .iter()
+            .find(|c| !self.extra_numeric_chars.contains(c))
+            .is_some_and(|c| self.numeric_chars.contains(c))
+            && self.extra_numeric_chars.contains(&chars[0])
     }
 }
 
@@ -194,7 +219,7 @@ mod tests {
         builder.numeric_characters(HashSet::from(['1', '2', '3']));
         builder.numsign("⠼", &rule("numsign 3456"));
         builder.midnum(",");
-        builder.numericmodechars(",");
+        builder.midendnumericmodechars(",");
         let indicator = builder.build().unwrap();
 
         assert_eq!(
@@ -205,5 +230,32 @@ mod tests {
                 (7, "⠼".to_string())
             ]
         );
+        assert_eq!(
+            pairs(&indicator.precompute("a,1")),
+            vec![(2, "⠼".to_string())]
+        );
+    }
+
+    #[test]
+    fn precompute_numericmodechars_before_digit() {
+        let mut builder = IndicatorBuilder::new();
+        builder.numeric_characters(HashSet::from(['1', '2', '3']));
+        builder.numsign("⠼", &rule("numsign 3456"));
+        builder.numericmodechars(".,");
+        let indicator = builder.build().unwrap();
+
+        assert_eq!(
+            pairs(&indicator.precompute("a.1")),
+            vec![(1, "⠼".to_string())]
+        );
+        assert_eq!(
+            pairs(&indicator.precompute(".,2")),
+            vec![(0, "⠼".to_string())]
+        );
+        assert_eq!(
+            pairs(&indicator.precompute("1.2")),
+            vec![(0, "⠼".to_string())]
+        );
+        assert!(pairs(&indicator.precompute("a.b")).is_empty());
     }
 }
