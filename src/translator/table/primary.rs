@@ -1,7 +1,5 @@
 use std::collections::{HashMap, HashSet};
 
-use log::warn;
-
 use crate::{
     Direction,
     emphasis::EmphasisSpan,
@@ -323,31 +321,6 @@ impl PrimaryTableBuilder {
         );
     }
 
-    /// Returns whether `opcode`'s `dots` are safe to register as a backward indicator:
-    /// some tables include a shared subtable purely for other opcodes (e.g.
-    /// Malayalam/Punjabi including `en-in-g1.ctb`), whose `capsletter`/`begcapsword`/
-    /// `numsign` happen to coincide with one of the table's own script letters. Since
-    /// the table itself doesn't actually intend a conflict — the collision is an
-    /// accident of composing independently-authored subtables — this is reported as a
-    /// warning (the opcode is ignored for backward translation, the letter wins) rather
-    /// than a hard error, mirroring how a missing `letsign`/`nocontractionsign`
-    /// counterpart is already handled.
-    fn backward_indicator_dots_available(
-        opcode: &str,
-        dots: &str,
-        letter_dots: &HashSet<String>,
-    ) -> bool {
-        if letter_dots.contains(dots) {
-            warn!(
-                "{opcode} dots {dots} collide with a letter definition in this table; \
-                 ignoring {opcode} for backward translation"
-            );
-            false
-        } else {
-            true
-        }
-    }
-
     fn build(mut self, direction: Direction, ctx: &TableContext) -> PrimaryTable {
         let triggers = self.compbrl_triggers;
         let numeric_mode_chars: Vec<char> = self
@@ -511,22 +484,6 @@ impl PrimaryTable {
             HashSet::new()
         };
 
-        // Backward-only: the dots of letter definitions, which an indicator may not share
-        // (see `backward_indicator_dots_available`).
-        let letter_dots: HashSet<String> = if direction == Direction::Backward {
-            rules
-                .iter()
-                .filter_map(|r| match &r.rule {
-                    Rule::Letter { dots, .. }
-                    | Rule::Lowercase { dots, .. }
-                    | Rule::Uppercase { dots, .. } => Some(dots.to_string()),
-                    _ => None,
-                })
-                .collect()
-        } else {
-            HashSet::new()
-        };
-
         let defined_chars: HashSet<char> = rules
             .iter()
             .filter_map(|rule| match &rule.rule {
@@ -635,14 +592,7 @@ impl PrimaryTable {
                 }
                 Rule::Numsign { dots } => {
                     builder.numeric_indicator.numsign(&dots.to_string(), rule);
-                    // See `backward_indicator_dots_available` for why this can be skipped.
-                    if direction == Direction::Backward
-                        && PrimaryTableBuilder::backward_indicator_dots_available(
-                            "numsign",
-                            &dots.to_string(),
-                            &letter_dots,
-                        )
-                    {
+                    if direction == Direction::Backward {
                         builder.insert_backward_indicator(&dots.to_string(), rule);
                     }
                 }
@@ -651,13 +601,7 @@ impl PrimaryTable {
                     builder
                         .dont_contract_constrainer
                         .nonumsign(&dots.to_string());
-                    if direction == Direction::Backward
-                        && PrimaryTableBuilder::backward_indicator_dots_available(
-                            "nonumsign",
-                            &dots.to_string(),
-                            &letter_dots,
-                        )
-                    {
+                    if direction == Direction::Backward {
                         builder.insert_backward_indicator(&dots.to_string(), rule);
                     }
                 }
@@ -681,14 +625,7 @@ impl PrimaryTable {
                     builder
                         .emphasis_indicator
                         .capsletter(&dots.to_string(), rule);
-                    // See `backward_indicator_dots_available` for why this can be skipped.
-                    if direction == Direction::Backward
-                        && PrimaryTableBuilder::backward_indicator_dots_available(
-                            "capsletter",
-                            &dots.to_string(),
-                            &letter_dots,
-                        )
-                    {
+                    if direction == Direction::Backward {
                         builder.insert_backward_indicator(&dots.to_string(), rule);
                     }
                 }
@@ -696,13 +633,7 @@ impl PrimaryTable {
                     builder
                         .emphasis_indicator
                         .begcapsword(&dots.to_string(), rule);
-                    if direction == Direction::Backward
-                        && PrimaryTableBuilder::backward_indicator_dots_available(
-                            "begcapsword",
-                            &dots.to_string(),
-                            &letter_dots,
-                        )
-                    {
+                    if direction == Direction::Backward {
                         builder.insert_backward_indicator(&dots.to_string(), rule);
                     }
                 }
@@ -710,37 +641,19 @@ impl PrimaryTable {
                     builder
                         .emphasis_indicator
                         .endcapsword(&dots.to_string(), rule);
-                    if direction == Direction::Backward
-                        && PrimaryTableBuilder::backward_indicator_dots_available(
-                            "endcapsword",
-                            &dots.to_string(),
-                            &letter_dots,
-                        )
-                    {
+                    if direction == Direction::Backward {
                         builder.insert_backward_indicator(&dots.to_string(), rule);
                     }
                 }
                 Rule::Begcaps { dots } => {
                     builder.emphasis_indicator.begcaps(&dots.to_string(), rule);
-                    if direction == Direction::Backward
-                        && PrimaryTableBuilder::backward_indicator_dots_available(
-                            "begcaps",
-                            &dots.to_string(),
-                            &letter_dots,
-                        )
-                    {
+                    if direction == Direction::Backward {
                         builder.insert_backward_indicator(&dots.to_string(), rule);
                     }
                 }
                 Rule::Endcaps { dots } => {
                     builder.emphasis_indicator.endcaps(&dots.to_string(), rule);
-                    if direction == Direction::Backward
-                        && PrimaryTableBuilder::backward_indicator_dots_available(
-                            "endcaps",
-                            &dots.to_string(),
-                            &letter_dots,
-                        )
-                    {
+                    if direction == Direction::Backward {
                         builder.insert_backward_indicator(&dots.to_string(), rule);
                     }
                 }
@@ -862,13 +775,7 @@ impl PrimaryTable {
                     builder
                         .lettersign_indicator
                         .letsign(&dots.to_string(), rule);
-                    if direction == Direction::Backward
-                        && PrimaryTableBuilder::backward_indicator_dots_available(
-                            "letsign",
-                            &dots.to_string(),
-                            &letter_dots,
-                        )
-                    {
+                    if direction == Direction::Backward {
                         builder.insert_backward_indicator(&dots.to_string(), rule);
                     }
                 }
@@ -916,13 +823,7 @@ impl PrimaryTable {
                     builder
                         .dont_contract_constrainer
                         .nocontractsign(&dots.to_string());
-                    if direction == Direction::Backward
-                        && PrimaryTableBuilder::backward_indicator_dots_available(
-                            "nocontractsign",
-                            &dots.to_string(),
-                            &letter_dots,
-                        )
-                    {
+                    if direction == Direction::Backward {
                         builder.insert_backward_indicator(&dots.to_string(), rule);
                     }
                 }
@@ -3872,29 +3773,5 @@ mod tests {
         .unwrap();
         assert_eq!(table.translate("⠘⠁⠀⠃⠰⠀⠁"), "A B a");
         assert_eq!(table.translate("⠨⠨⠁⠃⠀⠁"), "AB a");
-    }
-
-    #[test]
-    fn backward_capsletter_does_not_shadow_a_real_letter_sharing_its_dots() {
-        // Regression: some tables (e.g. Malayalam, Punjabi) include a shared subtable
-        // (en-in-g1.ctb) purely for other opcodes, whose capsletter/numsign happen to
-        // share dots with one of the table's own script letters (Malayalam "ഃ" and
-        // capsletter both use dots 6). Unlike the `$`/capsletter collision, the letter
-        // must win here — capsletter should not be recognized as an indicator at all
-        // for dots already claimed by a real letter.
-        let rules = [
-            parse_rule("lowercase a 1"),
-            parse_rule("letter b 6"),
-            parse_rule("capsletter 6"),
-        ];
-        let context = TableContext::compile(&rules).unwrap();
-        let table = PrimaryTable::compile(
-            &rules,
-            Direction::Backward,
-            TranslationStage::Main,
-            &context,
-        )
-        .unwrap();
-        assert_eq!(table.translate("⠠⠁"), "ba");
     }
 }
