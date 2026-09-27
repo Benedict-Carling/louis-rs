@@ -1963,7 +1963,8 @@ impl PrimaryTable {
             // marks a single capitalized letter, not a whole capitalized word.
             let is_backward = self.direction == Direction::Backward;
             let uppercase_here = is_backward && constraints.uppercase_at(char_pos);
-            let titlecase_here = is_backward && constraints.titlecase_at(char_pos);
+            let next_upper = backward_state.next_upper;
+            let titlecase_here = is_backward && (constraints.titlecase_at(char_pos) || next_upper);
             let to_uppercase = |c: char| -> String {
                 match &self.backward {
                     Some(selector) => selector.to_uppercase(c),
@@ -2057,6 +2058,9 @@ impl PrimaryTable {
                     char_pos += t.length();
                 }
                 if let Some(selector) = &self.backward {
+                    if next_upper && !t.output().is_empty() {
+                        backward_state.next_upper = false;
+                    }
                     selector.applied(&mut backward_state, t.rule());
                 }
                 // there is a matching translation rule
@@ -3550,6 +3554,21 @@ mod tests {
         let table = backward_table(&rules);
         assert_eq!(table.translate("⠁⠇"), "also");
         assert_eq!(table.translate("⠰⠠⠁⠇"), "Al");
+    }
+
+    #[test]
+    fn backward_capsletter_carries_over_indicators() {
+        let table = backward_table(&[
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase q 6-12345"),
+            parse_rule("capsletter 46"),
+            parse_rule("letsign 6"),
+            parse_rule("multind 46-6 capsletter letsign"),
+            parse_rule("space \\s 0"),
+        ]);
+        assert_eq!(table.translate("⠨⠠⠁"), "A");
+        assert_eq!(table.translate("⠨⠠⠠⠟"), "Q");
+        assert_eq!(table.translate("⠨⠀⠁"), " a");
     }
 
     #[test]

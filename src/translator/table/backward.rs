@@ -68,6 +68,9 @@ pub struct State {
     /// a digit.
     number: u8,
     no_contract: NoContract,
+    /// liblouis's `nextUpper`: set by `capsletter`, it capitalizes the next character put
+    /// out, however many indicators come between.
+    pub next_upper: bool,
 }
 
 #[derive(Debug, Default)]
@@ -337,6 +340,7 @@ impl BackwardSelector {
             Rule::Space { .. } => {
                 state.no_contract = NoContract::Off;
                 state.number = 0;
+                state.next_upper = false;
             }
             _ => {}
         }
@@ -352,9 +356,11 @@ impl BackwardSelector {
 
     fn indicator_applied(state: &mut State, name: &str) {
         match name {
-            "capsletter" | "begcapsword" | "endcapsword" | "begcaps" | "endcaps" | "begcomp" => {
-                state.number = 0
+            "capsletter" => {
+                state.next_upper = true;
+                state.number = 0;
             }
+            "begcapsword" | "endcapsword" | "begcaps" | "endcaps" | "begcomp" => state.number = 0,
             "letsign" | "nonumsign" | "nocontractsign" => {
                 state.no_contract = NoContract::Active;
                 state.number = 0;
