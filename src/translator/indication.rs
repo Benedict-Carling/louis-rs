@@ -122,6 +122,17 @@ impl Indicators {
         Indicators(indicators)
     }
 
+    /// Where liblouis's emphasis buffer marks anything for an emphasis class
+    pub fn emphasis_marks(&self, input: &str, spans: &[EmphasisSpan]) -> Vec<bool> {
+        self.0
+            .iter()
+            .find_map(|indicator| match indicator {
+                Indicator::Emphasis(i) => Some(i.marked(input, spans)),
+                _ => None,
+            })
+            .unwrap_or_else(|| vec![false; input.chars().count() + 1])
+    }
+
     pub fn precompute(&self, input: &str, spans: &[EmphasisSpan]) -> PrecomputedIndications<'_> {
         let n = input.chars().count();
         let mut translations = vec![(vec![], vec![]); n + 1];

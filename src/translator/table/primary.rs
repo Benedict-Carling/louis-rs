@@ -1837,16 +1837,18 @@ impl PrimaryTable {
             same_typeform && self.case.valid_match(&input_chars, pos, len)
         };
         // where liblouis's emphasisBuffer (caps included) marks a begin, end, word or symbol
-        let emphasis_at = |caps_only: bool| -> Vec<bool> {
-            (0..=input_chars.len())
-                .map(|pos| {
-                    indications
+        let emphasis_at: Vec<bool> = self
+            .indicators
+            .emphasis_marks(input, &enriched_spans)
+            .into_iter()
+            .enumerate()
+            .map(|(pos, emphasis)| {
+                emphasis
+                    || indications
                         .precomputed_at(pos)
-                        .any(|t| is_emphasis_indicator(t.rule(), caps_only))
-                })
-                .collect()
-        };
-        let (emphasis_at, caps_at) = (emphasis_at(false), emphasis_at(true));
+                        .any(|t| is_caps_indicator(t.rule()))
+            })
+            .collect();
         let emphasis_allows = |t: &ResolvedTranslation, pos: usize| {
             if self.direction == Direction::Backward {
                 return true;
@@ -1861,7 +1863,7 @@ impl PrimaryTable {
                         | Rule::Word { .. }
                         | Rule::Match { .. }
                 )
-            ) && (pos + 1..end).any(|i| caps_at[i]);
+            ) && (pos + 1..end).any(|i| emphasis_at[i]);
             let (before, after) = match t.rule() {
                 Some(Rule::Match {
                     matches: Some(m), ..
@@ -2274,8 +2276,8 @@ fn fallback(ch: char) -> char {
     char::from_u32(0x2800 | dot7 | DOTS[(c - 0x20) as usize]).unwrap()
 }
 
-fn is_emphasis_indicator(rule: Option<&Rule>, caps_only: bool) -> bool {
-    let caps = matches!(
+fn is_caps_indicator(rule: Option<&Rule>) -> bool {
+    matches!(
         rule,
         Some(
             Rule::Capsletter { .. }
@@ -2286,20 +2288,7 @@ fn is_emphasis_indicator(rule: Option<&Rule>, caps_only: bool) -> bool {
                 | Rule::Begcapsphrase { .. }
                 | Rule::Endcapsphrase { .. }
         )
-    );
-    caps || !caps_only
-        && matches!(
-            rule,
-            Some(
-                Rule::Emphletter { .. }
-                    | Rule::Begemph { .. }
-                    | Rule::Endemph { .. }
-                    | Rule::Begemphword { .. }
-                    | Rule::Endemphword { .. }
-                    | Rule::Begemphphrase { .. }
-                    | Rule::Endemphphrase { .. }
-            )
-        )
+    )
 }
 
 #[cfg(test)]
