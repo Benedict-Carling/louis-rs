@@ -6,8 +6,8 @@ use crate::{
     Direction,
     emphasis::EmphasisSpan,
     parser::{
-        AnchoredRule, Braille, BrailleChars, CharacterClass, CharacterClasses, HasNocross,
-        HasPrecedence, Precedence, WithClass,
+        AnchoredRule, Braille, BrailleChars, CharacterClass, CharacterClasses, HasDirection,
+        HasNocross, HasPrecedence, Precedence, WithClass,
     },
     translator::{
         CharacterDefinition, ClassConstraint, ResolvedTranslation, Rule, TranslationError,
@@ -1643,6 +1643,28 @@ impl PrimaryTable {
             .character_classes()
             .get(&CharacterClass::Letter)
             .unwrap_or_default();
+        // liblouis's finalizeTable: a letter with a single-letter word or largesign rule
+        // never takes a letter sign
+        for rule in rules.iter().filter(|r| r.is_direction(Direction::Forward)) {
+            if let Rule::Word { chars, .. } | Rule::Largesign { chars, .. } = &rule.rule {
+                let mut cs = chars.chars();
+                if let (Some(c), None) = (cs.next(), cs.next())
+                    && [
+                        CharacterClass::Letter,
+                        CharacterClass::Uppercase,
+                        CharacterClass::Lowercase,
+                    ]
+                    .iter()
+                    .any(|class| {
+                        ctx.character_classes()
+                            .get(class)
+                            .is_some_and(|l| l.contains(&c))
+                    })
+                {
+                    builder.lettersign_indicator.noletsign(chars);
+                }
+            }
+        }
         builder
             .punctuation_constrainer
             .letter_characters(letter_chars.clone());
@@ -2728,6 +2750,23 @@ mod tests {
         assert_eq!(table.translate("cd"), "⠠⠉⠙");
         assert_eq!(table.translate("abcd"), "⠁⠃⠉⠙");
         assert_eq!(table.translate("ef"), "⠑⠋");
+    }
+
+    #[test]
+    fn single_letter_word_takes_no_letsign() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase u 136"),
+            parse_rule("letsign 56"),
+            parse_rule("word u 136"),
+            parse_rule("nofor word a 1"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("u"), "⠥");
+        assert_eq!(table.translate("a"), "⠰⠁");
     }
 
     #[test]
