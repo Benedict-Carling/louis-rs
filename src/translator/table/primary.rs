@@ -1641,10 +1641,10 @@ impl PrimaryTable {
             .partition(|t| t.offset() == 0)
     }
 
-    /// A nocross candidate is valid only if it doesn't cross an internal
-    /// hyphenation break of the word it's part of, mirroring liblouis's
-    /// `syllableBreak`. `char_pos` is the candidate's starting position in
-    /// the whole input, needed to look up the precomputed breaks.
+    /// A nocross candidate is valid only if it doesn't cross a hyphenation break of the
+    /// word it starts in, mirroring liblouis's `syllableBreak`. `char_pos` is the
+    /// candidate's starting position in the whole input, needed to look up the
+    /// precomputed breaks.
     fn nocross_candidates(
         &self,
         input: &str,
@@ -1657,6 +1657,7 @@ impl PrimaryTable {
             .into_iter()
             .filter(|t| {
                 !(char_pos..char_pos + t.length().saturating_sub(1))
+                    .take_while(|&pos| constraints.letter_gap_at(pos))
                     .any(|pos| constraints.hyphenation_break_at(pos))
             })
             .collect()
@@ -3242,6 +3243,31 @@ mod tests {
                 .unwrap();
         assert_eq!(table.translate("hausboot"), "⠇");
         assert_eq!(table.translate("fff"), "⠸");
+    }
+
+    /// liblouis's `syllableBreak` hyphenates the lowercased word the rule starts in, and
+    /// only that word
+    #[test]
+    fn nocross_checks_the_lowercased_word_it_starts_in() {
+        let rules = vec![
+            parse_rule("include dictionaries/nocross-test.dic"),
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase s 234"),
+            parse_rule("uppercase S 234"),
+            parse_rule("uppercase B 12"),
+            parse_rule("punctuation - 36"),
+            parse_rule("nocross always sb 456"),
+            parse_rule("nocross always -sb 3456"),
+        ];
+        let rules = expand_includes(rules, &fixture_search_path(), &[]).unwrap();
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("asb"), "⠁⠎⠃");
+        assert_eq!(table.translate("aSB"), "⠁⠎⠃");
+        assert_eq!(table.translate("a-sb"), "⠁⠼");
     }
 
     #[test]
