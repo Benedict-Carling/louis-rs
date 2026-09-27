@@ -325,6 +325,15 @@ impl TableContext {
                 _ => (),
             }
         }
+        for (n, class) in user_classes(rules).into_iter().take(4).enumerate() {
+            let ordinal = CharacterClass::Ordinal(n as u8 + 1);
+            for c in character_classes.get(&class).unwrap_or_default() {
+                character_classes.insert(ordinal.clone(), c);
+            }
+            for c in dots_classes.get(&class).unwrap_or_default() {
+                dots_classes.insert(ordinal.clone(), c);
+            }
+        }
         Ok(TableContext {
             character_dots: Arc::new(CharacterDots::new(character_definitions.clone(), undefined)),
             character_definitions,
@@ -338,6 +347,47 @@ impl TableContext {
     }
 }
 
+/// The classes a table defines beyond liblouis' predefined ones, in the order liblouis
+/// allocates their attributes
+fn user_classes(rules: &[AnchoredRule]) -> Vec<CharacterClass> {
+    let mut classes: Vec<CharacterClass> = Vec::new();
+    for rule in rules {
+        let name = match &rule.rule {
+            Rule::Attribute { name, .. } if !name.starts_with(|c: char| c.is_ascii_digit()) => name,
+            Rule::Class { name, .. }
+            | Rule::Base { name, .. }
+            | Rule::Modeletter { name, .. }
+            | Rule::Begmodeword { name, .. }
+            | Rule::Endmodeword { name, .. }
+            | Rule::Begmode { name, .. }
+            | Rule::Endmode { name, .. }
+            | Rule::Begmodephrase { name, .. }
+            | Rule::Endmodephrase { name, .. }
+            | Rule::Lenmodephrase { name, .. } => name,
+            _ => continue,
+        };
+        if matches!(
+            name.as_str(),
+            "space"
+                | "letter"
+                | "digit"
+                | "punctuation"
+                | "uppercase"
+                | "lowercase"
+                | "math"
+                | "sign"
+                | "litdigit"
+        ) {
+            continue;
+        }
+        let class = CharacterClass::from(name.as_str());
+        if !classes.contains(&class) {
+            classes.push(class);
+        }
+    }
+    classes
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -348,6 +398,32 @@ mod tests {
 
     fn parse_rule(source: &str) -> AnchoredRule {
         RuleParser::new(source).rule().unwrap().into()
+    }
+
+    #[test]
+    fn ordinal_classes() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("attribute 1 a"),
+            parse_rule("attribute letter b"),
+            parse_rule("attribute foo a"),
+            parse_rule("base uppercase A a"),
+            parse_rule("attribute bar b"),
+            parse_rule("attribute foo c"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        assert_eq!(
+            context.character_classes.get(&CharacterClass::Ordinal(1)),
+            Some(HashSet::from(['a', 'c']))
+        );
+        assert_eq!(
+            context.character_classes.get(&CharacterClass::Ordinal(2)),
+            Some(HashSet::from(['b']))
+        );
+        assert_eq!(
+            context.character_classes.get(&CharacterClass::Ordinal(3)),
+            None
+        );
     }
 
     #[test]

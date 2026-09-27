@@ -132,8 +132,12 @@ impl Regexp {
                         characters.extend(chars);
                     }
                 }
-                Attribute::Boundary => (),   // TODO
-                Attribute::ByOrder(_) => (), // TODO
+                Attribute::Boundary => (), // TODO
+                Attribute::ByOrder(n) => {
+                    if let Some(chars) = ctx.get(&CharacterClass::Ordinal(*n)) {
+                        characters.extend(chars);
+                    }
+                }
                 Attribute::Any => unreachable!("handled above"),
             }
         }

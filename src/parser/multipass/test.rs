@@ -506,6 +506,7 @@ mod display {
                     CharacterClass::Seqdelimiter => write!(f, "~"),
                     CharacterClass::Seqbeforechars => write!(f, "<"),
                     CharacterClass::Seqafterchars => write!(f, ">"),
+                    CharacterClass::Ordinal(_) => unreachable!(),
                     CharacterClass::UserDefined(name) => write!(f, "{}", name),
                 },
                 Attribute::ByOrder(order) => match order {
