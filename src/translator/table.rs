@@ -3,9 +3,13 @@ pub mod display;
 pub mod multipass;
 pub mod primary;
 
+use std::sync::Arc;
+
 use crate::{
     parser::{AnchoredRule, CharacterClass, CharacterClasses, Rule},
-    translator::{CharacterDefinition, TranslationError, swap::SwapClasses},
+    translator::{
+        CharacterDefinition, TranslationError, swap::SwapClasses, translation::CharacterDots,
+    },
 };
 
 #[derive(Debug, Default)]
@@ -19,6 +23,7 @@ pub struct TableContext {
     direction_dots_classes: Option<CharacterClasses>,
     swap_classes: SwapClasses,
     seq_after_patterns: Vec<String>,
+    character_dots: Arc<CharacterDots>,
 }
 
 impl TableContext {
@@ -36,6 +41,7 @@ impl TableContext {
             seq_after_patterns: Vec::new(),
             direction_character_classes: None,
             direction_dots_classes: None,
+            character_dots: Arc::default(),
         }
     }
 
@@ -53,6 +59,10 @@ impl TableContext {
 
     pub fn swap_classes(&self) -> &SwapClasses {
         &self.swap_classes
+    }
+
+    pub fn character_dots(&self) -> &Arc<CharacterDots> {
+        &self.character_dots
     }
 
     /// This context with the character and dots classes of `other`
@@ -88,6 +98,7 @@ impl TableContext {
         let mut dots_classes = CharacterClasses::default();
         let mut swap_classes = SwapClasses::default();
         let mut seq_after_patterns = Vec::new();
+        let mut undefined = None;
 
         // First pass: everything that later rules need to *look up*. These include
         // character definitions (`space`, `letter`, `digit`, …), because `Rule::Base` and
@@ -260,6 +271,7 @@ impl TableContext {
                 Rule::Seqafterpattern { chars } => {
                     seq_after_patterns.push(chars.clone());
                 }
+                Rule::Undefined { dots } => undefined = Some(dots.to_string()),
                 Rule::Swapcc {
                     name,
                     chars,
@@ -314,6 +326,7 @@ impl TableContext {
             }
         }
         Ok(TableContext {
+            character_dots: Arc::new(CharacterDots::new(character_definitions.clone(), undefined)),
             character_definitions,
             character_classes,
             dots_classes,

@@ -2114,7 +2114,7 @@ impl PrimaryTable {
                     // otherwise handle it as a undefined character
                     let translation = ResolvedTranslation::new(
                         &next_char.to_string(),
-                        &self.handle_undefined_char(next_char),
+                        &undefined_char_dots(next_char, &self.fallback_definitions),
                         1,
                         TranslationStage::Main,
                         None,
@@ -2147,22 +2147,6 @@ impl PrimaryTable {
             _ => self.letter_or_litdigit_chars.contains(&next),
         }
     }
-
-    fn handle_undefined_char(&self, ch: char) -> String {
-        ch.escape_unicode()
-            .to_string()
-            .replace(r"\u", r"\x") // replace \u by \x
-            .replace(['{', '}'], "") // drop the curly braces
-            .chars()
-            .map(|c| {
-                if let Some(t) = self.fallback_definitions.get(&c) {
-                    t.clone()
-                } else {
-                    fallback(c).to_string()
-                }
-            })
-            .collect()
-    }
 }
 
 /// The opcodes liblouis's `for_selectRule` skips while `dontContract` is set
@@ -2192,13 +2176,30 @@ fn is_contraction(rule: &Rule) -> bool {
     )
 }
 
+/// The escape liblouis prints for a character the table does not define, in the table's dots
+pub(crate) fn undefined_char_dots(ch: char, definitions: &CharacterDefinition) -> String {
+    ch.escape_unicode()
+        .to_string()
+        .replace(r"\u", r"\x")
+        .replace(['{', '}'], "")
+        .chars()
+        .map(|c| {
+            if let Some(t) = definitions.get(&c) {
+                t.clone()
+            } else {
+                fallback(c).to_string()
+            }
+        })
+        .collect()
+}
+
 /// Map a char to dots according to the North American Braille Computer Code (NABCC)
 ///
 /// A fallback mapping for character to braille in case the table does
 /// not provide a mapping. This is used as a last resort when printing
 /// unicode escapes for undefined characters when the table does not
 /// define the character mappings that are needed. Only the characters
-/// that [`PrimaryTable::handle_undefined_char`] can produce are mapped.
+/// that [`undefined_char_dots`] can produce are mapped.
 fn fallback(ch: char) -> BrailleChars {
     let dots = match ch {
         '0' => "356",
@@ -2262,7 +2263,7 @@ mod tests {
 
     #[test]
     fn fallback_covers_every_escaped_char() {
-        // handle_undefined_char emits `\x` plus lowercase hex digits, so
+        // undefined_char_dots emits `\x` plus lowercase hex digits, so
         // fallback must map all of them without hitting the unreachable arm
         for c in r"\x0123456789abcdef".chars() {
             assert_eq!(fallback(c).len(), 1);
