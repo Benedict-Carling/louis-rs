@@ -641,6 +641,9 @@ impl PrimaryTable {
                     builder.numeric_indicator.numericmodechars(chars);
                     builder.numeric_constrainer.numericmodechars(chars);
                 }
+                Rule::Midendnumericmodechars { chars } => {
+                    builder.numeric_indicator.numericmodechars(chars);
+                }
                 Rule::Capsletter { dots, .. } => {
                     builder
                         .uppercase_indicator
