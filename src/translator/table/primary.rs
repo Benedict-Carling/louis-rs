@@ -1580,6 +1580,26 @@ impl PrimaryTable {
             .partition(|t| t.offset() == 0)
     }
 
+    /// liblouis matches a `match` rule's `pre` pattern backwards from the rule's position, so
+    /// it may begin inside the `len` characters at the start of `consumed` that a translation
+    /// just used up, positions the loop never visits. Returns those candidates, with offsets
+    /// relative to the position after them.
+    fn match_candidates_within(&self, consumed: &str, len: usize) -> Vec<ResolvedTranslation> {
+        consumed
+            .char_indices()
+            .enumerate()
+            .take(len)
+            .skip(1)
+            .flat_map(|(i, (byte_pos, _))| {
+                self.match_patterns
+                    .find_with_pre(&consumed[byte_pos..])
+                    .into_iter()
+                    .filter(move |t| t.offset() >= len - i)
+                    .map(move |t| t.decrement_offset(len - i))
+            })
+            .collect()
+    }
+
     fn partition_delayed_translations(
         &self,
         delayed: Vec<ResolvedTranslation>,
@@ -1759,13 +1779,17 @@ impl PrimaryTable {
             {
                 let translation = nocross.clone();
                 let translation = uppercase_if_needed(translation);
+                let consumed = chars.as_str();
                 // move the iterator forward by the number of characters in the translation
                 chars.nth(nocross.length() - 1);
                 prev = translation.input().chars().last();
                 char_pos += nocross.length();
                 translations.push(translation);
                 delayed_translations = self.update_offsets(delayed_translations, nocross.length());
+                delayed_translations
+                    .extend(self.match_candidates_within(consumed, nocross.length()));
             } else if let Some(t) = candidate {
+                let consumed = chars.as_str();
                 if t.length() == 0 {
                     // if there is a zero-length translation candiate we run the risk of an infinite
                     // loop, so remember the current translation so we only apply it once
@@ -1782,6 +1806,7 @@ impl PrimaryTable {
                 let translation = uppercase_if_needed(translation);
                 translations.push(translation);
                 delayed_translations = self.update_offsets(delayed_translations, t.length());
+                delayed_translations.extend(self.match_candidates_within(consumed, t.length()));
 
                 // update the environment if needed
                 if !t.effects().is_empty() {
@@ -2276,6 +2301,25 @@ mod tests {
         assert_eq!(table.translate("afoo"), "⠁⠄⠈⠈");
         assert_eq!(table.translate("afoob"), "⠁⠉⠂");
         assert_eq!(table.translate("ffoob"), "⠄⠉⠂");
+    }
+
+    #[test]
+    fn match_pre_inside_consumed_translation() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 2"),
+            parse_rule("punctuation . 256"),
+            parse_rule("always ab 12"),
+            parse_rule("match b . - 3"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        // the pre pattern starts inside "ab", which the loop never visits
+        assert_eq!(table.translate("ab."), "⠃⠄");
+        assert_eq!(table.translate("b."), "⠂⠄");
+        assert_eq!(table.translate("a."), "⠁⠲");
     }
 
     #[test]
