@@ -331,6 +331,22 @@ mod tests {
     }
 
     #[test]
+    fn user_classes_by_order() {
+        let rules = [
+            parse_rule("sign a 1"),
+            parse_rule("sign b 12"),
+            parse_rule("attribute first a"),
+            parse_rule("attribute second b"),
+            parse_rule("pass2 $x @4"),
+        ];
+        let ctx = TableContext::compile(&rules).unwrap();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Post1, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("⠁⠃⠉"), "⠁⠈⠉");
+    }
+
+    #[test]
     fn effects() {
         let rules = [
             // when encountering @123 set var 1 to 1

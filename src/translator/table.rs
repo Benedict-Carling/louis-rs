@@ -313,6 +313,39 @@ impl TableContext {
                 _ => (),
             }
         }
+        // multipass tests name the first four user-defined classes $w, $x, $y and $z
+        let mut user_classes: Vec<CharacterClass> = Vec::new();
+        for rule in rules {
+            let name = match &rule.rule {
+                Rule::Attribute { name, .. }
+                | Rule::Class { name, .. }
+                | Rule::Base { name, .. }
+                | Rule::Modeletter { name, .. }
+                | Rule::Begmodeword { name, .. }
+                | Rule::Endmodeword { name, .. }
+                | Rule::Begmode { name, .. }
+                | Rule::Endmode { name, .. }
+                | Rule::Begmodephrase { name, .. }
+                | Rule::Endmodephrase { name, .. }
+                | Rule::Lenmodephrase { name, .. } => name,
+                _ => continue,
+            };
+            let class = CharacterClass::from(name.as_str());
+            if matches!(class, CharacterClass::UserDefined(_))
+                && !name.chars().all(|c| c.is_ascii_digit())
+                && !user_classes.contains(&class)
+            {
+                user_classes.push(class);
+            }
+        }
+        for (i, class) in user_classes.iter().take(4).enumerate() {
+            let alias = CharacterClass::by_order(i as u8 + 1);
+            for classes in [&mut character_classes, &mut dots_classes] {
+                for c in classes.get(class).unwrap_or_default() {
+                    classes.insert(alias.clone(), c);
+                }
+            }
+        }
         Ok(TableContext {
             character_definitions,
             character_classes,
