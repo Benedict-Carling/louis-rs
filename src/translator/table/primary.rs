@@ -1783,6 +1783,8 @@ impl PrimaryTable {
         // the loop at the same char_pos without advancing, so indications must only be
         // emitted the first time a given position is visited, not on every re-entry.
         let mut last_indications_pos: Option<usize> = None;
+        // where the indications at the current position are in `translations`
+        let (mut indications_from, mut indications_to) = (0, 0);
 
         // Enrich spans with compbrl-detected regions.
         let enriched_spans = match &self.compbrl_scanner {
@@ -1881,7 +1883,9 @@ impl PrimaryTable {
 
         loop {
             if last_indications_pos != Some(char_pos) {
+                indications_from = translations.len();
                 translations.extend(indications.translations_at(char_pos));
+                indications_to = translations.len();
                 last_indications_pos = Some(char_pos);
             }
 
@@ -1929,6 +1933,8 @@ impl PrimaryTable {
             // move delayed_translations with zero offset into candidates
             let (current, delayed) = self.partition_delayed_translations(delayed_translations);
             delayed_translations = delayed;
+            let delayed_now: HashSet<TranslationSubset> =
+                current.iter().map(TranslationSubset::from).collect();
             candidates.extend(current);
             // a tie between the two goes to the later, prepunc, as when they shared a trie
             for trie in [&self.postpunc_trie, &self.prepunc_trie] {
@@ -2085,7 +2091,20 @@ impl PrimaryTable {
                 // there is a matching translation rule
                 let translation = t.clone();
                 let translation = uppercase_if_needed(translation);
-                translations.push(translation);
+                // liblouis applies a context rule whose test begins before its replacement
+                // where the test begins, before the indicators at the replacement
+                if self.direction == Direction::Forward
+                    && t.length() == 0
+                    && matches!(t.rule(), Some(Rule::Context { .. }))
+                    && delayed_now.contains(&TranslationSubset::from(t))
+                    && translations.len() == indications_to
+                {
+                    translations.insert(indications_from, translation);
+                    indications_from += 1;
+                    indications_to += 1;
+                } else {
+                    translations.push(translation);
+                }
                 delayed_translations = self.update_offsets(delayed_translations, t.length());
                 delayed_translations.extend(self.match_candidates_within(consumed, t.length()));
                 // liblouis drops the spaces after a joinword or joinnum
@@ -2874,6 +2893,23 @@ mod tests {
         assert_eq!(table.translate("abc"), "⠁⠃⠉");
         assert_eq!(table.translate("Abc"), "⠨⠁⠃⠉");
         assert_eq!(table.translate("ABC"), "⠠⠠⠁⠃⠉");
+    }
+
+    #[test]
+    fn context_output_comes_before_the_indicators_where_its_test_began_earlier() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("base uppercase A a"),
+            parse_rule("digit 1 2"),
+            parse_rule("capsletter 46"),
+            parse_rule("noback context $d[]$l @6"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("1a"), "⠂⠠⠁");
+        assert_eq!(table.translate("1A"), "⠂⠠⠨⠁");
     }
 
     #[test]
