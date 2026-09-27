@@ -665,6 +665,7 @@ impl PrimaryTable {
                     builder.numeric_constrainer.uses_numeric_mode();
                 }
                 Rule::Midendnumericmodechars { chars } => {
+                    builder.numeric_indicator.midendnumericmodechars(chars);
                     builder.numeric_constrainer.midendnumericmodechars(chars);
                 }
                 Rule::Numericmodechars { chars } => {

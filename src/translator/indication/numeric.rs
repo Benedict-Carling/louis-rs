@@ -25,6 +25,8 @@ impl IndicatorBuilder {
             start_translation: None,
             end_translation: None,
             terminating_chars: HashSet::default(),
+            midend_numeric_mode_chars: HashSet::default(),
+            uses_numeric_mode: false,
         })
     }
 
@@ -62,10 +64,17 @@ impl IndicatorBuilder {
 
     pub fn numericnocontchars(&mut self, s: &str) {
         self.0.terminating_chars = HashSet::from_iter(s.chars());
+        self.0.uses_numeric_mode = true;
     }
 
     pub fn numericmodechars(&mut self, s: &str) {
         self.0.extra_numeric_chars = HashSet::from_iter(s.chars());
+        self.0.uses_numeric_mode = true;
+    }
+
+    pub fn midendnumericmodechars(&mut self, s: &str) {
+        self.0.midend_numeric_mode_chars.extend(s.chars());
+        self.0.uses_numeric_mode = true;
     }
 
     pub fn numeric_characters(&mut self, chars: HashSet<char>) {
@@ -89,9 +98,40 @@ pub struct Indicator {
     end_translation: Option<ResolvedTranslation>,
     /// Characters that trigger end-of-run indication when the run exits into them
     terminating_chars: HashSet<char>,
+    midend_numeric_mode_chars: HashSet<char>,
+    uses_numeric_mode: bool,
 }
 
 impl Indicator {
+    /// liblouis's `checkNumericMode`, used instead of `insertNumberSign` by a table that
+    /// defines `numericmodechars`, `midendnumericmodechars` or `numericnocontchars`.
+    fn precompute_numeric_mode(&self, chars: &[char]) -> Vec<(usize, ResolvedTranslation)> {
+        let mut translations = Vec::new();
+        let Some(numsign) = &self.start_translation else {
+            return translations;
+        };
+        let mut numeric = false;
+        for (pos, &c) in chars.iter().enumerate() {
+            if !numeric {
+                if self.numeric_chars.contains(&c) || self.starts_numeric_mode(&chars[pos..]) {
+                    numeric = true;
+                    translations.push((pos, numsign.clone()));
+                }
+            } else if !(self.numeric_chars.contains(&c)
+                || self.extra_numeric_chars.contains(&c)
+                || self.midend_numeric_mode_chars.contains(&c))
+            {
+                numeric = false;
+                if self.terminating_chars.contains(&c)
+                    && let Some(t) = &self.end_translation
+                {
+                    translations.push((pos, t.clone()));
+                }
+            }
+        }
+        translations
+    }
+
     /// Returns sparse `(position, translation)` pairs.
     pub fn precompute(&self, input: &str) -> Vec<(usize, ResolvedTranslation)> {
         let chars: Vec<char> = input.chars().collect();
@@ -99,6 +139,9 @@ impl Indicator {
 
         if self.start_translation.is_none() {
             return translations;
+        }
+        if self.uses_numeric_mode {
+            return self.precompute_numeric_mode(&chars);
         }
 
         let mut in_numeric = false;
@@ -194,6 +237,40 @@ mod tests {
         assert_eq!(
             pairs(&indicator.precompute("ab12a")),
             vec![(2, "⠼".to_string()), (4, "⠰".to_string())],
+        );
+    }
+
+    #[test]
+    fn numeric_mode_ends_at_a_numericnocontchar() {
+        let mut builder = IndicatorBuilder::new();
+        builder.numeric_characters(HashSet::from(['1', '2', '3']));
+        builder.numsign("⠼", &rule("numsign 3456"));
+        builder.nonumsign("⠰", &rule("nonumsign 56"));
+        builder.numericmodechars(".");
+        builder.numericnocontchars("abc");
+        let indicator = builder.build().unwrap();
+
+        assert_eq!(
+            pairs(&indicator.precompute("1.2a")),
+            vec![(0, "⠼".to_string()), (3, "⠰".to_string())]
+        );
+    }
+
+    #[test]
+    fn midend_numeric_mode_char_keeps_numeric_mode() {
+        let mut builder = IndicatorBuilder::new();
+        builder.numeric_characters(HashSet::from(['1', '2', '3']));
+        builder.numsign("⠼", &rule("numsign 3456"));
+        builder.midendnumericmodechars("-");
+        let indicator = builder.build().unwrap();
+
+        assert_eq!(
+            pairs(&indicator.precompute("1-2")),
+            vec![(0, "⠼".to_string())]
+        );
+        assert_eq!(
+            pairs(&indicator.precompute("1 2")),
+            vec![(0, "⠼".to_string()), (2, "⠼".to_string())]
         );
     }
 
