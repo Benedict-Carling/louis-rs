@@ -1948,7 +1948,8 @@ impl PrimaryTable {
                         is_pass_rule(t)
                             && (t.offset() > 0 || !seen.contains(&TranslationSubset::from(*t)))
                     })
-                    .max_by_key(|t| t.rank())
+                    // liblouis tries pass rules longest test first, whatever they replace
+                    .max_by_key(|t| (t.weight(), t.length()))
                     .cloned();
                 context_candidates.retain(|t| !is_pass_rule(t));
                 context_delayed.retain(|t| !is_pass_rule(t));
@@ -2950,6 +2951,19 @@ mod tests {
             "noback context $l[]$d @56",
         ]);
         assert_eq!(table.translate("a1"), "⠁⠰⠼⠁");
+    }
+
+    #[test]
+    fn the_pass_rule_testing_more_wins_over_an_empty_replacement() {
+        let table = forward_table(&[
+            "digit 1 1",
+            "digit 2 12",
+            "math / 34",
+            "noback context $d[\"/\"$d] @3456",
+            "noback context $d[]\"/\" @56",
+        ]);
+        assert_eq!(table.translate("1/2"), "⠁⠼");
+        assert_eq!(table.translate("1/"), "⠁⠰⠌");
     }
 
     #[test]
