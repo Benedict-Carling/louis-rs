@@ -4,7 +4,7 @@ use crate::{
     parser::{AnchoredRule, HasDirection, Rule},
     translator::{
         PositionMap, ResolvedTranslation, TranslationError, TranslationOptions, TranslationStage,
-        indication::emphasis,
+        back_emphasis,
         table::{
             TableContext, display::DisplayTable, multipass::MultipassTable, primary::PrimaryTable,
         },
@@ -210,7 +210,7 @@ impl TranslationPipeline {
                     .iter()
                     .zip(&stages)
                     .find(|(step, _)| matches!(step, Transformation::Primary(_)))
-                    .map(|(_, trace)| emphasis::back_translated(trace))
+                    .map(|(_, trace)| back_emphasis::back_translated(trace))
                     .unwrap_or_default()
             });
         (output, positions, emphasis)
