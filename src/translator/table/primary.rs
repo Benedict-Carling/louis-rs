@@ -111,6 +111,9 @@ impl CharacterTranslation {
 #[derive(Debug)]
 pub struct PrimaryTable {
     undefined: Option<String>,
+    /// The text classes `joinnum` looks at
+    space_chars: HashSet<char>,
+    digit_chars: HashSet<char>,
     /// Fallback character definitions that are used as a last resort to translate unknown
     /// characters to their hex representation
     fallback_definitions: CharacterDefinition,
@@ -409,8 +412,11 @@ impl PrimaryTableBuilder {
         .into_iter()
         .flatten()
         .collect();
+        let class = |class| ctx.character_classes().get(&class).unwrap_or_default();
         PrimaryTable {
             undefined: self.undefined,
+            space_chars: class(CharacterClass::Space),
+            digit_chars: class(CharacterClass::Digit),
             character_translations: self.character_translations,
             direction,
             fallback_definitions: ctx.character_definitions().clone(),
@@ -1508,6 +1514,22 @@ impl PrimaryTable {
                     TranslationStage::Main,
                     rule,
                 ),
+                Rule::Joinnum { chars, dots, .. } if direction == Direction::Forward => {
+                    builder.get_trie_mut(rule).insert(
+                        chars,
+                        &dots.to_string(),
+                        Some(Transition::Start(vec![
+                            CharacterClass::Space,
+                            CharacterClass::Punctuation,
+                        ])),
+                        Some(Transition::End(vec![CharacterClass::Space])),
+                        direction,
+                        rule.precedence(),
+                        vec![],
+                        TranslationStage::Main,
+                        rule,
+                    )
+                }
                 Rule::Midnum { chars, dots, .. } => {
                     builder.numeric_indicator.midnum(chars);
                     builder.numeric_constrainer.midnum(chars);
@@ -1922,6 +1944,9 @@ impl PrimaryTable {
             // leaving the position to fall through to the plain punctuation character
             // definition (`character_translations`), matching liblouis.
             candidates.retain(|t| match t.rule() {
+                Some(Rule::Joinnum { .. }) => {
+                    self.number_follows(&chars.as_str()[t.input().len()..])
+                }
                 Some(Rule::Prepunc { .. }) => is_backward || constraints.prepunc_ok_at(char_pos),
                 Some(Rule::Postpunc { .. }) => is_backward || constraints.postpunc_ok_at(char_pos),
                 _ => stands_alone(t, char_pos),
@@ -2038,6 +2063,23 @@ impl PrimaryTable {
                 translations.push(translation);
                 delayed_translations = self.update_offsets(delayed_translations, t.length());
                 delayed_translations.extend(self.match_candidates_within(consumed, t.length()));
+                // liblouis' joinnum swallows the spaces between it and the number
+                if matches!(t.rule(), Some(Rule::Joinnum { .. })) {
+                    while let Some(c) = chars.clone().next()
+                        && self.space_chars.contains(&c)
+                    {
+                        chars.next();
+                        char_pos += 1;
+                        translations.push(ResolvedTranslation::new(
+                            &c.to_string(),
+                            "",
+                            1,
+                            TranslationStage::Main,
+                            t.origin(),
+                        ));
+                        delayed_translations = self.update_offsets(delayed_translations, 1);
+                    }
+                }
 
                 // update the environment if needed
                 if !t.effects().is_empty() {
@@ -2086,6 +2128,13 @@ impl PrimaryTable {
             }
         }
         translations
+    }
+
+    /// Whether the first character after the spaces at the start of `rest` is a digit
+    fn number_follows(&self, rest: &str) -> bool {
+        rest.chars()
+            .find(|c| !self.space_chars.contains(c))
+            .is_some_and(|c| self.digit_chars.contains(&c))
     }
 
     fn handle_undefined_char(&self, ch: char) -> String {
@@ -2850,6 +2899,25 @@ mod tests {
             PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
                 .unwrap();
         assert_eq!(table.translate("Vv"), "⠨\u{f4027}⠧");
+    }
+
+    #[test]
+    fn joinnum() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("space \\s 0"),
+            parse_rule("digit 1 1"),
+            parse_rule("sign § 346"),
+            parse_rule("joinnum § 346"),
+            parse_rule("numsign 3456"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("§ 1"), "⠬⠼⠁");
+        assert_eq!(table.translate("§  1"), "⠬⠼⠁");
+        assert_eq!(table.translate("§ a"), "⠬⠀⠁");
     }
 
     #[test]
