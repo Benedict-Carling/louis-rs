@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 pub mod backward;
 pub mod display;
 pub mod multipass;
@@ -181,8 +182,27 @@ impl TableContext {
                 _ => (),
             }
         }
+        let defined_at: HashMap<char, usize> = rules
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map(|(index, rule)| match &rule.rule {
+                Rule::Space { character, .. }
+                | Rule::Punctuation { character, .. }
+                | Rule::Digit { character, .. }
+                | Rule::Litdigit { character, .. }
+                | Rule::Letter { character, .. }
+                | Rule::Lowercase { character, .. }
+                | Rule::Uppercase { character, .. }
+                | Rule::Sign { character, .. }
+                | Rule::Math { character, .. }
+                | Rule::Hyphen { character, .. }
+                | Rule::Decpoint { character, .. } => Some((*character, index)),
+                _ => None,
+            })
+            .collect();
         // go through the rules again with all the character_definitions sorted out
-        for rule in rules {
+        for (index, rule) in rules.iter().enumerate() {
             match &rule.rule {
                 Rule::Base {
                     derived,
@@ -190,6 +210,13 @@ impl TableContext {
                     name,
                 } => {
                     if let Some(translation) = character_definitions.get(base).cloned() {
+                        // liblouis ignores a base rule for a character defined before it
+                        // with other dots
+                        if defined_at.get(derived).is_some_and(|&at| at < index)
+                            && character_definitions.get(derived) != Some(&translation)
+                        {
+                            continue;
+                        }
                         if character_definitions.get(derived).is_none() {
                             character_definitions.insert(*derived, &translation);
                         }
@@ -368,6 +395,21 @@ mod tests {
 
     fn parse_rule(source: &str) -> AnchoredRule {
         RuleParser::new(source).rule().unwrap().into()
+    }
+
+    #[test]
+    fn base_rule_after_a_differing_definition_is_ignored() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("letter A 46-1"),
+            parse_rule("base uppercase A a"),
+            parse_rule("base uppercase B b"),
+        ];
+        let ctx = TableContext::compile(&rules).unwrap();
+        let classes = ctx.character_classes();
+        assert!(!classes.contains(&CharacterClass::Uppercase, 'A'));
+        assert!(classes.contains(&CharacterClass::Uppercase, 'B'));
     }
 
     #[test]
