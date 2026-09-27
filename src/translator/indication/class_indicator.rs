@@ -387,7 +387,17 @@ impl ClassIndicator {
                         self.emit_whole_word(chars, last_open, last_close, last_count, result);
                     }
                     Some(endt) => {
-                        result.push((last_close, endt.clone()));
+                        // liblouis puts an endphrase-after indicator after the rest of the
+                        // last word, when only whitespace separates words
+                        let end = if self.whitespace_separates_words && self.mode_chars.is_empty() {
+                            chars[last_close..]
+                                .iter()
+                                .position(|&c| self.is_space(c))
+                                .map_or(chars.len(), |i| last_close + i)
+                        } else {
+                            last_close
+                        };
+                        result.push((end, endt.clone()));
                     }
                     None => {
                         // No dedicated endmodephrase: fall back to the shared mode closer.

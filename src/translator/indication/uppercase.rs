@@ -273,6 +273,26 @@ mod tests {
     }
 
     #[test]
+    fn endcapsphrase_after_follows_the_rest_of_the_last_word() {
+        let mut builder = base_builder();
+        builder.capsletter("⠠", &rule("capsletter 6"));
+        builder.begcapsword("⠠⠠", &rule("begcapsword 6-6"));
+        builder.begcapsphrase("⠠⠠⠠", &rule("begcapsphrase 6-6-6"));
+        builder.endcapsphrase("⠱", &Position::After, &rule("endcapsphrase after 156"));
+        builder.lencapsphrase(3);
+        let indicator = builder.build(&space_ctx()).unwrap();
+
+        assert_eq!(
+            pairs(&indicator.precompute("AB CD EF?")),
+            vec![(0, "⠠⠠⠠".to_string()), (9, "⠱".to_string())]
+        );
+        assert_eq!(
+            pairs(&indicator.precompute("AB CD EF")),
+            vec![(0, "⠠⠠⠠".to_string()), (8, "⠱".to_string())]
+        );
+    }
+
+    #[test]
     fn begcaps_alone_runs_until_a_lowercase_letter() {
         // see the begcaps block of liblouis/tests/yaml/capsword.yaml
         let mut builder = base_builder();
