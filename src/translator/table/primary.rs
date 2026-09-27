@@ -12,6 +12,7 @@ use crate::{
     translator::{
         CharacterDefinition, ClassConstraint, ResolvedTranslation, Rule, TranslationError,
         TranslationOptions, TranslationStage,
+        case::CaseClasses,
         context_pattern::{ContextPatterns, ContextPatternsBuilder},
         effect::Environment,
         indication::{
@@ -140,6 +141,7 @@ pub struct PrimaryTable {
     backward_digit_overrides: HashMap<char, ResolvedTranslation>,
     /// Forward-only: the standing-alone check for `word` and `contraction` rules.
     sequences: Option<Sequences>,
+    case: CaseClasses,
 }
 
 /// A builder for [`PrimaryTable`]
@@ -379,6 +381,7 @@ impl PrimaryTableBuilder {
             character_translations: self.character_translations,
             direction,
             fallback_definitions: ctx.character_definitions().clone(),
+            case: CaseClasses::from_context(ctx),
             trie: self.trie,
             comp6_trie: self.comp6_trie,
             nocross_trie: self.nocross_trie,
@@ -1645,10 +1648,7 @@ impl PrimaryTable {
 
         let indications = self.indicators.precompute(input, &enriched_spans);
         let constraints = self.constrainers.precompute(input, &enriched_spans);
-        let input_chars: Vec<char> = match self.sequences {
-            Some(_) => input.chars().collect(),
-            None => Vec::new(),
-        };
+        let input_chars: Vec<char> = input.chars().collect();
         let stands_alone = |t: &ResolvedTranslation, pos: usize| match &self.sequences {
             Some(sequences)
                 if matches!(t.rule(), Some(Rule::Word { .. } | Rule::Contraction { .. })) =>
@@ -1656,6 +1656,11 @@ impl PrimaryTable {
                 sequences.in_sequence(&input_chars, pos, t.length())
             }
             _ => true,
+        };
+        let valid_match = |t: &ResolvedTranslation, pos: usize| {
+            self.direction == Direction::Backward
+                || matches!(t.rule(), Some(Rule::Context { .. }))
+                || self.case.valid_match(&input_chars, pos, t.length())
         };
 
         loop {
@@ -1672,7 +1677,7 @@ impl PrimaryTable {
             let nocross_candidate = self
                 .nocross_candidates(chars.as_str(), prev, char_pos, &constraints)
                 .into_iter()
-                .filter(|t| stands_alone(t, char_pos))
+                .filter(|t| stands_alone(t, char_pos) && valid_match(t, char_pos))
                 .max_by_key(|t| t.rank());
 
             // given an input query the trie for matching translations. Then split off the
@@ -1705,6 +1710,8 @@ impl PrimaryTable {
             // boundary and gated here instead. Rejected candidates are simply dropped,
             // leaving the position to fall through to the plain punctuation character
             // definition (`character_translations`), matching liblouis.
+            candidates.retain(|t| valid_match(t, char_pos));
+
             candidates.retain(|t| match t.rule() {
                 Some(Rule::Prepunc { .. }) => constraints.prepunc_ok_at(char_pos),
                 Some(Rule::Postpunc { .. }) => constraints.postpunc_ok_at(char_pos),
@@ -2496,6 +2503,27 @@ mod tests {
         assert_eq!(table.translate("B"), "⠐⠠⠃");
         // caps start before nonumsign
         assert_eq!(table.translate("1A"), "⠼⠁⠠⠰⠁");
+    }
+
+    #[test]
+    fn case_change_inside_a_rule_prevents_it() {
+        let rules = [
+            parse_rule("lowercase m 134"),
+            parse_rule("lowercase i 24"),
+            parse_rule("lowercase t 2345"),
+            parse_rule("base uppercase M m"),
+            parse_rule("base uppercase I i"),
+            parse_rule("base uppercase T t"),
+            parse_rule("always mit 2345"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("Mit"), "⠞");
+        assert_eq!(table.translate("MIT"), "⠞");
+        assert_eq!(table.translate("mIt"), "⠍⠊⠞");
+        assert_eq!(table.translate("miT"), "⠍⠊⠞");
     }
 
     #[test]
