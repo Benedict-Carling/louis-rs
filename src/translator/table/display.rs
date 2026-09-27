@@ -104,74 +104,84 @@ impl DisplayTable {
     }
 }
 
+/// Each character paired with its cell by a rule liblouis puts in a display table, in table
+/// order: `display` rules, character definitions with a single cell and both characters of a
+/// `grouping`. So a translation table that includes no display table still has one.
+fn char_dots_pairs(rules: &[AnchoredRule]) -> Vec<(char, char)> {
+    let mut pairs = Vec::new();
+    for rule in rules {
+        match &rule.rule {
+            Rule::Display {
+                character, dots, ..
+            } => pairs.push((*character, dots.to_unicode())),
+            Rule::Space {
+                character, dots, ..
+            }
+            | Rule::Punctuation {
+                character, dots, ..
+            }
+            | Rule::Digit {
+                character, dots, ..
+            }
+            | Rule::Letter {
+                character, dots, ..
+            }
+            | Rule::Lowercase {
+                character, dots, ..
+            }
+            | Rule::Uppercase {
+                character, dots, ..
+            }
+            | Rule::Litdigit {
+                character, dots, ..
+            }
+            | Rule::Sign {
+                character, dots, ..
+            }
+            | Rule::Math {
+                character, dots, ..
+            } if dots.len() == 1 => {
+                pairs.push((*character, dots.iter().next().unwrap().to_unicode()))
+            }
+            Rule::Grouping {
+                chars, left, right, ..
+            } => {
+                let mut chars = chars.chars();
+                if let (Some(open), Some(close)) = (chars.next(), chars.next()) {
+                    pairs.push((open, left.to_unicode()));
+                    pairs.push((close, right.to_unicode()));
+                }
+            }
+            _ => (),
+        }
+    }
+    pairs
+}
+
+fn add_mapping(mappings: &mut HashMap<char, char>, from: char, to: char) {
+    if cfg!(feature = "backwards_compatibility") {
+        mappings.entry(from).or_insert(to);
+    } else {
+        mappings.insert(from, to);
+    }
+}
+
+const BLANK: char = '\u{2800}';
+
 /// The braille cell each character is shown as, the reverse of a [`DisplayTable`], as
 /// liblouis's `lou_charToDots` reads it off a table.
-///
-/// Besides `display` rules, every character definition with a single cell and both
-/// characters of a `grouping` contribute a mapping, so a translation table that includes
-/// no display table still has one.
 #[derive(Debug)]
 pub struct CharToDots {
     mappings: HashMap<char, char>,
 }
 
 impl CharToDots {
-    const BLANK: char = '\u{2800}';
-
     pub fn compile(rules: &[AnchoredRule]) -> CharToDots {
         let mut mappings = HashMap::new();
-        let mut add = |character: char, dots: char| {
+        for (character, dots) in char_dots_pairs(rules) {
             // ucBrl output only has room for dots 1 to 8
             let cell = char::from_u32(0x2800 | (dots as u32 & 0xff)).unwrap();
-            if cfg!(feature = "backwards_compatibility") {
-                mappings.entry(character).or_insert(cell);
-            } else {
-                mappings.insert(character, cell);
-            }
-        };
-        for rule in rules {
-            match &rule.rule {
-                Rule::Display {
-                    character, dots, ..
-                } => add(*character, dots.to_unicode()),
-                Rule::Space {
-                    character, dots, ..
-                }
-                | Rule::Punctuation {
-                    character, dots, ..
-                }
-                | Rule::Digit {
-                    character, dots, ..
-                }
-                | Rule::Letter {
-                    character, dots, ..
-                }
-                | Rule::Lowercase {
-                    character, dots, ..
-                }
-                | Rule::Uppercase {
-                    character, dots, ..
-                }
-                | Rule::Litdigit {
-                    character, dots, ..
-                }
-                | Rule::Sign {
-                    character, dots, ..
-                }
-                | Rule::Math {
-                    character, dots, ..
-                } if dots.len() == 1 => add(*character, dots.iter().next().unwrap().to_unicode()),
-                Rule::Grouping {
-                    chars, left, right, ..
-                } => {
-                    let mut chars = chars.chars();
-                    if let (Some(open), Some(close)) = (chars.next(), chars.next()) {
-                        add(open, left.to_unicode());
-                        add(close, right.to_unicode());
-                    }
-                }
-                _ => (),
-            }
+            add_mapping(&mut mappings, character, cell);
         }
         CharToDots { mappings }
     }
@@ -181,7 +191,44 @@ impl CharToDots {
     pub fn dots(&self, input: &str) -> String {
         input
             .chars()
-            .map(|c| *self.mappings.get(&c).unwrap_or(&Self::BLANK))
+            .map(|c| *self.mappings.get(&c).unwrap_or(&BLANK))
+            .collect()
+    }
+}
+
+/// A translation table read as its own display table, which is what liblouis does when a
+/// translation is given no display table. Both directions come from the same
+/// [`char_dots_pairs`], each keeping the first mapping for its key.
+#[derive(Debug)]
+pub struct ImpliedDisplay {
+    chars: HashMap<char, char>,
+    cells: HashMap<char, char>,
+}
+
+impl ImpliedDisplay {
+    pub fn compile(rules: &[AnchoredRule]) -> ImpliedDisplay {
+        let mut chars = HashMap::new();
+        let mut cells = HashMap::new();
+        for (character, cell) in char_dots_pairs(rules) {
+            add_mapping(&mut chars, cell, character);
+            add_mapping(&mut cells, character, cell);
+        }
+        ImpliedDisplay { chars, cells }
+    }
+
+    /// The characters `braille` is shown as, or `None` if a cell has no mapping, which
+    /// liblouis treats as a failed translation.
+    pub fn show(&self, braille: &str) -> Option<String> {
+        braille
+            .chars()
+            .map(|c| self.chars.get(&c).copied())
+            .collect()
+    }
+
+    /// The cells `text` is read as, with a blank cell for a character that has no mapping.
+    pub fn read(&self, text: &str) -> String {
+        text.chars()
+            .map(|c| *self.cells.get(&c).unwrap_or(&BLANK))
             .collect()
     }
 }
@@ -245,6 +292,27 @@ mod tests {
         let rules = [parse_rule("display a 78"), parse_rule("display b 19")];
         let table = CharToDots::compile(&rules);
         assert_eq!(table.dots("ab"), "⣀⠁");
+    }
+
+    #[test]
+    #[cfg(feature = "backwards_compatibility")]
+    fn implied_display_keeps_the_first_mapping_each_way() {
+        let rules = [
+            parse_rule("letter a 1"),
+            parse_rule("display A 1"),
+            parse_rule("display b 1"),
+            parse_rule("grouping parens () 2356,356"),
+        ];
+        let display = ImpliedDisplay::compile(&rules);
+        assert_eq!(display.show("⠁⠶⠴").as_deref(), Some("a()"));
+        assert_eq!(display.read("aAb()"), "⠁⠁⠁⠶⠴");
+    }
+
+    #[test]
+    fn implied_display_has_no_character_for_an_unmapped_cell() {
+        let display = ImpliedDisplay::compile(&[parse_rule("letter a 1")]);
+        assert_eq!(display.show("⠁⠂"), None);
+        assert_eq!(display.read("ax"), "⠁⠀");
     }
 
     #[test]

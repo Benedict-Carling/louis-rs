@@ -581,7 +581,7 @@ mod tests {
         assert!(results[0].is_success());
     }
 
-    const AB_TABLE: &str = "table: |\n  letter a 1\n  letter b 12\n";
+    const AB_TABLE: &str = "table: |\n  display ⠁ 1\n  display ⠃ 12\n  letter a 1\n  letter b 12\n";
 
     #[test]
     fn matching_positions_are_not_reported() {
@@ -640,7 +640,7 @@ mod tests {
 
     #[test]
     fn both_directions_swap_the_expected_positions() {
-        let yaml = "table: |\n  letter a 1\n  letter b 12\n  always ab 123\nflags: {testmode: bothDirections}\ntests:\n  - - ab\n    - ⠇\n    - inputPos: [0]\n      outputPos: [0, 0]\n";
+        let yaml = "table: |\n  display ⠇ 123\n  letter a 1\n  letter b 12\n  always ab 123\nflags: {testmode: bothDirections}\ntests:\n  - - ab\n    - ⠇\n    - inputPos: [0]\n      outputPos: [0, 0]\n";
         let results = run("both_directions", yaml).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.is_success()));
@@ -670,5 +670,60 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results[0].is_success());
         assert!(results[1].is_translation_failure());
+    }
+
+    #[test]
+    fn without_display_the_table_shows_its_own_braille() {
+        let yaml = "table: |\n  letter a 1\n  letter b 12\n  punctuation . 256\nflags: {testmode: bothDirections}\ntests:\n  - - ab.\n    - ab.\n";
+        let results = run("implied_display", yaml).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.is_success()));
+    }
+
+    #[test]
+    fn without_display_the_first_mapping_wins() {
+        let yaml = "table: |\n  display A 1\n  letter a 1\n  display B 12\ntests:\n  - - a\n    - A\ntable: |\n  letter a 1\n  display A 1\ntests:\n  - - a\n    - a\n";
+        let results = run("implied_display_first_wins", yaml).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.is_success()));
+    }
+
+    #[test]
+    fn without_display_a_cell_with_no_mapping_fails_the_translation() {
+        let yaml = "table: |\n  letter a 1\n  always b 2\ntests:\n  - - b\n    - ⠂\n  - - b\n    - ⠂\n    - xfail: true\n";
+        let results = run("implied_display_unmapped_cell", yaml).unwrap();
+        assert_eq!(
+            results,
+            [
+                TestResult::Failure(FailureReason::Translation {
+                    input: "b".to_string(),
+                    expected: "⠂".to_string(),
+                    actual: "⠂".to_string(),
+                    direction: Direction::Forward,
+                }),
+                TestResult::ExpectedFailure {
+                    input: "b".to_string(),
+                    expected: "⠂".to_string(),
+                    actual: "⠂".to_string(),
+                    direction: Direction::Forward,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn without_display_a_character_with_no_mapping_reads_as_a_blank_cell() {
+        let yaml = "table: |\n  letter a 1\n  space \\s 0\nflags: {testmode: backward}\ntests:\n  - - a?a\n    - a a\n";
+        let results = run("implied_display_unmapped_char", yaml).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_success());
+    }
+
+    #[test]
+    fn an_explicit_display_holds_for_later_blocks() {
+        let yaml = "display: |\n  display X 1\ntable: |\n  display A 1\n  letter a 1\ntests:\n  - - a\n    - X\ntable: |\n  letter a 1\ntests:\n  - - a\n    - X\n";
+        let results = run("explicit_display_persists", yaml).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.is_success()));
     }
 }
