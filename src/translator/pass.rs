@@ -104,8 +104,8 @@ struct Match {
     end_replace: usize,
     end_match: usize,
     /// How much the test looked at: the span of input it went over, less what `$a` took
-    /// unseen, and the conditions it checked besides
-    context: usize,
+    /// unseen, then the conditions it checked besides
+    context: (usize, usize),
 }
 
 #[derive(Debug, Clone)]
@@ -420,7 +420,7 @@ impl PassRule {
             start_replace,
             end_replace,
             end_match,
-            context: ((highest - lowest - unchecked) as usize) + conditions,
+            context: ((highest - lowest - unchecked) as usize, conditions),
         })
     }
 
@@ -531,7 +531,7 @@ impl PassRule {
             start_replace,
             end_replace,
             end_match,
-            context: ((highest - lowest - unchecked) as usize) + conditions,
+            context: ((highest - lowest - unchecked) as usize, conditions),
         })
     }
 
@@ -808,7 +808,7 @@ impl ContextRules {
                 let translation = ResolvedTranslation::new(
                     &consumed,
                     &output,
-                    rule.consumed(&m) + m.context,
+                    rule.consumed(&m) * 4096 + m.context.0 * 64 + m.context.1,
                     TranslationStage::Main,
                     rule.origin.clone(),
                 )
