@@ -47,7 +47,9 @@ reversed for back-translation.
 
 **Contractions and the word-family opcodes** — `word`, `begword`, `midword`,
 `endword`, `midendword`, `prfword`, `sufword`, `partword`, `begmidword`, with their
-`before`/`after` class constraints.
+`before`/`after` class constraints (several of either kind are alternatives, as liblouis
+ors them). A contraction's letter sign goes in only where the contraction is the rule
+chosen.
 
 **`match` and `context` rules** via a purpose-built regexp VM (`src/translator/regexp.rs`)
 that compiles patterns at table load time and matches in linear time.
@@ -131,7 +133,7 @@ a few hundred either way on the million-assertion files.
 
 | Area                                                | Failing | Root cause                                                                                                                                                                       | Size |
 |-----------------------------------------------------|--------:|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------|
-| `afr-za-g2` forward                                 |      13 | Not yet surveyed. The dictionary harness it shared this row with passes since back-translation selects rules as liblouis does and a boundary that holds counts towards a `match` rule's weight. | M    |
+| `afr-za-g2` forward                                 |      13 | Definition-order tie (table bug): `match [Ss] en ING\|ing\|[Uu] 15-1345` (afr-za-g2.ctb:146) against `match !%3 en !%3 26` (:274), equal weight, for every `senu…` word. | —    |
 | `ml`, `ta`, `hi`, `pa`, `th`, `my-g2`                 |      81 | Definition-order ties (table bugs): a `word` rule against an equally long `postpunc`/`prepunc`/`always` for the same punctuation (en-in-g1, en-us-g1, pu-in-g1), `begmidword` against `endword` for the same conjunct in `malayalam.cti`, and `always တစ်` defined twice in `my-g2.ctb`. The "one indicator per grapheme cluster" theory did not hold: the causes were context `*` copying, lookbacks, `$w`–`$z`, context rule ranking, `decpoint`, `repeated`, `nocont` and undefined-character escapes. | —    |
 | `da-dk-g28-dictionary_harness`                      |       9 | Not yet surveyed; the backward `letsign` ambiguity that made up most of it went with the back-translation rule selection. | S    |
 | `hu-hu-g1_dictionary_special_consonants`            |      11 | Four `always` rules defined twice with different dots in `hu-exceptionwords.cti`; liblouis keeps the first, a definition-order tie (table bug).                                   | —    |
