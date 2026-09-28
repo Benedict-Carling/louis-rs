@@ -386,7 +386,6 @@ impl Emphases {
             emphases: self,
             buffer: marker.buffer,
             chars: chars.to_vec(),
-            from: 0,
         }
     }
 }
@@ -956,15 +955,12 @@ impl Marker<'_> {
     }
 }
 
-/// The emphasis and capital marks of one input, and the translation loop's progress
-/// inserting them
+/// The emphasis and capital marks of one input
 #[derive(Debug, Clone)]
 pub struct Marks<'a> {
     emphases: &'a Emphases,
     buffer: Vec<Info>,
     chars: Vec<char>,
-    /// liblouis's `insertEmphasesFrom`
-    from: usize,
 }
 
 impl Marks<'_> {
@@ -978,20 +974,18 @@ impl Marks<'_> {
         (pos + 1..pos + len).any(|i| self.marked_at(i))
     }
 
-    /// The indicators liblouis inserts when its loop reaches `pos`: the ends and
-    /// emphasis starts of every position since the last call, and the capital starts
-    /// of those before `pos`
-    pub fn reached(&mut self, pos: usize) -> Vec<ResolvedTranslation> {
+    /// The capital end indicators of `at`
+    pub fn caps_end_at(&self, at: usize) -> Vec<ResolvedTranslation> {
         let mut out = Vec::new();
-        for at in self.from..=pos.min(self.chars.len()) {
-            self.caps_end(at, &mut out);
-            self.emphasis_end(at, &mut out);
-            self.emphasis_begin(at, &mut out);
-            if at < pos {
-                self.caps_begin(at, &mut out);
-            }
-        }
-        self.from = pos + 1;
+        self.caps_end(at, &mut out);
+        out
+    }
+
+    /// The emphasis end and start indicators of `at`
+    pub fn emphasis_at(&self, at: usize) -> Vec<ResolvedTranslation> {
+        let mut out = Vec::new();
+        self.emphasis_end(at, &mut out);
+        self.emphasis_begin(at, &mut out);
         out
     }
 
@@ -1180,12 +1174,13 @@ mod tests {
     /// The indicators inserted at each position when the loop visits every one of them
     fn visit_all(emphases: &Emphases, input: &str, spans: &[EmphasisSpan]) -> Vec<String> {
         let chars: Vec<char> = input.chars().collect();
-        let mut marks = emphases.mark(&chars, spans);
+        let marks = emphases.mark(&chars, spans);
         (0..=chars.len())
             .map(|pos| {
                 marks
-                    .reached(pos)
+                    .caps_end_at(pos)
                     .into_iter()
+                    .chain(marks.emphasis_at(pos))
                     .chain(marks.caps_begin_at(pos))
                     .map(|t| t.output().to_string())
                     .collect()
@@ -1204,25 +1199,20 @@ mod tests {
     #[test]
     fn capital_start_repeats_on_each_visit() {
         let emphases = caps_builder().build(&ctx()).unwrap();
-        let mut marks = emphases.mark(&['A'], &[]);
+        let marks = emphases.mark(&['A'], &[]);
         assert_eq!(marks.caps_begin_at(0)[0].output(), "⠨");
-        assert!(marks.reached(0).is_empty());
-        assert_eq!(marks.caps_begin_at(0)[0].output(), "⠨");
+        assert!(marks.caps_end_at(0).is_empty());
     }
 
     #[test]
-    fn indicators_of_skipped_positions_come_when_reached() {
+    fn marks_inside_a_word() {
         let emphases = caps_builder().build(&ctx()).unwrap();
         let chars: Vec<char> = "aBCd".chars().collect();
-        let mut marks = emphases.mark(&chars, &[]);
+        let marks = emphases.mark(&chars, &[]);
         assert!(marks.changes_within(0, 2));
         assert!(!marks.changes_within(1, 1));
-        let outputs: Vec<String> = marks
-            .reached(3)
-            .iter()
-            .map(|t| t.output().to_string())
-            .collect();
-        assert_eq!(outputs, vec!["⠘", "⠠"]);
+        assert_eq!(marks.caps_begin_at(1)[0].output(), "⠘");
+        assert_eq!(marks.caps_end_at(3)[0].output(), "⠠");
     }
 
     #[test]

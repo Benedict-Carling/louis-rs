@@ -57,11 +57,15 @@ three tiers — `capsletter`, `begcapsword`/`endcapsword`, and caps passages via
 `begcaps`/`endcaps` or `begcapsphrase`/`endcapsphrase`/`lencapsphrase` — plus letter
 sign, `nocontract`, and the generic `begmode`/`endmode` family.
 
-**Emphasis.** Capitals and the typeform classes share liblouis's model
+**Emphasis.** Capitals, the other modes and the typeform classes share liblouis's model
 (`src/translator/indication/emphasis.rs`): `markEmphases` resolves begin/end/word/symbol
-marks per class, and the translation loop inserts them as `insertEmphasesAt` does,
-including the capital start indicator again when a zero-width rule leaves the position
-unchanged. `correct` carries the typeforms over to its output.
+marks per class (sections, words, passages, resets, letters), and the translation loop
+inserts them in `insertEmphasesAt`'s order, including those at positions a rule spans
+and the capital start indicator again when a zero-width rule leaves the position
+unchanged. `correct` carries the typeforms over to its output. Back-translation reads
+the emphasis indicators and reports the emphasis in `TranslationResult::emphasis` when
+`TranslationOptions::with_emphasis_output` asks for it, as liblouis fills a typeform
+buffer. `repword` and `rependword` are translated.
 
 **Computer braille** as a full pipeline feature — `comp6`, `compbrl`,
 `begcomp`/`endcomp`, and a scanner that derives computer-braille spans from
@@ -106,10 +110,8 @@ Honest list, no dates attached:
 - **A screen-reader mode is missing**: `partialTrans`
   ([#19](https://github.com/liblouis/louis-rs/issues/19)). The option flag is
   accepted; nothing reads it yet.
-- **Back-translation returns text but not typeform.** `TranslationResult::emphasis`
-  is never populated, and nothing reports whether a back-translation result could
-  still change if more cells arrive
-  ([#29](https://github.com/liblouis/louis-rs/issues/29)).
+- **Nothing reports whether a back-translation result could still change** if more
+  cells arrive ([#29](https://github.com/liblouis/louis-rs/issues/29)).
 - **No Unicode normalization.** NFC was implemented and reverted — it fixed tables
   with precomposed-character rules and broke tables with standalone
   combining-character rules (IPA, Hebrew, Yiddish). NFD is the proposed path.
@@ -145,8 +147,8 @@ Two cross-cutting items have no single file behind them:
   last character of the text produced so far, classified by the text classes; the side
   after is the next cell's attributes or `isEndWord`'s scan; rules are tried in
   liblouis's order; and `itsANumber` and `noContractMode` are state set by the rules
-  applied, as are capitalization's `nextUpper`/`allUpper`/`allUpperPhrase`. Emphasis
-  still has no backward path. *(M)*
+  applied, as are capitalization's `nextUpper`/`allUpper`/`allUpperPhrase` and the emphasis
+  of the text. *(M)*
 - **Engine debt.** Regexp negation of concatenation and alternation is wrong
   (`!(e1e2)` ≠ `(!e1!e2)`); `Attribute::ByOrder` and `Any` are no-ops in
   `match_pattern.rs` and all three are no-ops in `context_pattern.rs`; the

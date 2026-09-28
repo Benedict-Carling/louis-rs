@@ -21,6 +21,7 @@
 //! * [`nocontract::Indicator`]: detects contractions that require a no-contract sign
 
 use crate::emphasis::EmphasisSpan;
+use crate::parser::Rule;
 use crate::translator::ResolvedTranslation;
 
 mod class_indicator;
@@ -59,6 +60,13 @@ fn find_spans(
     spans
 }
 
+fn is_mode_end(rule: Option<&Rule>) -> bool {
+    matches!(
+        rule,
+        Some(Rule::Endmodeword { .. } | Rule::Endmode { .. } | Rule::Endmodephrase { .. })
+    )
+}
+
 #[derive(Debug, Clone)]
 pub enum Indicator {
     ComputerBraille(computer_braille::Indicator),
@@ -84,6 +92,12 @@ pub struct PrecomputedIndications<'a> {
     /// start ones, and after the capital start ones
     translations: Vec<[Vec<ResolvedTranslation>; 3]>,
     marks: Option<emphasis::Marks<'a>>,
+    /// The end and start indicators of the other modes, which liblouis inserts with the
+    /// capital ones
+    mode_ends: Vec<Vec<ResolvedTranslation>>,
+    mode_begins: Vec<Vec<ResolvedTranslation>>,
+    /// liblouis's `insertEmphasesFrom`
+    from: usize,
     /// A numeric indicator stepped as the translation loop visits positions
     live_numeric: Option<&'a numeric::Indicator>,
     in_numeric: bool,
@@ -91,23 +105,44 @@ pub struct PrecomputedIndications<'a> {
 }
 
 impl PrecomputedIndications<'_> {
+    /// The start indicators of the modes and capitals at `pos`, modes first
+    fn mode_begin_at(&self, pos: usize) -> Vec<ResolvedTranslation> {
+        let mut out = self.mode_begins.get(pos).cloned().unwrap_or_default();
+        out.extend(
+            self.marks
+                .as_ref()
+                .map(|m| m.caps_begin_at(pos))
+                .unwrap_or_default(),
+        );
+        out
+    }
+
     /// The indications at `pos`. Call it each time the translation loop visits a
     /// position, in order; `revisit` when it stays at the position it visited last, where
-    /// liblouis inserts only the capital start indicator again.
+    /// liblouis inserts only the mode and capital start indicators again.
+    ///
+    /// Like liblouis's `insertEmphasesAt`, each position since the last visit first
+    /// gets its capital and mode ends and its emphasis, and those before `pos` their
+    /// mode and capital starts too.
     pub fn translations_at(&mut self, pos: usize, revisit: bool) -> Vec<ResolvedTranslation> {
-        let caps = self
-            .marks
-            .as_ref()
-            .map(|m| m.caps_begin_at(pos))
-            .unwrap_or_default();
+        let caps = self.mode_begin_at(pos);
         if revisit {
             return caps;
         }
-        let reached = self
-            .marks
-            .as_mut()
-            .map(|m| m.reached(pos))
-            .unwrap_or_default();
+        let mut reached = Vec::new();
+        for at in self.from..=pos.min(self.chars.len()) {
+            if let Some(m) = &self.marks {
+                reached.extend(m.caps_end_at(at));
+            }
+            reached.extend(self.mode_ends.get(at).cloned().unwrap_or_default());
+            if let Some(m) = &self.marks {
+                reached.extend(m.emphasis_at(at));
+            }
+            if at < pos {
+                reached.extend(self.mode_begin_at(at));
+            }
+        }
+        self.from = pos + 1;
         let numeric = self
             .live_numeric
             .and_then(|n| n.at(&mut self.in_numeric, &self.chars, pos));
@@ -148,8 +183,20 @@ impl Indicators {
         let chars: Vec<char> = input.chars().collect();
         let mut translations = vec![<[Vec<ResolvedTranslation>; 3]>::default(); chars.len() + 1];
         let mut live_numeric = None;
+        let mut mode_ends = vec![Vec::new(); chars.len() + 1];
+        let mut mode_begins = vec![Vec::new(); chars.len() + 1];
 
         for indicator in &self.indicators {
+            if let Indicator::Mode(i) = indicator {
+                for (pos, t) in i.precompute(input) {
+                    if is_mode_end(t.rule()) {
+                        mode_ends[pos].push(t);
+                    } else {
+                        mode_begins[pos].push(t);
+                    }
+                }
+                continue;
+            }
             let (bucket, pairs) = match indicator {
                 Indicator::ComputerBraille(i) => (0, i.precompute(input, spans)),
                 Indicator::Numeric(i) if i.is_live() => {
@@ -157,7 +204,7 @@ impl Indicators {
                     continue;
                 }
                 Indicator::Numeric(i) => (2, i.precompute(input)),
-                Indicator::Mode(i) => (2, i.precompute(input)),
+                Indicator::Mode(_) => unreachable!("handled above"),
                 Indicator::LetterSign(i) => (1, i.precompute(input)),
                 Indicator::NoContract(i) => (1, i.precompute(input)),
             };
@@ -169,6 +216,9 @@ impl Indicators {
         PrecomputedIndications {
             translations,
             marks: self.emphases.as_ref().map(|e| e.mark(&chars, spans)),
+            mode_ends,
+            mode_begins,
+            from: 0,
             live_numeric,
             in_numeric: false,
             chars,
