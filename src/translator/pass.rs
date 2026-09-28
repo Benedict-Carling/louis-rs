@@ -177,9 +177,7 @@ impl Compiler<'_> {
                             Attribute::Any => chars.extend(self.classes.members()),
                             Attribute::Class(class) => chars.extend(self.class_chars(class)),
                             Attribute::ByOrder(n) => {
-                                if let Some(class) = self.ctx.user_class(*n) {
-                                    chars.extend(self.class_chars(&class));
-                                }
+                                chars.extend(self.class_chars(&CharacterClass::Ordinal(*n)))
                             }
                             Attribute::Boundary => {}
                         }

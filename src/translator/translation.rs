@@ -1,8 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::{
     parser::{AnchoredRule, Precedence, Rule},
-    translator::{effect::Effect, regexp::CharacterRange, swap::Swapper},
+    translator::{
+        CharacterDefinition, effect::Effect, regexp::CharacterRange, swap::Swapper,
+        table::primary::undefined_char_dots,
+    },
 };
 
 /// A translation can have multiple stages.
@@ -54,6 +58,38 @@ pub enum TranslationTarget {
     Capture,
     /// Translate to the result of a capture but also apply the mapping defined in the [`Swapper`]
     Swap(Swapper),
+    /// Translate to the dots of each captured character, as liblouis' `putCharacter` does
+    Characters(Arc<CharacterDots>),
+}
+
+/// The dots of a character: its definition, else the `undefined` dots, else its escape
+#[derive(Debug, PartialEq, Default)]
+pub struct CharacterDots {
+    definitions: CharacterDefinition,
+    undefined: Option<String>,
+}
+
+impl CharacterDots {
+    pub fn new(definitions: CharacterDefinition, undefined: Option<String>) -> Self {
+        Self {
+            definitions,
+            undefined,
+        }
+    }
+
+    pub fn definitions(&self) -> &CharacterDefinition {
+        &self.definitions
+    }
+
+    pub fn put(&self, input: &str) -> String {
+        input
+            .chars()
+            .map(|c| match (self.definitions.get(&c), &self.undefined) {
+                (Some(dots), _) | (None, Some(dots)) => dots.clone(),
+                (None, None) => undefined_char_dots(c, &self.definitions),
+            })
+            .collect()
+    }
 }
 
 impl std::fmt::Display for TranslationTarget {
@@ -74,6 +110,7 @@ impl TranslationTarget {
             TranslationTarget::Literal(_) => self,
             TranslationTarget::Capture => TranslationTarget::Literal(captured.to_string()),
             TranslationTarget::Swap(swapper) => TranslationTarget::Literal(swapper.swap(captured)),
+            TranslationTarget::Characters(dots) => TranslationTarget::Literal(dots.put(captured)),
         }
     }
 }
@@ -419,6 +456,26 @@ mod tests {
 
         let resolved = TranslationTarget::Swap(swapper).resolve("abc");
         assert_eq!(resolved, TranslationTarget::Literal("ABC".to_string()));
+    }
+
+    #[test]
+    fn resolve_characters() {
+        let mut definitions = CharacterDefinition::new();
+        definitions.insert('a', "⠁");
+        let dots = |undefined: Option<&str>| {
+            TranslationTarget::Characters(Arc::new(CharacterDots::new(
+                definitions.clone(),
+                undefined.map(str::to_string),
+            )))
+        };
+        assert_eq!(
+            dots(Some("⠿")).resolve("ab"),
+            TranslationTarget::Literal("⠁⠿".to_string())
+        );
+        assert_eq!(
+            dots(None).resolve("a"),
+            TranslationTarget::Literal("⠁".to_string())
+        );
     }
 
     #[test]
