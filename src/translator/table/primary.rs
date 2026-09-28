@@ -1959,8 +1959,13 @@ impl PrimaryTable {
                 let pass_rule = context_candidates
                     .iter()
                     .chain(&context_delayed)
-                    .filter(|t| is_pass_rule(t) && !seen.contains(&TranslationSubset::from(*t)))
-                    .max_by_key(|t| t.rank())
+                    .filter(|t| {
+                        // `seen` holds what was applied at the current position only
+                        is_pass_rule(t)
+                            && (t.offset() > 0 || !seen.contains(&TranslationSubset::from(*t)))
+                    })
+                    // liblouis tries pass rules longest test first, whatever they replace
+                    .max_by_key(|t| (t.weight(), t.length()))
                     .cloned();
                 context_candidates.retain(|t| !is_pass_rule(t));
                 context_delayed.retain(|t| !is_pass_rule(t));
