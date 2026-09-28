@@ -55,10 +55,18 @@ pub struct TableContext {
     direction_dots_classes: Option<CharacterClasses>,
     swap_classes: SwapClasses,
     seq_after_patterns: Vec<String>,
+    groupings: HashMap<String, Grouping>,
     /// liblouis's `toLowercase`: each capital a kept `base uppercase` rule derives, mapped
     /// to its base
     case_folding: HashMap<char, char>,
     character_dots: Arc<CharacterDots>,
+}
+
+/// The pair of characters and the pair of cells a `grouping` rule names
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Grouping {
+    pub chars: (char, char),
+    pub dots: (char, char),
 }
 
 impl TableContext {
@@ -77,8 +85,13 @@ impl TableContext {
             case_folding: HashMap::new(),
             direction_character_classes: None,
             direction_dots_classes: None,
+            groupings: HashMap::new(),
             character_dots: Arc::default(),
         }
+    }
+
+    pub fn grouping(&self, name: &str) -> Option<Grouping> {
+        self.groupings.get(name).copied()
     }
 
     pub fn character_definitions(&self) -> &CharacterDefinition {
@@ -143,6 +156,7 @@ impl TableContext {
         let mut dots_classes = CharacterClasses::default();
         let mut swap_classes = SwapClasses::default();
         let mut seq_after_patterns = Vec::new();
+        let mut groupings = HashMap::new();
         let mut undefined = None;
 
         // First pass: everything that later rules need to *look up*. These include
@@ -259,6 +273,23 @@ impl TableContext {
         // go through the rules again with all the character_definitions sorted out
         for (index, rule) in rules.iter().enumerate() {
             match &rule.rule {
+                Rule::Grouping {
+                    name,
+                    chars,
+                    left,
+                    right,
+                } => {
+                    let mut chars = chars.chars();
+                    if let (Some(open), Some(close)) = (chars.next(), chars.next()) {
+                        groupings.insert(
+                            name.clone(),
+                            Grouping {
+                                chars: (open, close),
+                                dots: (left.to_unicode(), right.to_unicode()),
+                            },
+                        );
+                    }
+                }
                 Rule::Base {
                     derived,
                     base,
@@ -298,7 +329,7 @@ impl TableContext {
                         }
                     }
                 }
-                Rule::Attribute { name, chars } => {
+                Rule::Attribute { name, chars } | Rule::Class { name, chars } => {
                     let class = CharacterClass::from(name.as_str());
                     for c in chars.chars() {
                         character_classes.insert(class.clone(), c);
@@ -420,6 +451,7 @@ impl TableContext {
             seq_after_patterns,
             direction_character_classes: None,
             direction_dots_classes: None,
+            groupings,
         })
     }
 }
@@ -521,6 +553,17 @@ mod tests {
 
     fn parse_rule(source: &str) -> AnchoredRule {
         RuleParser::new(source).rule().unwrap().into()
+    }
+
+    #[test]
+    fn class_is_an_alias_of_attribute() {
+        let context = TableContext::compile(&[parse_rule("class foo ab")]).unwrap();
+        assert_eq!(
+            context
+                .character_classes
+                .get(&CharacterClass::UserDefined("foo".to_string())),
+            Some(HashSet::from(['a', 'b']))
+        );
     }
 
     #[test]

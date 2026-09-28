@@ -371,7 +371,7 @@ struct Thread {
     pc: InstructionIndex,
     captured: CharacterRange,
     consumed: CharacterRange,
-    bonus: isize,
+    bonus: usize,
 }
 
 /// A bitset over instruction indices, used to track which `pc`s have already been added
@@ -443,7 +443,7 @@ impl CompiledRegexp {
         sp: usize,
         cp: usize,
         // weight earned by zero-width boundary assertions (see `Regexp::StartBoundary`)
-        bonus: isize,
+        bonus: usize,
         input: &str,
         at_start: bool,
         env: &Environment,
@@ -526,7 +526,7 @@ impl CompiledRegexp {
                 env,
             ),
             Instruction::VariableEqual(var, expected) => {
-                if env.get(var) == expected {
+                if env.get(var).copied().unwrap_or(0) == expected {
                     self.add_thread(
                         list,
                         pc + 1,
@@ -534,7 +534,7 @@ impl CompiledRegexp {
                         consumed,
                         sp,
                         cp,
-                        bonus + 1,
+                        bonus,
                         input,
                         at_start,
                         env,
@@ -542,7 +542,7 @@ impl CompiledRegexp {
                 }
             }
             Instruction::NotVariableEqual(var, expected) => {
-                if env.get(var) != expected {
+                if env.get(var).copied().unwrap_or(0) != expected {
                     self.add_thread(
                         list,
                         pc + 1,
@@ -730,7 +730,7 @@ impl CompiledRegexp {
                         matched = Some((
                             thread.captured.clone(),
                             thread.consumed.clone(),
-                            (length as isize + thread.bonus) as usize,
+                            length + thread.bonus,
                             index,
                         ));
                         // every remaining thread in this step is lower priority than the one

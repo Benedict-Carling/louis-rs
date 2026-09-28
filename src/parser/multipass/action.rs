@@ -65,14 +65,35 @@ impl TryFrom<&Action> for String {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ActionInstruction {
-    String { s: String },
-    Dots { dots: BrailleChars },
-    SwapClass { name: String },
-    Assignment { variable: u8, value: u8 },
-    Increment { variable: u8 },
-    Decrement { variable: u8 },
+    String {
+        s: String,
+    },
+    Dots {
+        dots: BrailleChars,
+    },
+    SwapClass {
+        name: String,
+    },
+    Assignment {
+        variable: u8,
+        value: u8,
+    },
+    Increment {
+        variable: u8,
+    },
+    Decrement {
+        variable: u8,
+    },
     Replace,
     Ignore,
+    /// `{name`: emit the opening character of the `grouping` rule called `name`
+    GroupStart {
+        name: String,
+    },
+    /// `}name`: emit the closing character of the `grouping` rule called `name`
+    GroupEnd {
+        name: String,
+    },
 }
 
 impl IsLiteral for ActionInstruction {
@@ -103,6 +124,7 @@ impl ConsumesInput for ActionInstruction {
             ActionInstruction::Assignment { .. }
             | ActionInstruction::Increment { .. }
             | ActionInstruction::Decrement { .. } => false,
+            ActionInstruction::GroupStart { .. } | ActionInstruction::GroupEnd { .. } => true,
         }
     }
 }
@@ -121,7 +143,7 @@ impl TryFrom<&ActionInstruction> for String {
 }
 
 fn is_action(c: &char) -> bool {
-    matches!(c, '@' | '"' | '%' | '#' | '*' | '?')
+    matches!(c, '@' | '"' | '%' | '#' | '*' | '?' | '{' | '}')
 }
 
 pub struct Parser<'a> {
@@ -203,18 +225,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn unescape_unicode(&mut self, len: usize) -> Result<char, ParseError> {
-        let mut s = String::new();
-        for _ in 0..len {
-            match self.chars.next() {
-                Some(c) => s.push(c),
-                None => return Err(ParseError::InvalidEscapeSequence { found: None }),
-            }
-        }
-        u32::from_str_radix(&s, 16)
-            .ok()
-            .and_then(char::from_u32)
-            .ok_or(ParseError::InvalidEscapeSequence { found: None })
+    fn unescape_unicode(&mut self, len: u8) -> Result<char, ParseError> {
+        crate::parser::unescape_unicode(&mut self.chars, len)
+            .map_err(|_| ParseError::InvalidEscapeSequence { found: None })
     }
 
     fn string(&mut self) -> Result<ActionInstruction, ParseError> {
@@ -261,8 +274,14 @@ impl<'a> Parser<'a> {
                     value: self.ascii_number()?,
                 })
             }
-            Some('+') => Ok(ActionInstruction::Increment { variable }),
-            Some('-') => Ok(ActionInstruction::Decrement { variable }),
+            Some('+') => {
+                self.consume('+')?;
+                Ok(ActionInstruction::Increment { variable })
+            }
+            Some('-') => {
+                self.consume('-')?;
+                Ok(ActionInstruction::Decrement { variable })
+            }
             c => Err(ParseError::InvalidOperator { found: c.copied() }),
         }
     }
@@ -285,6 +304,21 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn group(&mut self) -> Result<ActionInstruction, ParseError> {
+        let open = self.chars.next() == Some('{');
+        let mut name = String::new();
+        while let Some(c) = self.chars.next_if(char::is_ascii_alphabetic) {
+            name.push(c);
+        }
+        if name.is_empty() {
+            Err(ParseError::InvalidClass)
+        } else if open {
+            Ok(ActionInstruction::GroupStart { name })
+        } else {
+            Ok(ActionInstruction::GroupEnd { name })
+        }
+    }
+
     fn action(&mut self) -> Result<ActionInstruction, ParseError> {
         match self.chars.peek() {
             Some('@') => Ok(self.dots()?),
@@ -293,6 +327,7 @@ impl<'a> Parser<'a> {
             Some('?') => Ok(self.ignore()?),
             Some('#') => Ok(self.variable()?),
             Some('%') => Ok(self.class()?),
+            Some('{' | '}') => Ok(self.group()?),
             Some(c) => Err(ParseError::InvalidAction { found: Some(*c) }),
             _ => Err(ParseError::InvalidAction { found: None }),
         }
@@ -345,6 +380,8 @@ mod display {
                 }
                 ActionInstruction::Increment { variable } => write!(f, "#{}+", variable),
                 ActionInstruction::Decrement { variable } => write!(f, "#{}-", variable),
+                ActionInstruction::GroupStart { name } => write!(f, "{{{}", name),
+                ActionInstruction::GroupEnd { name } => write!(f, "}}{}", name),
             }
         }
     }
@@ -414,6 +451,10 @@ mod tests {
             Parser::new(r#"".\s\"""#).string(),
             Ok(ActionInstruction::String { s: ". \"".into() })
         );
+        assert_eq!(
+            Parser::new(r#""\xd83d\xde02""#).string(),
+            Ok(ActionInstruction::String { s: "😂".into() })
+        );
         // an escaped backslash is one backslash, and must not swallow the
         // closing quote (it-it-comp6.utb:248, `nofor context @16 "\\"`)
         assert_eq!(
@@ -459,6 +500,13 @@ mod tests {
         assert_eq!(
             Parser::new("#5-").action(),
             Ok(ActionInstruction::Decrement { variable: 5 })
+        );
+        assert_eq!(
+            Parser::new("#1+?").actions(),
+            Ok(Action::new(vec![
+                ActionInstruction::Increment { variable: 1 },
+                ActionInstruction::Ignore
+            ]))
         );
         assert_ne!(
             Parser::new("#1=").action(),

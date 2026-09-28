@@ -1,10 +1,17 @@
 //! A parser for [liblouis](https://liblouis.io) YAML test files
 
-use std::{collections::HashMap, fs::File, iter::Peekable, num::ParseIntError, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs::File,
+    iter::Peekable,
+    num::ParseIntError,
+    path::{Path, PathBuf},
+};
 
 use crate::{parser, parser::EscapingContext, parser::unescape};
 
 use libyaml::{Encoding, Event, Parser, ParserIter, ScalarStyle};
+use search_path::SearchPath;
 
 use crate::emphasis::EmphasisSpan;
 use crate::parser::Direction;
@@ -60,6 +67,7 @@ pub enum ParseError {
 
 pub struct YAMLParser<'a> {
     events: Peekable<ParserIter<'a>>,
+    search_path: SearchPath,
 }
 
 impl YAMLParser<'_> {
@@ -67,7 +75,15 @@ impl YAMLParser<'_> {
         let parser = Parser::new(reader)?;
         Ok(Self {
             events: parser.into_iter().peekable(),
+            search_path: SearchPath::new_or("LOUIS_TABLE_PATH", "."),
         })
+    }
+
+    /// Look tables up in `dir` before the search path, as lou_checkyaml does by changing into the
+    /// YAML file's directory.
+    pub fn in_dir(mut self, dir: &Path) -> Self {
+        self.search_path.prepend(dir.to_path_buf());
+        self
     }
 
     fn scalar(&mut self) -> Result<String, ParseError> {
@@ -526,6 +542,7 @@ impl YAMLParser<'_> {
                 "tests" => {
                     let tests = self.tests()?;
                     let suite = TestMatrix::new(
+                        &self.search_path,
                         &current_display_table,
                         &current_tables,
                         &test_mode,
@@ -567,7 +584,9 @@ mod tests {
             .unwrap()
             .write_all(yaml.as_bytes())
             .unwrap();
-        let results = YAMLParser::new(File::open(&path).unwrap())?.yaml();
+        let results = YAMLParser::new(File::open(&path).unwrap())?
+            .in_dir(&std::env::temp_dir())
+            .yaml();
         let _ = std::fs::remove_file(&path);
         results
     }
@@ -624,6 +643,29 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn the_word_at_the_cursor_is_computer_braille() {
+        let yaml = format!(
+            "{AB_TABLE}  space \\s 0\n  always ab 12-1\ntests:\n  - - ab ab\n    - ⠃⠁ ⠁⠃\n    - mode: [compbrlAtCursor]\n      cursorPos: [4, 4]\n      inputPos: [0, 0, 2, 3, 4]\n"
+        );
+        let results = run("compbrl_at_cursor", &yaml).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_success(), "{:?}", results[0]);
+    }
+
+    #[test]
+    fn hyphenate_mode_shows_the_breaks() {
+        let dic = format!("louis-rs-{}-hyphenate.dic", std::process::id());
+        std::fs::write(std::env::temp_dir().join(&dic), "UTF-8\na1b\n").unwrap();
+        let yaml = format!(
+            "table: |\n  include {dic}\n  letter a 1\n  letter b 12\n  hyphen - 36\nflags: {{testmode: hyphenate}}\ntests:\n  - [aabb, aa-bb]\n  - [ab-ab, a-b-|a-b]\n  - [bbaa, bbaa]\n"
+        );
+        let results = run("hyphenate_mode", &yaml).unwrap();
+        let _ = std::fs::remove_file(std::env::temp_dir().join(&dic));
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
     }
 
     #[test]

@@ -186,6 +186,7 @@ impl Resolve for UnresolvedTranslation {
             stage: self.stage,
             effects: self.effects,
             origin: self.origin,
+            parts: Vec::new(),
         }
     }
 }
@@ -249,6 +250,8 @@ pub struct ResolvedTranslation {
     effects: Vec<Effect>,
     /// Which translation rule was the cause for this translation
     origin: Option<AnchoredRule>,
+    /// The steps this translation is made of, where liblouis maps their positions separately
+    parts: Vec<ResolvedTranslation>,
 }
 
 /// A subset of translation for which [`Hash`] and [`Eq`] is implemented
@@ -299,6 +302,7 @@ impl ResolvedTranslation {
             stage,
             effects: Vec::default(),
             origin: origin.into(),
+            parts: Vec::new(),
         }
     }
 
@@ -363,6 +367,24 @@ impl ResolvedTranslation {
     /// Set the `weight` of a translation.
     pub fn with_weight(self, weight: usize) -> Self {
         Self { weight, ..self }
+    }
+
+    pub fn with_effects(self, effects: Vec<Effect>) -> Self {
+        Self { effects, ..self }
+    }
+
+    /// This translation as the steps of `parts`, which make up the same input and output
+    pub fn with_parts(self, parts: Vec<ResolvedTranslation>) -> Self {
+        Self { parts, ..self }
+    }
+
+    /// The steps this translation is made of: its parts, or else itself
+    pub fn into_steps(self) -> Vec<ResolvedTranslation> {
+        if self.parts.is_empty() {
+            vec![self]
+        } else {
+            self.parts
+        }
     }
 
     /// Set the `length` of a translation.

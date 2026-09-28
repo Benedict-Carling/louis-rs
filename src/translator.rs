@@ -21,6 +21,7 @@ mod effect;
 mod indication;
 mod match_pattern;
 mod options;
+mod pass;
 mod pipeline;
 mod position_constraints;
 mod positions;
@@ -39,6 +40,19 @@ pub enum TranslationError {
     BaseCharacterNotDefined { base: char, derived: char },
     #[error("Swap class {0} not defined")]
     SwapClassNotDefined(String),
+    #[error("Grouping {0} not defined")]
+    GroupingNotDefined(String),
+}
+
+/// The characters `rules` give the letter attribute
+pub fn letters(
+    rules: &[AnchoredRule],
+) -> Result<std::collections::HashSet<char>, TranslationError> {
+    let ctx = table::TableContext::compile(rules)?;
+    Ok(ctx
+        .character_classes()
+        .get(&crate::parser::CharacterClass::Letter)
+        .unwrap_or_default())
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
