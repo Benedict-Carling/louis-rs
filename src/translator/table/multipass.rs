@@ -94,6 +94,7 @@ impl MultipassTable {
         let mut behind: Vec<(usize, ResolvedTranslation)> = Vec::new();
 
         loop {
+            let from_before = pending.is_some();
             let candidate = match pending.take() {
                 Some(t) if t.offset() > 0 => {
                     pending = Some(t.decrement_offset(1));
@@ -127,7 +128,8 @@ impl MultipassTable {
             advanced = true;
             let consumed = if let Some(t) = candidate {
                 if t.length() == 0 {
-                    advanced = false;
+                    // a rule whose test began earlier has advanced past where it began
+                    advanced = from_before;
                 } else {
                     // move the iterator forward by the number of characters in the translation
                     chars.nth(t.length() - 1);
@@ -245,6 +247,19 @@ mod tests {
                 .unwrap();
         assert_eq!(transform.translate("⠃⠃"), "⠃");
         assert_eq!(transform.translate("⠃⠙⠃"), "⠃⠙⠃");
+    }
+
+    #[test]
+    fn a_rule_that_began_earlier_lets_the_next_one_start_where_it_ended() {
+        let rules = [
+            parse_rule("noback pass2 @1[]@2 @3"),
+            parse_rule("noback pass2 @2[]@4 @5"),
+        ];
+        let ctx = TableContext::default();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Post1, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("⠁⠂⠈"), "⠁⠄⠂⠐⠈");
     }
 
     #[test]
