@@ -483,14 +483,16 @@ impl BackwardSelector {
         let after_is = |classes: &[CharacterClass]| self.cell_is(after, classes);
         let end_word = || !situation.partial && self.is_end_word(situation.cells, end);
 
+        // liblouis ors the classes of a rule's `after` constraints, and of its `before` ones
+        let (mut after, mut before) = (Vec::new(), Vec::new());
         for with in with_classes(rule) {
-            let ok = match with {
-                WithClass::After { class } => before_is(&[CharacterClass::from(class.as_str())]),
-                WithClass::Before { class } => after_is(&[CharacterClass::from(class.as_str())]),
-            };
-            if !ok {
-                return false;
+            match with {
+                WithClass::After { class } => after.push(CharacterClass::from(class.as_str())),
+                WithClass::Before { class } => before.push(CharacterClass::from(class.as_str())),
             }
+        }
+        if (!after.is_empty() && !before_is(&after)) || (!before.is_empty() && !after_is(&before)) {
+            return false;
         }
 
         let number = situation.state.number != 0;

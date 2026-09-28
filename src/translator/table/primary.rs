@@ -2740,6 +2740,30 @@ mod tests {
     use crate::parser::{RuleParser, expand_includes};
 
     #[test]
+    fn after_classes_are_alternatives_backward() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase c 14"),
+            parse_rule("lowercase x 1346"),
+            parse_rule("sign # 3456"),
+            parse_rule("attribute ca a"),
+            parse_rule("attribute cb b"),
+            parse_rule("after ca after cb always x 3456"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table = PrimaryTable::compile(
+            &rules,
+            Direction::Backward,
+            TranslationStage::Main,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(table.translate("⠃⠼"), "bx");
+        assert_eq!(table.translate("⠉⠼"), "c#");
+    }
+
+    #[test]
     fn zero_length_context_rule_applies_again_further_on() {
         let rules = [
             parse_rule("lowercase a 1"),
