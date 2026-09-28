@@ -89,6 +89,11 @@ impl IndicatorBuilder {
     pub fn letter_characters(&mut self, chars: HashSet<char>) {
         self.0.letter_characters(chars);
     }
+
+    /// The letters that have case
+    pub fn cased_characters(&mut self, chars: HashSet<char>) {
+        self.0.emphasizable_characters(chars);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +162,25 @@ mod tests {
         assert_eq!(
             pairs(&indicator.precompute("ABCa")),
             vec![(0, "⠇".to_string()), (3, "⠠".to_string()),]
+        );
+    }
+
+    #[test]
+    fn no_end_indication_before_an_uncased_letter() {
+        let mut builder = base_builder();
+        builder.letter_characters(HashSet::from(['A', 'B', 'C', 'a', 'ع']));
+        builder.cased_characters(HashSet::from(['A', 'B', 'C', 'a']));
+        builder.begcapsword("⠇", &rule("begcapsword 123"));
+        builder.endcapsword("⠠", &rule("endcapsword 6"));
+        let indicator = builder.build(&no_space_ctx()).unwrap();
+
+        assert_eq!(
+            pairs(&indicator.precompute("ABCع")),
+            vec![(0, "⠇".to_string())]
+        );
+        assert_eq!(
+            pairs(&indicator.precompute("ABCa")),
+            vec![(0, "⠇".to_string()), (3, "⠠".to_string())]
         );
     }
 

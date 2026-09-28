@@ -170,8 +170,7 @@ mod tests {
         }
     }
 
-    const NUMBER_TABLE: &str =
-        "space \\s 0\nletter a 1\nlitdigit 4 145\nlitdigit 2 12\nnumsign 3456\n";
+    const NUMBER_TABLE: &str = "space \\s 0\nletter a 1\ndigit 4 145\ndigit 2 12\nnumsign 3456\n";
 
     #[test]
     fn positions_with_number_sign() {

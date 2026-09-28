@@ -45,11 +45,11 @@ pub enum TranslationError {
 pub struct CharacterDefinition(HashMap<char, String>);
 
 impl CharacterDefinition {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(HashMap::new())
     }
 
-    fn insert(&mut self, from: char, to: &str) {
+    pub(crate) fn insert(&mut self, from: char, to: &str) {
         if cfg!(feature = "backwards_compatibility") {
             // first rule wins
             self.0.entry(from).or_insert(to.to_string());

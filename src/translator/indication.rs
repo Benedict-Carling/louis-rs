@@ -109,6 +109,8 @@ pub struct PrecomputedIndications<'a> {
     live_numeric: Option<&'a numeric::Indicator>,
     in_numeric: bool,
     chars: Vec<char>,
+    /// The positions in computer braille, where liblouis puts no other indicator
+    computer_braille: Vec<bool>,
 }
 
 impl PrecomputedIndications<'_> {
@@ -126,9 +128,13 @@ impl PrecomputedIndications<'_> {
             .filter(|(_, spanned, _)| *spanned)
             .map(|(t, ..)| t.clone())
             .collect();
-        let numeric = self
-            .live_numeric
-            .and_then(|n| n.at(&mut self.in_numeric, &self.chars, pos));
+        let numeric = if self.computer_braille.get(pos).copied().unwrap_or(false) {
+            self.in_numeric = false;
+            None
+        } else {
+            self.live_numeric
+                .and_then(|n| n.at(&mut self.in_numeric, &self.chars, pos))
+        };
         if let Some((before, after)) = self.translations.get(pos) {
             result.extend(before.iter().map(|(t, ..)| t.clone()));
             result.extend(numeric);
@@ -169,6 +175,12 @@ impl Indicators {
         let n = input.chars().count();
         let mut translations = vec![(vec![], vec![]); n + 1];
         let mut live_numeric = None;
+        let mut computer_braille = vec![false; n + 1];
+        for span in spans.iter().filter(|s| s.class == "computer_braille") {
+            for pos in span.range.start..span.range.end.min(n) {
+                computer_braille[pos] = true;
+            }
+        }
 
         for indicator in &self.0 {
             let spanned = matches!(indicator, Indicator::Emphasis(_) | Indicator::Mode(_));
@@ -186,6 +198,9 @@ impl Indicators {
                 Indicator::NoContract(i) => i.precompute(input),
             };
             for (pos, t) in pairs {
+                if computer_braille[pos] && !matches!(indicator, Indicator::ComputerBraille(_)) {
+                    continue;
+                }
                 // liblouis ends capitals, then the other modes, before any other indicator
                 // but computer braille
                 let phase = match indicator {
@@ -217,6 +232,7 @@ impl Indicators {
             live_numeric,
             in_numeric: false,
             chars: input.chars().collect(),
+            computer_braille,
         }
     }
 }
