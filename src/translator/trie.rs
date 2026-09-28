@@ -334,7 +334,8 @@ impl Trie {
             }
         }
 
-        let translation = ResolvedTranslation::new(from, to, length, stage, origin.clone());
+        let translation = ResolvedTranslation::new(from, to, length, stage, origin.clone())
+            .with_precedence(precedence.clone());
         let existing = current_node.translations.first().map(|t| t.precedence());
         let translations = &mut current_node.translations;
         // backward translation keeps a single rule per node

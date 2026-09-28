@@ -401,6 +401,10 @@ impl ResolvedTranslation {
     }
 
     /// Set the `offset` of a translation.
+    pub fn with_precedence(self, precedence: Precedence) -> Self {
+        Self { precedence, ..self }
+    }
+
     pub fn with_offset(self, offset: usize) -> Self {
         Self { offset, ..self }
     }

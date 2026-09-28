@@ -1112,6 +1112,7 @@ impl HasPrecedence for Rule {
             | Rule::Midnum { .. }
             | Rule::Endnum { .. }
             | Rule::Always { .. }
+            | Rule::Nocont { .. }
             | Rule::Replace { .. } => Precedence::Translation,
             Rule::Capsletter { .. }
             | Rule::Begcapsword { .. }
