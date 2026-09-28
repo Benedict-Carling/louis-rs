@@ -6,6 +6,7 @@ use crate::{
     parser::{AnchoredRule, BrailleChars, CharacterClass, Constraints, HasDirection, Rule},
     translator::{
         PositionMap, ResolvedTranslation, TranslationError, TranslationOptions, TranslationStage,
+        back_emphasis,
         table::{
             TableContext, display::DisplayTable, multipass::MultipassTable, primary::PrimaryTable,
         },
@@ -365,13 +366,33 @@ impl TranslationPipeline {
         input: &str,
         options: &TranslationOptions,
     ) -> (String, PositionMap) {
+        let (output, positions, _) = self.translate_with_emphasis(input, options);
+        (output, positions)
+    }
+
+    /// Like [`Self::translate_with_positions`], also giving the emphasis of a
+    /// back-translation when `options` ask for it
+    pub fn translate_with_emphasis(
+        &self,
+        input: &str,
+        options: &TranslationOptions,
+    ) -> (String, PositionMap, Option<Vec<EmphasisSpan>>) {
         let stages = self.trace_with_options(input, options);
         let output = stages.last().map_or_else(
             || input.to_string(),
             |steps| steps.iter().map(|t| t.output()).collect(),
         );
         let positions = PositionMap::from_trace(input.chars().count(), &stages, self.direction);
-        (output, positions)
+        let emphasis =
+            (self.direction == Direction::Backward && options.emphasis_output()).then(|| {
+                self.steps
+                    .iter()
+                    .zip(&stages)
+                    .find(|(step, _)| matches!(step, Transformation::Primary(_)))
+                    .map(|(_, trace)| back_emphasis::back_translated(trace))
+                    .unwrap_or_default()
+            });
+        (output, positions, emphasis)
     }
 }
 

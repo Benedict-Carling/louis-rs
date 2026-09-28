@@ -49,9 +49,11 @@ pub enum TranslationError {
 #[derive(Debug, Default)]
 pub struct TranslationResult {
     pub output: String,
-    pub emphasis: Option<Vec<EmphasisSpan>>, // Only if input had emphasis
+    /// The emphasis of a back-translation, if [`TranslationOptions::with_emphasis_output`]
+    /// asked for it
+    pub emphasis: Option<Vec<EmphasisSpan>>,
     pub output_positions: Option<Vec<usize>>, // Maps input pos -> output pos
-    pub input_positions: Option<Vec<usize>>, // Maps output pos -> input pos
+    pub input_positions: Option<Vec<usize>>,  // Maps output pos -> input pos
     pub cursor_pos: Option<usize>,
 }
 
@@ -129,15 +131,15 @@ impl Translator {
         input: &str,
         options: TranslationOptions,
     ) -> Result<TranslationResult, TranslationError> {
-        let (output, positions) = self.0.translate_with_positions(input, &options);
+        let (output, positions, emphasis) = self.0.translate_with_emphasis(input, &options);
         let cursor_pos = options.cursor_pos().map(|cursor| positions.cursor(cursor));
         let (output_positions, input_positions) = positions.into_parts();
         Ok(TranslationResult {
             output,
+            emphasis,
             output_positions: Some(output_positions),
             input_positions: Some(input_positions),
             cursor_pos,
-            ..Default::default()
         })
     }
 }
@@ -225,6 +227,31 @@ mod tests {
         // backward, a consumed cell is claimed by the character that follows it, so the "H"
         // covers the capital sign as well ("prepend to next", as liblouis calls it)
         assert_eq!(result.input_positions, Some(vec![0, 2]));
+    }
+
+    #[test]
+    fn emphasis_of_a_back_translation() {
+        let table = "space \\s 0\nletter a 1\nletter b 12\nemphclass italic\nemphletter italic 46\nbegemphword italic 45\n";
+        let backward = Translator::from_table_source(table, Direction::Backward).unwrap();
+        let result = backward
+            .translate_with_options(
+                "⠨⠁⠃⠀⠘⠁⠃",
+                TranslationOptions::default().with_emphasis_output(),
+            )
+            .unwrap();
+        assert_eq!(result.output, "ab ab");
+        assert_eq!(
+            result.emphasis,
+            Some(vec![
+                EmphasisSpan::new("italic", 0..1),
+                EmphasisSpan::new("italic", 3..5)
+            ])
+        );
+        let result = backward
+            .translate_with_options("⠨⠁", TranslationOptions::default())
+            .unwrap();
+        assert_eq!(result.output, "\\46/a");
+        assert_eq!(result.emphasis, None);
     }
 
     #[test]

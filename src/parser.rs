@@ -1704,6 +1704,7 @@ impl<'a> RuleParser<'a> {
             })?
     }
 
+    #[allow(dead_code)] // used by the binary and the tests
     pub fn rule(&mut self) -> Result<Rule, ParseError> {
         self.rule_or_blank()?
             .ok_or(ParseError::OpcodeExpected { found: None })

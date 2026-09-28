@@ -217,4 +217,30 @@ mod tests {
         assert_eq!(transform.translate("resszel"), "resszel");
         assert_eq!(transform.translate("ressze"), "reszsze");
     }
+
+    #[test]
+    fn rules_starting_with_more_literal_cells_are_tried_first() {
+        let rules = [
+            parse_rule("noback pass2 @1-2[@3]@4 @5"),
+            parse_rule("noback pass2 @1[@3]@4 @6"),
+        ];
+        let ctx = TableContext::default();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Post1, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("⠁⠂⠄⠈"), "⠁⠂⠐⠈");
+    }
+
+    #[test]
+    fn a_rule_whose_test_began_earlier_comes_first() {
+        let rules = [
+            parse_rule("noback pass2 @1[@2] @4"),
+            parse_rule("noback pass2 [@2-2] @5"),
+        ];
+        let ctx = TableContext::default();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Post1, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("⠁⠂⠂"), "⠁⠈⠂");
+    }
 }

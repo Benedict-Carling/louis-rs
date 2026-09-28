@@ -65,6 +65,12 @@ pub enum FailureReason {
         direction: Direction,
     },
     Position(PositionMismatch),
+    /// The text matched, but a back-translation reported the wrong emphasis
+    Typeform {
+        input: String,
+        expected: Vec<EmphasisSpan>,
+        actual: Vec<EmphasisSpan>,
+    },
 }
 
 #[derive(PartialEq, Debug)]
@@ -92,7 +98,10 @@ impl TestResult {
         matches!(self, TestResult::Success)
     }
     pub fn is_translation_failure(&self) -> bool {
-        matches!(self, TestResult::Failure(FailureReason::Translation { .. }))
+        matches!(
+            self,
+            TestResult::Failure(FailureReason::Translation { .. } | FailureReason::Typeform { .. })
+        )
     }
     pub fn is_position_failure(&self) -> bool {
         matches!(self, TestResult::Failure(FailureReason::Position(_)))
@@ -503,6 +512,21 @@ impl ExpectedFailure {
     }
 }
 
+/// Whether `a` and `b` emphasize each of the first `len` characters with the same classes
+fn same_emphasis(a: &[EmphasisSpan], b: &[EmphasisSpan], len: usize) -> bool {
+    fn classes(spans: &[EmphasisSpan], pos: usize) -> Vec<&str> {
+        let mut classes: Vec<&str> = spans
+            .iter()
+            .filter(|s| s.range.contains(&pos))
+            .map(|s| s.class.as_str())
+            .collect();
+        classes.sort();
+        classes.dedup();
+        classes
+    }
+    (0..len).all(|pos| classes(a, pos) == classes(b, pos))
+}
+
 /// A test to verify a braille translation.
 #[derive(Debug, Clone)]
 pub struct Test {
@@ -513,7 +537,8 @@ pub struct Test {
     /// Is the test expected to fail?
     xfail: ExpectedFailure,
     emphasis: Vec<EmphasisSpan>,
-    expected_emphasis: Vec<EmphasisSpan>,
+    /// The emphasis a back-translation is expected to report, if the test checks it
+    expected_emphasis: Option<Vec<EmphasisSpan>>,
     input_pos: Vec<usize>,
     output_pos: Vec<usize>,
     cursor_pos: Option<CursorPosition>,
@@ -534,6 +559,9 @@ impl Test {
         let mut options = TranslationOptions::default()
             .with_mode(self.modes.clone())
             .with_emphasis(self.emphasis.clone());
+        if self.expected_emphasis.is_some() && direction == Direction::Backward {
+            options = options.with_emphasis_output();
+        }
         if let Some(CursorPosition::Single(cursor) | CursorPosition::Tuple(cursor, _)) =
             self.cursor_pos
         {
@@ -560,7 +588,7 @@ impl Test {
             }
             return self.verdict(translated, direction, None);
         }
-        let (translated, positions) = table.translate_with_positions(&input, &options);
+        let (translated, positions, emphasis) = table.translate_with_emphasis(&input, &options);
         let translated = match (display, direction) {
             (Some(display), Direction::Forward) => match display.show(&translated) {
                 Some(shown) => shown,
@@ -569,7 +597,19 @@ impl Test {
             _ => translated,
         };
         let position_mismatch = self.position_mismatch(&positions, direction);
-        self.verdict(translated, direction, position_mismatch)
+        let result = self.verdict(translated, direction, position_mismatch);
+        match (result, &self.expected_emphasis, emphasis) {
+            (TestResult::Success, Some(expected), Some(actual))
+                if !same_emphasis(expected, &actual, self.expected.chars().count()) =>
+            {
+                TestResult::Failure(FailureReason::Typeform {
+                    input: self.input.clone(),
+                    expected: expected.clone(),
+                    actual,
+                })
+            }
+            (result, _, _) => result,
+        }
     }
 
     /// Check the test in `display` mode: map each character of `input` to the cell the
@@ -660,7 +700,7 @@ impl Test {
         expected: String,
         xfail: ExpectedFailure,
         emphasis: Vec<EmphasisSpan>,
-        expected_emphasis: Vec<EmphasisSpan>,
+        expected_emphasis: Option<Vec<EmphasisSpan>>,
         input_pos: Vec<usize>,
         output_pos: Vec<usize>,
         cursor_pos: Option<CursorPosition>,
@@ -733,7 +773,7 @@ mod tests {
             "⠁⠃".to_string(),
             ExpectedFailure::Simple(false),
             vec![],
-            vec![],
+            None,
             input_pos,
             output_pos,
             cursor_pos,
