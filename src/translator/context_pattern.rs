@@ -16,43 +16,6 @@ use crate::translator::translation::{
 };
 use crate::translator::{ResolvedTranslation, TranslationError, TranslationStage};
 
-/// The number of leading instructions of a test that a lookback `_n` steps back over: the
-/// lookback itself, the zero-width checks before it, and the fixed-width checks after it that
-/// take the test back to where it started. 0 when the test does not start that way.
-fn lookbehind_len(tests: &[TestInstruction]) -> usize {
-    let Some(i) = tests
-        .iter()
-        .position(|t| !matches!(t, TestInstruction::Variable { .. }))
-    else {
-        return 0;
-    };
-    let Some(TestInstruction::Lookback { len }) = tests.get(i) else {
-        return 0;
-    };
-    let mut remaining = usize::from(*len);
-    for (j, test) in tests.iter().enumerate().skip(i + 1) {
-        if remaining == 0 {
-            return j;
-        }
-        let width = match test {
-            TestInstruction::Dots { dots } => dots.len(),
-            TestInstruction::String { s } => s.chars().count(),
-            TestInstruction::Attributes { quantifier, .. }
-            | TestInstruction::Class { quantifier, .. } => match quantifier {
-                None => 1,
-                Some(Quantifier::Number(n)) => usize::from(*n),
-                _ => return 0,
-            },
-            _ => return 0,
-        };
-        if width > remaining {
-            return 0;
-        }
-        remaining -= width;
-    }
-    if remaining == 0 { tests.len() } else { 0 }
-}
-
 impl Regexp {
     fn from_test(test: &Test, whole_match: bool, ctx: &CharacterClasses) -> Self {
         Regexp::from_test_in(test, whole_match, ctx, Direction::Forward)
@@ -66,7 +29,7 @@ impl Regexp {
     ) -> Self {
         if whole_match {
             // what a lookback steps back over lies before liblouis's startMatch
-            let (behind, rest) = test.tests().split_at(lookbehind_len(test.tests()));
+            let (behind, rest) = test.tests().split_at(test.lookbehind().0);
             let regexp = Regexp::Consume(Box::new(Regexp::from_instructions(
                 rest,
                 whole_match,

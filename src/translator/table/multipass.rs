@@ -37,6 +37,34 @@ impl MultipassTableBuilder {
     }
 }
 
+fn test_of(translation: &ResolvedTranslation) -> Option<&crate::parser::Test> {
+    match translation.rule() {
+        Some(
+            Rule::Correct { test, .. }
+            | Rule::Pass2 { test, .. }
+            | Rule::Pass3 { test, .. }
+            | Rule::Pass4 { test, .. },
+        ) => Some(test),
+        _ => None,
+    }
+}
+
+fn lookback(translation: &ResolvedTranslation) -> usize {
+    test_of(translation).map_or(0, |test| test.lookbehind().1)
+}
+
+fn leading_chars(translation: &ResolvedTranslation) -> usize {
+    match translation.rule() {
+        Some(
+            Rule::Correct { test, .. }
+            | Rule::Pass2 { test, .. }
+            | Rule::Pass3 { test, .. }
+            | Rule::Pass4 { test, .. },
+        ) => test.leading_chars(),
+        _ => 0,
+    }
+}
+
 impl MultipassTable {
     pub fn compile(
         rules: &[AnchoredRule],
@@ -65,103 +93,82 @@ impl MultipassTable {
         self.trace(input).iter().map(|t| t.output()).collect()
     }
 
-    fn translation_candidates(
-        &self,
-        input: &str,
-        _prev: Option<char>,
-        env: &Environment,
-        at_start: bool,
-    ) -> (Vec<ResolvedTranslation>, Vec<ResolvedTranslation>) {
-        self.patterns
-            .find(input, env, at_start)
-            .into_iter()
-            .partition(|t| t.offset() == 0)
-    }
-
-    fn update_offsets(
-        &self,
-        translations: Vec<ResolvedTranslation>,
-        decrement: usize,
-    ) -> Vec<ResolvedTranslation> {
-        translations
-            .into_iter()
-            // drop translations where the offet is smaller than the decrement
-            .filter(|t| t.offset() >= decrement)
-            .map(|t| t.decrement_offset(decrement))
-            .collect()
-    }
-
-    fn partition_delayed_translations(
-        &self,
-        delayed: Vec<ResolvedTranslation>,
-    ) -> (Vec<ResolvedTranslation>, Vec<ResolvedTranslation>) {
-        delayed.into_iter().partition(|t| t.offset() == 0)
-    }
-
     pub fn trace(&self, input: &str) -> Vec<ResolvedTranslation> {
         let mut translations: Vec<ResolvedTranslation> = Vec::new();
-        let mut delayed_translations: Vec<ResolvedTranslation> = Vec::new();
         let mut env = Environment::new();
         let mut chars = input.chars();
-        let mut prev: Option<char> = None;
         // liblouis copies the next character unchanged after a rule that did not advance
         let mut advanced = true;
+        // a rule matched from an earlier position, whose replacement is still ahead
+        let mut pending: Option<ResolvedTranslation> = None;
+        // rules found before what their lookback steps over, with the characters left
+        // until liblouis would start matching them
+        let mut behind: Vec<(usize, ResolvedTranslation)> = Vec::new();
 
         loop {
-            // given an input query the patterns for matching translations. Then split off the
-            // translations that are delayed, i.e. have an offset because they have a pre-pattern
-            let at_start = chars.as_str().len() == input.len();
-            let (mut candidates, delayed) =
-                self.translation_candidates(chars.as_str(), prev, &env, at_start);
-            delayed_translations.extend(delayed);
-
-            // move delayed_translations with zero offset into candidates
-            let (current, delayed) = self.partition_delayed_translations(delayed_translations);
-            delayed_translations = delayed;
-            candidates.extend(current);
-
-            // use the longest translation
-            let candidate = candidates
-                .iter()
-                .filter(|_| advanced)
-                .cloned()
-                .max_by_key(|translation| translation.rank());
+            let candidate = match pending.take() {
+                Some(t) if t.offset() > 0 => {
+                    pending = Some(t.decrement_offset(1));
+                    None
+                }
+                Some(t) => Some(t),
+                None if advanced => {
+                    let at_start = chars.as_str().len() == input.len();
+                    for t in self.patterns.find(chars.as_str(), &env, at_start) {
+                        behind.push((lookback(&t), t));
+                    }
+                    let (due, waiting): (Vec<_>, Vec<_>) =
+                        behind.drain(..).partition(|(left, _)| *left == 0);
+                    behind = waiting;
+                    // liblouis tries pass rules by the characters they are filed by, longest
+                    // first, and takes the first that matches from this position
+                    let best = due
+                        .into_iter()
+                        .map(|(_, t)| t)
+                        .max_by_key(|t| (leading_chars(t), t.rank()));
+                    match best {
+                        Some(t) if t.offset() > 0 => {
+                            pending = Some(t.decrement_offset(1));
+                            None
+                        }
+                        t => t,
+                    }
+                }
+                None => None,
+            };
             advanced = true;
-            if let Some(t) = candidate {
+            let consumed = if let Some(t) = candidate {
                 if t.length() == 0 {
                     advanced = false;
                 } else {
                     // move the iterator forward by the number of characters in the translation
                     chars.nth(t.length() - 1);
-                    prev = t.input().chars().last();
                 }
-                // there is a matching translation rule
-                let translation = t.clone();
-                translations.push(translation);
-                delayed_translations = self.update_offsets(delayed_translations, t.length());
-
-                // update the environment if needed
-                if !t.effects().is_empty() {
-                    for effect in t.effects() {
-                        env.apply(effect);
-                    }
+                for effect in t.effects() {
+                    env.apply(effect);
                 }
+                let length = t.length();
+                translations.push(t);
+                length
             } else if let Some(next_char) = chars.next() {
-                prev = Some(next_char);
                 // no translation rule found, just pass the character through
-                let translation = ResolvedTranslation::new(
+                translations.push(ResolvedTranslation::new(
                     &next_char.to_string(),
                     &next_char.to_string(),
                     1,
                     self.stage,
                     None,
-                );
-                translations.push(translation);
-                delayed_translations = self.update_offsets(delayed_translations, 1);
+                ));
+                1
             } else {
                 // the chars iterator is exhausted
                 break;
-            }
+            };
+            behind = behind
+                .into_iter()
+                .filter(|(left, _)| *left >= consumed)
+                .map(|(left, t)| (left - consumed, t.decrement_offset(consumed)))
+                .collect();
         }
         translations
     }

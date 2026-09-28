@@ -20,6 +20,102 @@ impl Test {
         &self.tests
     }
 
+    /// A leading lookback `_n` and the checks it steps back over, as the number of
+    /// instructions they take and the `n` characters they check: the zero-width checks
+    /// before it and the fixed-width ones after it that take the test back to where it
+    /// started, which is where liblouis starts the match. `(0, 0)` when the test does not
+    /// start that way.
+    pub fn lookbehind(&self) -> (usize, usize) {
+        let tests = &self.tests;
+        let Some(i) = tests
+            .iter()
+            .position(|t| !matches!(t, TestInstruction::Variable { .. }))
+        else {
+            return (0, 0);
+        };
+        let Some(TestInstruction::Lookback { len }) = tests.get(i) else {
+            return (0, 0);
+        };
+        let len = usize::from(*len);
+        let mut remaining = len;
+        for (j, test) in tests.iter().enumerate().skip(i + 1) {
+            if remaining == 0 {
+                return (j, len);
+            }
+            let width = match test {
+                TestInstruction::Dots { dots } => dots.len(),
+                TestInstruction::String { s } => s.chars().count(),
+                TestInstruction::Attributes { quantifier, .. }
+                | TestInstruction::Class { quantifier, .. } => match quantifier {
+                    None => 1,
+                    Some(Quantifier::Number(n)) => usize::from(*n),
+                    _ => return (0, 0),
+                },
+                _ => return (0, 0),
+            };
+            if width > remaining {
+                return (0, 0);
+            }
+            remaining -= width;
+        }
+        if remaining == 0 {
+            (tests.len(), len)
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// The number of characters liblouis files a pass rule by (`passFindCharacters`): those
+    /// of the first string or dots the test checks, less what a lookback steps back over. 0
+    /// when an attribute or class check comes first.
+    pub fn leading_chars(&self) -> usize {
+        fn scan(tests: &[TestInstruction], lookback: &mut usize) -> Option<usize> {
+            for test in tests {
+                let test = match test {
+                    TestInstruction::Negate { test } => test.as_ref(),
+                    test => test,
+                };
+                match test {
+                    TestInstruction::String { s } => {
+                        let count = s.chars().count();
+                        if count > *lookback {
+                            return Some(count - *lookback);
+                        }
+                        *lookback -= count;
+                    }
+                    TestInstruction::Dots { dots } => {
+                        let count = dots.len();
+                        if count > *lookback {
+                            return Some(count - *lookback);
+                        }
+                        *lookback -= count;
+                    }
+                    TestInstruction::Attributes { quantifier, .. }
+                    | TestInstruction::Class { quantifier, .. } => {
+                        let n = match quantifier {
+                            None => 1,
+                            Some(Quantifier::Number(n)) => usize::from(*n),
+                            _ => return Some(0),
+                        };
+                        if n > *lookback {
+                            return Some(0);
+                        }
+                        *lookback -= n;
+                    }
+                    TestInstruction::Lookback { len } => *lookback += usize::from(*len),
+                    TestInstruction::Replace { tests } => {
+                        if let Some(n) = scan(tests, lookback) {
+                            return Some(n);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        scan(&self.tests, &mut 0).unwrap_or(0)
+    }
+
     fn has_replace(&self) -> bool {
         self.tests
             .iter()
