@@ -16,57 +16,6 @@ impl Test {
         Self { tests }
     }
 
-    /// liblouis's `passFindCharacters`: how many literal characters the test starts with at
-    /// the rule's position, the length liblouis ranks multipass rules by
-    pub fn literal_prefix(&self) -> usize {
-        // `None` while the scan has not settled the answer yet
-        fn scan(tests: &[TestInstruction], lookback: &mut usize) -> Option<usize> {
-            for test in tests {
-                let count = match test {
-                    TestInstruction::String { s } => s.chars().count(),
-                    TestInstruction::Dots { dots } => dots.len(),
-                    TestInstruction::Negate { test } => {
-                        match scan(std::slice::from_ref(test), lookback) {
-                            None => continue,
-                            found => return found,
-                        }
-                    }
-                    TestInstruction::Replace { tests } => match scan(tests, lookback) {
-                        None => continue,
-                        found => return found,
-                    },
-                    TestInstruction::Lookback { len } => {
-                        *lookback += *len as usize;
-                        continue;
-                    }
-                    TestInstruction::Attributes { quantifier, .. }
-                    | TestInstruction::Class { quantifier, .. } => {
-                        let count = match quantifier {
-                            None => 1,
-                            Some(Quantifier::Number(n)) => *n as usize,
-                            Some(Quantifier::Range(min, max)) if min == max => *min as usize,
-                            _ => return Some(0),
-                        };
-                        if count > *lookback {
-                            return Some(0);
-                        }
-                        *lookback -= count;
-                        continue;
-                    }
-                    TestInstruction::Variable { .. }
-                    | TestInstruction::AtBeginning
-                    | TestInstruction::AtEnd => continue,
-                };
-                if count > *lookback {
-                    return Some(count - *lookback);
-                }
-                *lookback -= count;
-            }
-            None
-        }
-        scan(&self.tests, &mut 0).unwrap_or(0)
-    }
-
     pub fn tests(&self) -> &Vec<TestInstruction> {
         &self.tests
     }

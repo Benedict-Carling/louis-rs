@@ -378,7 +378,7 @@ impl YAMLParser<'_> {
         }
         let mut xfail = ExpectedFailure::Simple(false);
         let mut emphasis: Vec<EmphasisSpan> = Vec::new();
-        let mut expected_emphasis: Vec<EmphasisSpan> = Vec::new();
+        let mut expected_emphasis: Option<Vec<EmphasisSpan>> = None;
         let mut input_pos: Vec<usize> = Vec::new();
         let mut output_pos: Vec<usize> = Vec::new();
         let mut cursor_pos = None;
@@ -397,7 +397,7 @@ impl YAMLParser<'_> {
                         emphasis = self.emphasis_spans_value()?;
                     }
                     "expected_typeform" => {
-                        expected_emphasis = self.emphasis_spans_value()?;
+                        expected_emphasis = Some(self.emphasis_spans_value()?);
                     }
                     "inputPos" => {
                         input_pos = self.pos_values()?;
@@ -646,6 +646,16 @@ mod tests {
         let results = run("both_directions", yaml).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.is_success()));
+    }
+
+    #[test]
+    fn expected_typeform_checks_the_emphasis_of_a_back_translation() {
+        let yaml = "table: |\n  display ⠁ 1\n  display ⠨ 46\n  letter a 1\n  emphclass italic\n  emphletter italic 46\nflags: {testmode: backward}\ntests:\n  - - ⠨⠁⠁\n    - aa\n    - expected_typeform: {italic: '+ '}\n  - - ⠨⠁⠁\n    - aa\n    - expected_typeform: {italic: '  '}\n  - - ⠨⠁⠁\n    - \\\\46/aa\n";
+        let results = run("expected_typeform", yaml).unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_success());
+        assert!(results[1].is_translation_failure());
+        assert!(results[2].is_success());
     }
 
     #[test]

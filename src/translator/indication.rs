@@ -21,6 +21,7 @@
 //! * [`nocontract::Indicator`]: detects contractions that require a no-contract sign
 
 use crate::emphasis::EmphasisSpan;
+use crate::parser::Rule;
 use crate::translator::ResolvedTranslation;
 
 mod class_indicator;
@@ -76,6 +77,24 @@ pub enum Indicator {
 #[derive(Debug, Clone)]
 pub struct Indicators(Vec<Indicator>);
 
+/// An indicator's translation, whether it is inserted even where a rule spans its
+/// position, and its place among the indicators at that position
+type Precomputed = (ResolvedTranslation, bool, u8);
+
+fn is_end_indicator(rule: Option<&Rule>) -> bool {
+    matches!(
+        rule,
+        Some(
+            Rule::Endcapsword { .. }
+                | Rule::Endcaps { .. }
+                | Rule::Endcapsphrase { .. }
+                | Rule::Endmodeword { .. }
+                | Rule::Endmode { .. }
+                | Rule::Endmodephrase { .. }
+        )
+    )
+}
+
 /// The result of pre-computing indications for a given input.
 ///
 /// Holds per-position braille translations to emit, indexed by
@@ -83,7 +102,9 @@ pub struct Indicators(Vec<Indicator>);
 /// must appear after all input characters, e.g. `endemph` at end of string).
 pub struct PrecomputedIndications<'a> {
     /// The translations of the indicators before the numeric one, and after it
-    translations: Vec<(Vec<ResolvedTranslation>, Vec<ResolvedTranslation>)>,
+    translations: Vec<(Vec<Precomputed>, Vec<Precomputed>)>,
+    /// The position after the last one visited
+    next: usize,
     /// A numeric indicator stepped as the translation loop visits positions
     live_numeric: Option<&'a numeric::Indicator>,
     in_numeric: bool,
@@ -93,19 +114,29 @@ pub struct PrecomputedIndications<'a> {
 impl PrecomputedIndications<'_> {
     /// The indications at `pos`. Call it once for each position the translation loop
     /// visits, in order.
+    ///
+    /// Like liblouis, the indicators of capitals, modes and emphasis at positions a rule
+    /// spanned come first (`insertEmphasesAt` for each position since the last one).
     pub fn translations_at(&mut self, pos: usize) -> Vec<ResolvedTranslation> {
+        let skipped = self.next.min(pos)..pos;
+        self.next = pos + 1;
+        let mut result: Vec<ResolvedTranslation> = self.translations[skipped]
+            .iter()
+            .flat_map(|(before, after)| before.iter().chain(after))
+            .filter(|(_, spanned, _)| *spanned)
+            .map(|(t, ..)| t.clone())
+            .collect();
         let numeric = self
             .live_numeric
             .and_then(|n| n.at(&mut self.in_numeric, &self.chars, pos));
-        match self.translations.get(pos) {
-            Some((before, after)) => before
-                .iter()
-                .cloned()
-                .chain(numeric)
-                .chain(after.iter().cloned())
-                .collect(),
-            None => numeric.into_iter().collect(),
+        if let Some((before, after)) = self.translations.get(pos) {
+            result.extend(before.iter().map(|(t, ..)| t.clone()));
+            result.extend(numeric);
+            result.extend(after.iter().map(|(t, ..)| t.clone()));
+        } else {
+            result.extend(numeric);
         }
+        result
     }
 
     /// The precomputed indications at `pos`, without the live numeric one
@@ -114,6 +145,7 @@ impl PrecomputedIndications<'_> {
             .get(pos)
             .into_iter()
             .flat_map(|(before, after)| before.iter().chain(after))
+            .map(|(t, ..)| t)
     }
 }
 
@@ -122,12 +154,24 @@ impl Indicators {
         Indicators(indicators)
     }
 
+    /// Where liblouis's emphasis buffer marks anything for an emphasis class
+    pub fn emphasis_marks(&self, input: &str, spans: &[EmphasisSpan]) -> Vec<bool> {
+        self.0
+            .iter()
+            .find_map(|indicator| match indicator {
+                Indicator::Emphasis(i) => Some(i.marked(input, spans)),
+                _ => None,
+            })
+            .unwrap_or_else(|| vec![false; input.chars().count() + 1])
+    }
+
     pub fn precompute(&self, input: &str, spans: &[EmphasisSpan]) -> PrecomputedIndications<'_> {
         let n = input.chars().count();
         let mut translations = vec![(vec![], vec![]); n + 1];
         let mut live_numeric = None;
 
         for indicator in &self.0 {
+            let spanned = matches!(indicator, Indicator::Emphasis(_) | Indicator::Mode(_));
             let pairs: Vec<(usize, ResolvedTranslation)> = match indicator {
                 Indicator::ComputerBraille(i) => i.precompute(input, spans),
                 Indicator::Emphasis(i) => i.precompute(input, spans),
@@ -142,17 +186,34 @@ impl Indicators {
                 Indicator::NoContract(i) => i.precompute(input),
             };
             for (pos, t) in pairs {
+                // liblouis ends capitals, then the other modes, before any other indicator
+                // but computer braille
+                let phase = match indicator {
+                    Indicator::ComputerBraille(_) => 0,
+                    Indicator::Uppercase(_) if is_end_indicator(t.rule()) => 1,
+                    Indicator::Mode(_) if is_end_indicator(t.rule()) => 2,
+                    _ => 3,
+                };
                 let (before, after) = &mut translations[pos];
+                if phase < 3 {
+                    let at = before
+                        .iter()
+                        .position(|(_, _, p)| *p > phase)
+                        .unwrap_or(before.len());
+                    before.insert(at, (t, spanned, phase));
+                    continue;
+                }
                 if live_numeric.is_some() {
-                    after.push(t);
+                    after.push((t, spanned, phase));
                 } else {
-                    before.push(t);
+                    before.push((t, spanned, phase));
                 }
             }
         }
 
         PrecomputedIndications {
             translations,
+            next: 0,
             live_numeric,
             in_numeric: false,
             chars: input.chars().collect(),
@@ -215,5 +276,21 @@ mod tests {
         };
         assert_eq!(outputs_at(0), vec!["⠠"]); // capsletter for 'A'
         assert_eq!(outputs_at(1), vec!["⠼"]); // numsign for '1'
+    }
+
+    #[test]
+    fn emphasis_at_a_spanned_position_comes_before_the_next_rule() {
+        let mut builder = emphasis::IndicatorBuilder::new();
+        builder.emphletter("italic", "⠨", &rule("emphletter italic 46"));
+        let emphasis = Indicator::Emphasis(builder.build(&TableContext::default()).unwrap());
+        let indicators = Indicators::new(vec![emphasis]);
+        let mut indications = indicators.precompute("abc", &[EmphasisSpan::new("italic", 1..2)]);
+        assert!(indications.translations_at(0).is_empty());
+        let outputs: Vec<String> = indications
+            .translations_at(2)
+            .into_iter()
+            .map(|t| t.output().to_string())
+            .collect();
+        assert_eq!(outputs, vec!["⠨"]);
     }
 }

@@ -1,7 +1,7 @@
 use crate::translator::ResolvedTranslation;
 use crate::translator::context_pattern::{ContextPatterns, ContextPatternsBuilder};
 use crate::translator::effect::Environment;
-use crate::translator::table::TableContext;
+use crate::translator::table::{TableContext, backward};
 use crate::{
     Direction,
     parser::{AnchoredRule, Rule, TestInstruction},
@@ -95,10 +95,11 @@ impl MultipassTable {
                 candidates.extend(due);
                 copied = false;
                 if advanced {
-                    forced = candidates
-                        .into_iter()
-                        .map(|(_, t)| t)
-                        .max_by_key(|t| (literal_prefix(t), t.rank()));
+                    forced = candidates.into_iter().map(|(_, t)| t).max_by_key(|t| {
+                        let (empty, length, weight) = t.rank();
+                        let cells = t.rule().map_or(0, backward::pass_rule_cells);
+                        (cells, empty, length, weight - variable_tests(t))
+                    });
                 }
             }
             advanced = true;
@@ -143,6 +144,24 @@ impl MultipassTable {
     }
 }
 
+/// The variable tests a rule checks, which weigh in the choice between `context` rules but
+/// not between the rules of a pass, where liblouis goes by the literal start alone
+fn variable_tests(translation: &ResolvedTranslation) -> usize {
+    match translation.rule() {
+        Some(
+            Rule::Correct { test, .. }
+            | Rule::Pass2 { test, .. }
+            | Rule::Pass3 { test, .. }
+            | Rule::Pass4 { test, .. },
+        ) => test
+            .tests()
+            .iter()
+            .filter(|t| matches!(t, TestInstruction::Variable { .. }))
+            .count(),
+        _ => 0,
+    }
+}
+
 /// How far back the test's leading lookback reaches before the rule's position
 fn leading_lookback(translation: &ResolvedTranslation) -> usize {
     match translation.rule() {
@@ -159,18 +178,6 @@ fn leading_lookback(translation: &ResolvedTranslation) -> usize {
                 _ => None,
             })
             .sum(),
-        _ => 0,
-    }
-}
-
-fn literal_prefix(translation: &ResolvedTranslation) -> usize {
-    match translation.rule() {
-        Some(
-            Rule::Correct { test, .. }
-            | Rule::Pass2 { test, .. }
-            | Rule::Pass3 { test, .. }
-            | Rule::Pass4 { test, .. },
-        ) => test.literal_prefix(),
         _ => 0,
     }
 }
