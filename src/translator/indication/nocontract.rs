@@ -54,7 +54,9 @@ impl IndicatorBuilder {
                     TranslationStage::Main,
                     origin.clone(),
                 );
-                let mut trie = Trie::new().with_context(ctx.character_classes().clone());
+                let mut trie = Trie::new()
+                    .with_context(ctx.character_classes().clone())
+                    .with_case_folding(ctx.case_folding().clone());
                 let (start, end) = whole_word_boundaries(sequences.as_ref());
                 for (contraction, _origin) in self.contractions {
                     trie.insert(

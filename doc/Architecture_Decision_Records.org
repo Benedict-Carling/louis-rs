@@ -854,6 +854,12 @@ isolated single-letter word.
 
 ** Decision Outcome
 
+Superseded: capitals now follow liblouis's emphasis model
+(~src/translator/indication/emphasis.rs~), which inserts the capital
+start indicator each time the loop visits a position. That is option 1,
+the table's hack works as it does in liblouis, and the German detailed
+specs pass. What follows is the earlier analysis.
+
 Not yet decided. Option 2 — the "obvious general fix" — is now known
 wrong. The live choice is between option 3 (accept the gap), option 4
 (a new declarative extension: scoped and low-risk, diverges from

@@ -3,6 +3,7 @@ pub mod display;
 pub mod multipass;
 pub mod primary;
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::{
@@ -11,6 +12,37 @@ use crate::{
         CharacterDefinition, TranslationError, swap::SwapClasses, translation::CharacterDots,
     },
 };
+
+/// The `base` rules liblouis keeps, as (attribute, derived, base): a character defined
+/// before its base rule keeps its own definition instead
+pub fn kept_bases(rules: &[AnchoredRule]) -> Vec<(String, char, char)> {
+    let mut defined_before = HashSet::new();
+    let mut bases = Vec::new();
+    for rule in rules {
+        match &rule.rule {
+            Rule::Base {
+                name,
+                derived,
+                base,
+            } if !defined_before.contains(derived) => {
+                bases.push((name.clone(), *derived, *base));
+            }
+            Rule::Space { character, .. }
+            | Rule::Punctuation { character, .. }
+            | Rule::Digit { character, .. }
+            | Rule::Litdigit { character, .. }
+            | Rule::Letter { character, .. }
+            | Rule::Lowercase { character, .. }
+            | Rule::Uppercase { character, .. }
+            | Rule::Sign { character, .. }
+            | Rule::Math { character, .. } => {
+                defined_before.insert(*character);
+            }
+            _ => {}
+        }
+    }
+    bases
+}
 
 #[derive(Debug, Default)]
 pub struct TableContext {
@@ -23,6 +55,9 @@ pub struct TableContext {
     direction_dots_classes: Option<CharacterClasses>,
     swap_classes: SwapClasses,
     seq_after_patterns: Vec<String>,
+    /// liblouis's `toLowercase`: each capital a kept `base uppercase` rule derives, mapped
+    /// to its base
+    case_folding: HashMap<char, char>,
     character_dots: Arc<CharacterDots>,
 }
 
@@ -39,6 +74,7 @@ impl TableContext {
             dots_classes,
             swap_classes,
             seq_after_patterns: Vec::new(),
+            case_folding: HashMap::new(),
             direction_character_classes: None,
             direction_dots_classes: None,
             character_dots: Arc::default(),
@@ -91,6 +127,10 @@ impl TableContext {
         self.direction_dots_classes
             .as_ref()
             .unwrap_or(&self.dots_classes)
+    }
+
+    pub fn case_folding(&self) -> &HashMap<char, char> {
+        &self.case_folding
     }
 
     pub fn seq_after_patterns(&self) -> &[String] {
@@ -330,6 +370,11 @@ impl TableContext {
                 _ => (),
             }
         }
+        let case_folding = kept_bases(rules)
+            .into_iter()
+            .filter(|(name, _, _)| name == "uppercase")
+            .map(|(_, derived, base)| (derived, base))
+            .collect();
         for (n, class) in user_classes(rules).into_iter().take(4).enumerate() {
             let ordinal = CharacterClass::Ordinal(n as u8 + 1);
             for c in character_classes.get(&class).unwrap_or_default() {
@@ -340,6 +385,7 @@ impl TableContext {
             }
         }
         Ok(TableContext {
+            case_folding,
             character_dots: Arc::new(CharacterDots::new(definition_rules(rules), undefined)),
             character_definitions,
             character_classes,

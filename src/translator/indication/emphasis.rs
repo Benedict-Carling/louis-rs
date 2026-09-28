@@ -1,748 +1,237 @@
-//! Emphasis (italic, bold, underline, …) braille indication.
+//! Emphasis and capitalization indication, as liblouis models both.
 //!
-//! A port of how liblouis marks emphasis (`markEmphases` and the `resolveEmphasis*`
-//! functions in `lou_translateString.c`) and inserts its indicators (`insertEmphasesAt`),
-//! for the emphasis classes a table declares with `emphclass`. Capitals and the other
-//! modes go through the same functions in liblouis, with a character class in place of
-//! the caller's typeform; they are handled elsewhere.
+//! liblouis treats capitals as one more emphasis class, a "mode" driven by the
+//! `uppercase` attribute instead of the caller's typeform. Each class marks, per input
+//! position, where an indicator begins or ends a passage, begins or ends a word, or marks
+//! a single letter (`markEmphases` and its `resolveEmphasis*` steps in
+//! `lou_translateString.c`). The translation loop then inserts the indicators of the
+//! positions it reaches (`insertEmphasesAt`), so an indicator of a position inside a
+//! multi-character rule comes out after that rule, and the capital start indicator of a
+//! position is inserted each time the loop visits it.
 //!
-//! Marking works on one class at a time. Where the caller's typeform emphasizes the
-//! text, it marks the positions where emphasis begins and ends, then, depending on the
-//! indicators the class has, turns those into words, passages and single letters. Each
-//! position then gets the indicators its marks call for, the classes ordered so that
-//! indicators nest.
+//! [`Emphases`] holds the classes of a table, [`Marks`] the marks of one input.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::{
     emphasis::EmphasisSpan,
-    parser::{AnchoredRule, CharacterClass, CharacterClasses, Position},
+    parser::{AnchoredRule, CharacterClass, Position},
     translator::{ResolvedTranslation, TranslationStage, table::TableContext},
 };
+
+const WORD_CHAR: u8 = 1;
+const WORD_WHOLE: u8 = 4;
+const CAPS_BIT: u64 = 1 << 63;
 
 fn make_translation(dots: &str, origin: &AnchoredRule) -> ResolvedTranslation {
     ResolvedTranslation::new("", dots, 1, TranslationStage::Main, origin.clone())
 }
 
-/// liblouis's `EmphasisInfo` for one class: what happens to the emphasis at each
-/// position, with one more position for the end of the input.
+/// liblouis's `EmphasisInfo`: one bit per class in each field
+#[derive(Debug, Clone, Copy, Default)]
+struct Info {
+    begin: u64,
+    end: u64,
+    word: u64,
+    symbol: u64,
+}
+
+impl Info {
+    fn any(&self) -> u64 {
+        self.begin | self.end | self.word | self.symbol
+    }
+}
+
+/// The indicators of one class (liblouis's `emphRules` row)
 #[derive(Debug, Clone, Default)]
-struct Marks {
-    begin: Vec<bool>,
-    end: Vec<bool>,
-    word: Vec<bool>,
-    symbol: Vec<bool>,
+struct Rules {
+    letter: Option<ResolvedTranslation>,
+    begword: Option<ResolvedTranslation>,
+    endword: Option<ResolvedTranslation>,
+    beg: Option<ResolvedTranslation>,
+    end: Option<ResolvedTranslation>,
+    begphrase: Option<ResolvedTranslation>,
+    endphrase_before: Option<ResolvedTranslation>,
+    endphrase_after: Option<ResolvedTranslation>,
+    len_phrase: usize,
 }
 
-impl Marks {
-    fn new(n: usize) -> Self {
-        Marks {
-            begin: vec![false; n + 1],
-            end: vec![false; n + 1],
-            word: vec![false; n + 1],
-            symbol: vec![false; n + 1],
+impl Rules {
+    fn set_endphrase(&mut self, dots: &str, position: &Position, origin: &AnchoredRule) {
+        let t = Some(make_translation(dots, origin));
+        match position {
+            Position::Before => self.endphrase_before = t,
+            Position::After => self.endphrase_after = t,
         }
     }
-
-    fn any(&self, at: usize) -> bool {
-        self.begin[at] || self.end[at] || self.word[at] || self.symbol[at]
-    }
 }
 
-/// liblouis's `wordBuffer` for one class: which characters are part of a word, and which
-/// words are emphasized as a whole. One more position for the end of the input.
-struct Words {
-    char: Vec<bool>,
-    whole: Vec<bool>,
+/// The characters a mode (capitals, or a `begmodeword`-family attribute) consults
+#[derive(Debug, Clone, Default)]
+struct ModeChars {
+    /// The characters of the mode's attribute
+    active: HashSet<char>,
+    /// Those and the characters sharing a base with one (liblouis's `isEmphasizable`)
+    emphasizable: HashSet<char>,
+    /// Characters that don't cancel the mode because they share a base with one of it
+    /// (the `linked` check of `resetsEmphMode`)
+    linked: HashSet<char>,
 }
 
-/// Compiled indicator data for one emphasis class (e.g. "italic").
 #[derive(Debug, Clone)]
-struct ClassIndicator {
-    class_name: String,
-    emphletter: Option<ResolvedTranslation>,
-    begemph: Option<ResolvedTranslation>,
-    endemph: Option<ResolvedTranslation>,
-    begemphword: Option<ResolvedTranslation>,
-    endemphword: Option<ResolvedTranslation>,
-    begemphphrase: Option<ResolvedTranslation>,
-    endemphphrase_before: Option<ResolvedTranslation>,
-    endemphphrase_after: Option<ResolvedTranslation>,
-    /// `lenemphphrase`, 0 when passages are not marked
-    len_phrase: Option<usize>,
-    /// Characters that don't cancel word emphasis (emphmodechars); by default only a
-    /// space does
-    emphmodechars: HashSet<char>,
-    /// Characters emphasis is not indicated on (noemphchars); by default spaces
-    noemphchars: HashSet<char>,
-    character_classes: CharacterClasses,
+enum Kind {
+    /// An emphasis class, named as the caller's typeform names it
+    Typeform(String),
+    Capitals,
+    /// Another mode, named by its attribute
+    Mode(String),
 }
 
-impl ClassIndicator {
-    fn new(class_name: String) -> Self {
-        ClassIndicator {
-            class_name,
-            emphletter: None,
-            begemph: None,
-            endemph: None,
-            begemphword: None,
-            endemphword: None,
-            begemphphrase: None,
-            endemphphrase_before: None,
-            endemphphrase_after: None,
-            len_phrase: None,
-            emphmodechars: HashSet::new(),
-            noemphchars: HashSet::new(),
-            character_classes: CharacterClasses::default(),
-        }
-    }
-
-    fn is(&self, class: CharacterClass, c: char) -> bool {
-        self.character_classes.contains(&class, c)
-    }
-
-    /// liblouis's `isEmphasizable`
-    fn is_emphasizable(&self, c: char) -> bool {
-        if self.noemphchars.is_empty() {
-            !self.is(CharacterClass::Space, c)
-        } else {
-            !self.noemphchars.contains(&c)
-        }
-    }
-
-    /// liblouis's `resetsEmphMode`: whether `c` cancels word emphasis
-    fn resets(&self, c: char) -> bool {
-        if self.is(CharacterClass::Letter, c) {
-            false
-        } else if self.emphmodechars.is_empty() {
-            self.is(CharacterClass::Space, c)
-        } else {
-            !self.emphmodechars.contains(&c)
-        }
-    }
-
-    /// liblouis's `isEmphSpace`: whether `c` separates words
-    fn is_emph_space(&self, c: char) -> bool {
-        !self.is_emphasizable(c) && (self.begemphword.is_none() || self.resets(c))
-    }
-
-    fn end_defined(&self) -> bool {
-        self.endemph.is_some() || self.endemphphrase_after.is_some()
-    }
-
-    /// liblouis's `markEmphases` for this class, given which characters the caller
-    /// emphasizes with it
-    fn mark(&self, chars: &[char], emphasized: &[bool]) -> Marks {
-        let n = chars.len();
-        let mut marks = Marks::new(n);
-        let mut words = Words {
-            char: chars
-                .iter()
-                .map(|&c| !self.is_emph_space(c))
-                .chain([false])
-                .collect(),
-            whole: vec![false; n + 1],
-        };
-        self.resolve_begin_end(chars, emphasized, &mut marks, &words);
-        if self.begemphword.is_some() {
-            self.resolve_words(chars, &mut marks, &mut words);
-            if let Some(len) = self.len_phrase.filter(|&len| len > 0) {
-                self.resolve_passages(n, len, &mut marks, &mut words);
-            }
-            self.resolve_resets(chars, &mut marks, &mut words);
-            if self.endemphword.is_none() {
-                self.resolve_all_symbols(n, &mut marks, &words);
-            }
-        } else if self.emphletter.is_some() {
-            if self.begemph.is_some() {
-                resolve_single_symbols(n, &mut marks);
-            } else {
-                self.resolve_all_symbols(n, &mut marks, &words);
-            }
-        }
-        marks
-    }
-
-    /// liblouis's `resolveEmphasisBeginEnd`: mark the sections that start with an
-    /// emphasized character and go on until an unemphasized one, not ending with a word
-    /// that has no emphasized character. With phrase indicators, a section doesn't end
-    /// inside a word.
-    fn resolve_begin_end(
-        &self,
-        chars: &[char],
-        emphasized: &[bool],
-        marks: &mut Marks,
-        words: &Words,
-    ) {
-        let n = chars.len();
-        let mut last_space: Option<usize> = None;
-        let mut emph_start: Option<usize> = None;
-        let mut last_word: Option<usize> = None;
-        let mut emph = false;
-        let phrase_enabled = self.begemphphrase.is_some();
-        let mut i = 0;
-        while i < n {
-            let is_space = !words.char[i];
-            if is_space {
-                last_space = Some(i);
-                if emph {
-                    last_word = Some(i);
-                    emph = false;
-                }
-            }
-            if !is_space && self.is_emphasizable(chars[i]) && emphasized[i] {
-                emph_start.get_or_insert(i);
-                emph = true;
-            } else if !is_space
-                && self.is_emphasizable(chars[i])
-                && let Some(start) = emph_start
-            {
-                marks.begin[start] = true;
-                if emph {
-                    if phrase_enabled && let Some(space) = last_space.filter(|&space| start < space)
-                    {
-                        if let Some(word) = last_word {
-                            marks.end[word] = true;
-                        }
-                        emph_start = None;
-                        last_word = None;
-                        emph = false;
-                        i = space + 1;
-                        continue;
-                    }
-                    marks.end[i] = true;
-                } else if let Some(word) = last_word {
-                    marks.end[word] = true;
-                }
-                emph_start = None;
-                last_word = None;
-                emph = false;
-            }
-            i += 1;
-        }
-        if let Some(start) = emph_start {
-            marks.begin[start] = true;
-            if emph {
-                marks.end[n] = true;
-            } else if let Some(word) = last_word {
-                marks.end[word] = true;
-            }
-        }
-    }
-
-    /// liblouis's `resolveEmphasisWords`: turn the sections into words, and into single
-    /// letters where `emphletter` is defined
-    fn resolve_words(&self, chars: &[char], marks: &mut Marks, words: &mut Words) {
-        let n = chars.len();
-        let mut in_word = false;
-        let mut in_emp = false;
-        let mut word_start: Option<usize> = None;
-        let mut char_cnt = 0;
-        let mut last_char: Option<usize> = None;
-        let letter_defined = self.emphletter.is_some();
-        let endphraseafter_defined = self.begemphphrase.is_some()
-            && (self.endemphphrase_after.is_some() || self.endemph.is_some());
-
-        // remove the word marks after the last emphasizable character of a word, and a
-        // word end mark there
-        let trim_word_end =
-            |marks: &mut Marks, words: &mut Words, last: Option<usize>, to: usize| {
-                let from = last.map_or(0, |l| l + 1);
-                for j in from..to {
-                    words.char[j] = false;
-                }
-                if let Some(last) = last
-                    && !marks.symbol[last]
-                {
-                    if marks.word[last] && !marks.end[last] {
-                        marks.symbol[last] = true;
-                    }
-                    for j in last..to.saturating_sub(1) {
-                        if marks.end[j + 1] {
-                            marks.end[j + 1] = false;
-                            marks.word[j + 1] = false;
-                            break;
-                        }
-                    }
-                }
-            };
-
-        for i in 0..n {
-            if !in_emp && marks.begin[i] {
-                in_emp = true;
-                marks.begin[i] = false;
-                if in_word {
-                    word_start = Some(i);
-                }
-                if !words.char[i] {
-                    word_start = None;
-                }
-            }
-
-            if in_emp && marks.end[i] {
-                in_emp = false;
-                marks.end[i] = false;
-                if in_word && let Some(start) = word_start {
-                    if letter_defined && char_cnt == 1 {
-                        marks.symbol[start] = true;
-                    } else {
-                        marks.word[start] = true;
-                        if words.char[i] {
-                            marks.end[i] = true;
-                            marks.word[i] = true;
-                        }
-                    }
-                }
-            }
-
-            if !in_word && words.char[i] && self.is_emphasizable(chars[i]) {
-                in_word = true;
-                if in_emp {
-                    word_start = Some(i);
-                }
-                trim_word_end(marks, words, last_char, i);
-            }
-
-            if in_word && !words.char[i] {
-                if in_emp && let Some(start) = word_start {
-                    if letter_defined && char_cnt == 1 {
-                        marks.symbol[start] = true;
-                    } else {
-                        marks.word[start] = true;
-                    }
-                }
-                in_word = false;
-                word_start = None;
-            }
-
-            if word_start == Some(i) {
-                last_char = Some(i);
-                char_cnt = 1;
-            } else if in_word && (endphraseafter_defined || self.is_emphasizable(chars[i])) {
-                last_char = Some(i);
-                if in_emp {
-                    char_cnt += 1;
-                }
-            }
-        }
-
-        if in_emp {
-            marks.end[n] = false;
-            if in_word && let Some(start) = word_start {
-                if letter_defined && char_cnt == 1 {
-                    marks.symbol[start] = true;
-                } else {
-                    marks.word[start] = true;
-                }
-            }
-        }
-
-        trim_word_end(marks, words, last_char, n);
-
-        // mark whole words
-        let mut word_start: Option<usize> = None;
-        for i in 0..n {
-            if marks.symbol[i] {
-                if (i == 0 || !words.char[i - 1]) && (i + 1 == n || !words.char[i + 1]) {
-                    words.whole[i] = true;
-                }
-            } else if marks.word[i] {
-                if marks.end[i] {
-                    if let Some(start) = word_start
-                        && words.char[i]
-                    {
-                        words.whole[start] = false;
-                    }
-                    word_start = None;
-                } else {
-                    if i == 0 || !words.char[i - 1] {
-                        words.whole[i] = true;
-                    }
-                    word_start = Some(i);
-                }
-            }
-        }
-    }
-
-    /// liblouis's `convertToPassage`
-    fn convert_to_passage(
-        &self,
-        pass_start: usize,
-        pass_end: usize,
-        word_start: usize,
-        marks: &mut Marks,
-        words: &mut Words,
-    ) {
-        for i in pass_start..=pass_end {
-            marks.symbol[i] = false;
-            marks.word[i] = false;
-            words.whole[i] = false;
-        }
-        marks.begin[pass_start] = true;
-        if self.end_defined() {
-            marks.end[pass_end] = true;
-        } else if let Some(end) = &self.endemphphrase_before {
-            // an end indicator that is the word indicator is marked as one
-            if self
-                .begemphword
-                .as_ref()
-                .is_some_and(|word| word.output() == end.output())
-            {
-                marks.word[word_start] = true;
-                words.whole[word_start] = true;
-            } else {
-                marks.end[word_start] = true;
-            }
-        }
-    }
-
-    /// liblouis's `resolveEmphasisPassages`: turn `len` or more consecutive emphasized
-    /// words into a passage
-    fn resolve_passages(&self, n: usize, len: usize, marks: &mut Marks, words: &mut Words) {
-        let mut in_word = false;
-        let mut last_word_end: Option<usize> = None;
-        let mut in_emph_word = false;
-        let mut last_emph_symbol: Option<usize> = None;
-        let mut in_pass = false;
-        let mut last_pass_word_start = 0;
-        let mut last_pass_word_end: Option<usize> = None;
-        let mut pass_start = 0;
-        let mut pass_word_cnt = 0;
-        let endphraseafter_defined = self.end_defined();
-
-        for i in 0..n {
-            if !in_word && words.char[i] {
-                in_word = true;
-            } else if in_word && !words.char[i] {
-                in_word = false;
-                last_word_end = Some(i);
-            }
-
-            let mut end_passage = false;
-            if !in_emph_word && (marks.symbol[i] || (marks.word[i] && !marks.end[i])) {
-                if marks.symbol[i] {
-                    last_emph_symbol = Some(i);
-                } else {
-                    in_emph_word = true;
-                }
-                if in_pass {
-                    last_pass_word_start = i;
-                    pass_word_cnt += 1;
-                }
-            } else if (in_emph_word && marks.word[i] && marks.end[i]) || last_word_end == Some(i) {
-                in_emph_word = false;
-                if in_pass {
-                    last_pass_word_end = Some(i);
-                }
-            }
-
-            if !in_pass && (in_emph_word || last_emph_symbol == Some(i)) {
-                in_pass = true;
-                pass_start = i;
-                last_pass_word_start = i;
-                last_pass_word_end = None;
-                pass_word_cnt = 1;
-            } else if in_pass {
-                if in_word && !(in_emph_word || last_emph_symbol == Some(i)) {
-                    end_passage = true;
-                } else if i == n - 1 && pass_word_cnt >= len {
-                    let end = match last_pass_word_end {
-                        Some(end) if end >= last_pass_word_start => end,
-                        _ => n,
-                    };
-                    self.convert_to_passage(pass_start, end, last_pass_word_start, marks, words);
-                }
-            }
-            if end_passage {
-                in_pass = false;
-                let end = match last_pass_word_end {
-                    Some(end) if end >= last_pass_word_start => end,
-                    _ => i,
-                };
-                // a passage closed before its last word needs one more word if that word is
-                // only partly emphasized
-                if !endphraseafter_defined && Some(end) != last_word_end {
-                    pass_word_cnt -= 1;
-                }
-                if pass_word_cnt >= len {
-                    self.convert_to_passage(pass_start, end, last_pass_word_start, marks, words);
-                }
-            }
-        }
-    }
-
-    /// liblouis's `resolveEmphasisResets`: where a character cancels word emphasis
-    /// inside a word, emphasize the rest of the word again
-    fn resolve_resets(&self, chars: &[char], marks: &mut Marks, words: &mut Words) {
-        let n = chars.len();
-        let mut in_word = false;
-        let mut in_pass = false;
-        let mut word_start: Option<usize> = None;
-        let mut word_reset = false;
-        let mut letter_cnt = 0;
-        let mut pass_end: Option<usize> = None;
-        let letter_defined = self.emphletter.is_some();
-
-        let mut i = 0;
-        while i < n {
-            if in_pass {
-                if marks.end[i] {
-                    in_pass = false;
-                } else if marks.word[i] {
-                    in_pass = false;
-                    pass_end = Some(i);
-                }
-            }
-            if !in_pass {
-                if marks.begin[i] {
-                    in_pass = true;
-                } else {
-                    if !in_word {
-                        if marks.word[i] {
-                            if self.resets(chars[i]) && letter_defined && pass_end != Some(i) {
-                                marks.symbol[i] = true;
-                                if words.char[i + 1] {
-                                    marks.word[i + 1] = true;
-                                    if words.whole[i] {
-                                        words.whole[i + 1] = true;
-                                    }
-                                    if pass_end == Some(i) {
-                                        pass_end = Some(i + 1);
-                                    }
-                                }
-                                marks.word[i] = false;
-                                words.whole[i] = false;
-                                i += 1;
-                                continue;
-                            }
-                            in_word = true;
-                            word_start = Some(i);
-                            letter_cnt = 0;
-                            word_reset = false;
-                        } else if marks.symbol[i] && self.resets(chars[i]) {
-                            marks.symbol[i] = false;
-                        }
-                    }
-
-                    if in_word {
-                        if !words.char[i] || (marks.word[i] && marks.end[i]) {
-                            in_word = false;
-                            let start = word_start.unwrap();
-                            if letter_defined && letter_cnt == 1 && Some(start) != pass_end {
-                                marks.symbol[start] = true;
-                                marks.word[start] = false;
-                                words.whole[start] = false;
-                                marks.end[i] = false;
-                                marks.word[i] = false;
-                            }
-                            if word_reset || self.resets(chars[i]) {
-                                marks.end[i] = false;
-                                marks.word[i] = false;
-                            }
-                            if i == start {
-                                words.whole[start] = false;
-                                marks.end[i] = false;
-                                marks.word[i] = false;
-                            }
-                        } else {
-                            if self.resets(chars[i]) {
-                                let start = word_start.unwrap();
-                                if letter_defined && letter_cnt == 1 && Some(start) != pass_end {
-                                    marks.symbol[start] = true;
-                                    marks.word[start] = false;
-                                    words.whole[start] = false;
-                                }
-                                word_reset = true;
-                                i += 1;
-                                continue;
-                            }
-                            if word_reset {
-                                if let Some(end) = pass_end
-                                    && word_start == Some(end)
-                                {
-                                    marks.word[end] = false;
-                                }
-                                pass_end = None;
-                                word_reset = false;
-                                word_start = Some(i);
-                                letter_cnt = 0;
-                                marks.word[i] = true;
-                            }
-                            letter_cnt += 1;
-                        }
-                    }
-                }
-            }
-            i += 1;
-        }
-
-        if in_word {
-            let start = word_start.unwrap();
-            if letter_defined && letter_cnt == 1 && Some(start) != pass_end {
-                marks.symbol[start] = true;
-                marks.word[start] = false;
-                words.whole[start] = false;
-                marks.end[n] = false;
-                marks.word[n] = false;
-            }
-            if word_reset {
-                marks.end[n] = false;
-                marks.word[n] = false;
-            }
-        }
-    }
-
-    /// liblouis's `resolveEmphasisAllSymbols`: without a word indicator, or without a
-    /// word end indicator where emphasis ends inside a word, mark each character
-    fn resolve_all_symbols(&self, n: usize, marks: &mut Marks, words: &Words) {
-        if self.begemphword.is_none() {
-            let mut in_emph = false;
-            for i in 0..n {
-                if in_emph {
-                    if marks.end[i] {
-                        in_emph = false;
-                        marks.end[i] = false;
-                    }
-                } else if marks.begin[i] {
-                    in_emph = true;
-                    marks.begin[i] = false;
-                }
-                if in_emph {
-                    marks.symbol[i] = true;
-                }
-            }
-        } else if self.endemphword.is_none() {
-            let mut in_pass = false;
-            let mut in_word = false;
-            let mut word_start = 0;
-            for i in 0..n {
-                if in_pass && (marks.end[i] || marks.word[i]) {
-                    in_pass = false;
-                }
-                if !in_pass {
-                    if marks.begin[i] {
-                        in_pass = true;
-                    } else {
-                        if !in_word && marks.word[i] {
-                            in_word = true;
-                            word_start = i;
-                        }
-                        if in_word {
-                            if marks.word[i] && marks.end[i] {
-                                in_word = false;
-                                marks.end[i] = false;
-                                marks.word[i] = false;
-                                marks.word[word_start] = false;
-                                for j in word_start..i {
-                                    marks.symbol[j] = true;
-                                }
-                            } else if !words.char[i] {
-                                in_word = false;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// liblouis's `insertEmphasisEnd`
-    fn end_indicator(&self, marks: &Marks, at: usize) -> Option<&ResolvedTranslation> {
-        if !marks.end[at] {
-            None
-        } else if marks.word[at] {
-            self.endemphword.as_ref()
-        } else {
-            self.endemph
-                .as_ref()
-                .or(self.endemphphrase_after.as_ref())
-                .or(self.endemphphrase_before.as_ref())
-        }
-    }
-
-    /// liblouis's `insertEmphasisBegin`
-    fn begin_indicators(&self, marks: &Marks, at: usize) -> Vec<&ResolvedTranslation> {
-        let mut indicators = Vec::new();
-        if marks.begin[at]
-            && let Some(t) = self.begemphphrase.as_ref().or(self.begemph.as_ref())
-        {
-            indicators.push(t);
-        }
-        if marks.word[at]
-            && !marks.end[at]
-            && let Some(t) = &self.begemphword
-        {
-            indicators.push(t);
-        }
-        indicators
-    }
-
-    /// liblouis's `endCount`: how far back the emphasis ending at `at` began
-    fn end_count(marks: &Marks, at: usize) -> usize {
-        if !marks.end[at] {
-            return 0;
-        }
-        1 + (0..at)
-            .rev()
-            .take_while(|&i| !(marks.begin[i] || marks.word[i]))
-            .count()
-    }
-
-    /// liblouis's `beginCount`: how far the emphasis beginning at `at` reaches
-    fn begin_count(&self, marks: &Marks, chars: &[char], at: usize) -> usize {
-        let n = chars.len();
-        if marks.begin[at] {
-            1 + (at + 1..n).take_while(|&i| !marks.end[i]).count()
-        } else if marks.word[at] {
-            1 + (at + 1..n)
-                .take_while(|&i| {
-                    !marks.end[i]
-                        && !self.is(CharacterClass::Seqdelimiter, chars[i])
-                        && !self.is_emph_space(chars[i])
-                })
-                .count()
-        } else {
-            0
-        }
-    }
+/// An emphasis class or a mode (liblouis's `EmphasisClass`)
+#[derive(Debug, Clone)]
+struct Class {
+    kind: Kind,
+    mode: ModeChars,
+    bit: u64,
+    rules: Rules,
+    emphmodechars: Vec<char>,
+    noemphchars: Vec<char>,
 }
 
-/// liblouis's `resolveEmphasisSingleSymbols`: a section of one character is a letter
-fn resolve_single_symbols(n: usize, marks: &mut Marks) {
-    for i in 0..n {
-        if marks.begin[i] && marks.end[i + 1] {
-            marks.begin[i] = false;
-            marks.end[i + 1] = false;
-            marks.symbol[i] = true;
-        }
-    }
+/// The character attributes the classes consult
+#[derive(Debug, Clone, Default)]
+struct Attributes {
+    space: HashSet<char>,
+    letter: HashSet<char>,
+    seqdelimiter: HashSet<char>,
+    capsmodechars: HashSet<char>,
+    /// The characters that don't cancel a digit mode: digits, litdigits and the numeric
+    /// mode characters
+    numeric: HashSet<char>,
 }
 
-// ── Builder ─────────────────────────────────────────────────────────────────
-
-/// Builder for [`Indicator`].
-#[derive(Debug)]
+/// Builder for [`Emphases`]
+#[derive(Debug, Default)]
 pub struct IndicatorBuilder {
-    classes: HashMap<String, ClassIndicator>,
-    /// Tracks emphclass declaration order so the built `Indicator` preserves it.
-    class_order: Vec<String>,
+    classes: Vec<Class>,
+    caps: Option<Class>,
+    modes: Vec<Class>,
+    capsmodechars: HashSet<char>,
+    numeric_mode_chars: HashSet<char>,
+    /// `base` rules as (attribute, derived, base)
+    bases: Vec<(String, char, char)>,
 }
 
 impl IndicatorBuilder {
     pub fn new() -> Self {
-        Self {
-            classes: HashMap::new(),
-            class_order: Vec::new(),
-        }
+        Self::default()
     }
 
-    fn class_mut(&mut self, name: &str) -> &mut ClassIndicator {
-        if !self.classes.contains_key(name) {
-            self.class_order.push(name.to_string());
-            self.classes
-                .insert(name.to_string(), ClassIndicator::new(name.to_string()));
+    fn class_mut(&mut self, name: &str) -> &mut Class {
+        if let Some(i) = self
+            .classes
+            .iter()
+            .position(|c| matches!(&c.kind, Kind::Typeform(n) if n == name))
+        {
+            return &mut self.classes[i];
         }
-        self.classes.get_mut(name).unwrap()
+        let bit = 1 << self.classes.len().min(62);
+        // liblouis gives the first three classes a default phrase length
+        let len_phrase = if self.classes.len() < 3 { 4 } else { 0 };
+        self.classes.push(Class {
+            kind: Kind::Typeform(name.to_string()),
+            mode: ModeChars::default(),
+            bit,
+            rules: Rules {
+                len_phrase,
+                ..Rules::default()
+            },
+            emphmodechars: Vec::new(),
+            noemphchars: Vec::new(),
+        });
+        self.classes.last_mut().unwrap()
+    }
+
+    fn caps_mut(&mut self) -> &mut Rules {
+        &mut self
+            .caps
+            .get_or_insert_with(|| Class {
+                kind: Kind::Capitals,
+                mode: ModeChars::default(),
+                bit: CAPS_BIT,
+                rules: Rules::default(),
+                emphmodechars: Vec::new(),
+                noemphchars: Vec::new(),
+            })
+            .rules
+    }
+
+    fn mode_mut(&mut self, name: &str) -> &mut Rules {
+        if name == "uppercase" {
+            return self.caps_mut();
+        }
+        let i = match self
+            .modes
+            .iter()
+            .position(|c| matches!(&c.kind, Kind::Mode(n) if n == name))
+        {
+            Some(i) => i,
+            None => {
+                let bit = CAPS_BIT >> (1 + self.modes.len()).min(30);
+                self.modes.push(Class {
+                    kind: Kind::Mode(name.to_string()),
+                    mode: ModeChars::default(),
+                    bit,
+                    rules: Rules::default(),
+                    emphmodechars: Vec::new(),
+                    noemphchars: Vec::new(),
+                });
+                self.modes.len() - 1
+            }
+        };
+        &mut self.modes[i].rules
+    }
+
+    pub fn modeletter(&mut self, name: &str, dots: &str, origin: &AnchoredRule) {
+        self.mode_mut(name).letter = Some(make_translation(dots, origin));
+    }
+
+    pub fn begmodeword(&mut self, name: &str, dots: &str, origin: &AnchoredRule) {
+        self.mode_mut(name).begword = Some(make_translation(dots, origin));
+    }
+
+    pub fn endmodeword(&mut self, name: &str, dots: &str, origin: &AnchoredRule) {
+        self.mode_mut(name).endword = Some(make_translation(dots, origin));
+    }
+
+    pub fn begmode(&mut self, name: &str, dots: &str, origin: &AnchoredRule) {
+        self.mode_mut(name).beg = Some(make_translation(dots, origin));
+    }
+
+    pub fn endmode(&mut self, name: &str, dots: &str, origin: &AnchoredRule) {
+        self.mode_mut(name).end = Some(make_translation(dots, origin));
+    }
+
+    pub fn begmodephrase(&mut self, name: &str, dots: &str, origin: &AnchoredRule) {
+        self.mode_mut(name).begphrase = Some(make_translation(dots, origin));
+    }
+
+    pub fn endmodephrase(
+        &mut self,
+        name: &str,
+        dots: &str,
+        position: &Position,
+        origin: &AnchoredRule,
+    ) {
+        self.mode_mut(name).set_endphrase(dots, position, origin);
+    }
+
+    pub fn lenmodephrase(&mut self, name: &str, len: usize) {
+        self.mode_mut(name).len_phrase = len;
+    }
+
+    pub fn numeric_mode_chars(&mut self, chars: impl IntoIterator<Item = char>) {
+        self.numeric_mode_chars.extend(chars);
     }
 
     pub fn emphclass(&mut self, name: &str) {
@@ -750,19 +239,19 @@ impl IndicatorBuilder {
     }
 
     pub fn emphletter(&mut self, name: &str, dots: &str, origin: &AnchoredRule) {
-        self.class_mut(name).emphletter = Some(make_translation(dots, origin));
+        self.class_mut(name).rules.letter = Some(make_translation(dots, origin));
     }
 
     pub fn begemphword(&mut self, name: &str, dots: &str, origin: &AnchoredRule) {
-        self.class_mut(name).begemphword = Some(make_translation(dots, origin));
+        self.class_mut(name).rules.begword = Some(make_translation(dots, origin));
     }
 
     pub fn endemphword(&mut self, name: &str, dots: &str, origin: &AnchoredRule) {
-        self.class_mut(name).endemphword = Some(make_translation(dots, origin));
+        self.class_mut(name).rules.endword = Some(make_translation(dots, origin));
     }
 
     pub fn begemphphrase(&mut self, name: &str, dots: &str, origin: &AnchoredRule) {
-        self.class_mut(name).begemphphrase = Some(make_translation(dots, origin));
+        self.class_mut(name).rules.begphrase = Some(make_translation(dots, origin));
     }
 
     pub fn endemphphrase(
@@ -772,299 +261,1128 @@ impl IndicatorBuilder {
         position: &Position,
         origin: &AnchoredRule,
     ) {
-        let class = self.class_mut(name);
-        let t = Some(make_translation(dots, origin));
-        match position {
-            Position::Before => class.endemphphrase_before = t,
-            Position::After => class.endemphphrase_after = t,
-        }
+        self.class_mut(name)
+            .rules
+            .set_endphrase(dots, position, origin);
     }
 
     pub fn lenemphphrase(&mut self, name: &str, len: usize) {
-        self.class_mut(name).len_phrase = Some(len);
+        self.class_mut(name).rules.len_phrase = len;
     }
 
     pub fn begemph(&mut self, name: &str, dots: &str, origin: &AnchoredRule) {
-        self.class_mut(name).begemph = Some(make_translation(dots, origin));
+        self.class_mut(name).rules.beg = Some(make_translation(dots, origin));
     }
 
     pub fn endemph(&mut self, name: &str, dots: &str, origin: &AnchoredRule) {
-        self.class_mut(name).endemph = Some(make_translation(dots, origin));
+        self.class_mut(name).rules.end = Some(make_translation(dots, origin));
     }
 
     pub fn emphmodechars(&mut self, name: &str, chars: &str) {
-        self.class_mut(name).emphmodechars = chars.chars().collect();
+        self.class_mut(name).emphmodechars.extend(chars.chars());
     }
 
     pub fn noemphchars(&mut self, name: &str, chars: &str) {
-        self.class_mut(name).noemphchars = chars.chars().collect();
+        self.class_mut(name).noemphchars.extend(chars.chars());
     }
 
-    pub fn build(mut self, ctx: &TableContext) -> Option<Indicator> {
-        let classes: Vec<ClassIndicator> = self
-            .class_order
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, name)| {
-                let mut c = self.classes.remove(&name)?;
-                c.character_classes = ctx.character_classes().clone();
-                // liblouis's `setDefaults`, which only covers the first three classes
-                if i < 3 && c.len_phrase.is_none_or(|len| len == 0) {
-                    c.len_phrase = Some(4);
-                }
-                Some(c)
-            })
+    pub fn capsletter(&mut self, dots: &str, origin: &AnchoredRule) {
+        self.caps_mut().letter = Some(make_translation(dots, origin));
+    }
+
+    pub fn begcapsword(&mut self, dots: &str, origin: &AnchoredRule) {
+        self.caps_mut().begword = Some(make_translation(dots, origin));
+    }
+
+    pub fn endcapsword(&mut self, dots: &str, origin: &AnchoredRule) {
+        self.caps_mut().endword = Some(make_translation(dots, origin));
+    }
+
+    pub fn begcaps(&mut self, dots: &str, origin: &AnchoredRule) {
+        self.caps_mut().beg = Some(make_translation(dots, origin));
+    }
+
+    pub fn endcaps(&mut self, dots: &str, origin: &AnchoredRule) {
+        self.caps_mut().end = Some(make_translation(dots, origin));
+    }
+
+    pub fn begcapsphrase(&mut self, dots: &str, origin: &AnchoredRule) {
+        self.caps_mut().begphrase = Some(make_translation(dots, origin));
+    }
+
+    pub fn endcapsphrase(&mut self, dots: &str, position: &Position, origin: &AnchoredRule) {
+        self.caps_mut().set_endphrase(dots, position, origin);
+    }
+
+    pub fn lencapsphrase(&mut self, len: usize) {
+        self.caps_mut().len_phrase = len;
+    }
+
+    pub fn capsmodechars(&mut self, chars: &str) {
+        self.capsmodechars.extend(chars.chars());
+    }
+
+    pub fn base(&mut self, attribute: &str, derived: char, base: char) {
+        self.bases.push((attribute.to_string(), derived, base));
+    }
+
+    /// liblouis's `isEmphasizable` and the `linked` check of `resetsEmphMode` for a mode
+    /// whose attribute has the characters `active`
+    fn mode_chars(&self, active: HashSet<char>) -> ModeChars {
+        let base_of: HashMap<char, (&str, char)> = self
+            .bases
+            .iter()
+            .map(|(attribute, derived, base)| (*derived, (attribute.as_str(), *base)))
             .collect();
-        if classes.is_empty() {
-            None
+        let mut derived_of: HashMap<char, Vec<(&str, char)>> = HashMap::new();
+        for (attribute, derived, base) in &self.bases {
+            derived_of
+                .entry(*base)
+                .or_default()
+                .push((attribute.as_str(), *derived));
+        }
+        let mut emphasizable = active.clone();
+        let mut linked = HashSet::new();
+        let candidates: HashSet<char> = base_of.keys().chain(derived_of.keys()).copied().collect();
+        for c in candidates {
+            let (mode, head) = match base_of.get(&c) {
+                Some(&(attribute, base)) => (Some(attribute), base),
+                None => (None, c),
+            };
+            let derived = derived_of.get(&head).map(Vec::as_slice).unwrap_or_default();
+            if active.contains(&head) || derived.iter().any(|(_, d)| active.contains(d)) {
+                emphasizable.insert(c);
+            }
+            if derived
+                .iter()
+                .any(|&(m, d)| mode.is_none_or(|mode| mode == m) && active.contains(&d))
+            {
+                linked.insert(c);
+            }
+        }
+        ModeChars {
+            active,
+            emphasizable,
+            linked,
+        }
+    }
+
+    pub fn build(mut self, ctx: &TableContext) -> Option<Emphases> {
+        if self.classes.is_empty() && self.caps.is_none() && self.modes.is_empty() {
+            return None;
+        }
+        let class = |c| ctx.character_classes().get(&c).unwrap_or_default();
+        let uppercase = class(CharacterClass::Uppercase);
+        if let Some(mut caps) = self.caps.take() {
+            caps.mode = self.mode_chars(uppercase);
+            self.caps = Some(caps);
+        }
+        let mut modes = std::mem::take(&mut self.modes);
+        for mode in &mut modes {
+            if let Kind::Mode(name) = &mode.kind {
+                mode.mode = self.mode_chars(class(CharacterClass::from(name.as_str())));
+            }
+        }
+        let mut numeric = self.numeric_mode_chars.clone();
+        numeric.extend(class(CharacterClass::Digit));
+        numeric.extend(class(CharacterClass::Litdigit));
+        let attributes = Attributes {
+            space: class(CharacterClass::Space),
+            letter: class(CharacterClass::Letter),
+            seqdelimiter: class(CharacterClass::Seqdelimiter),
+            capsmodechars: self.capsmodechars,
+            numeric,
+        };
+        Some(Emphases {
+            classes: self.classes,
+            caps: self.caps,
+            modes,
+            attributes,
+        })
+    }
+}
+
+/// The emphasis classes and the capitals mode of a table
+#[derive(Debug, Clone)]
+pub struct Emphases {
+    classes: Vec<Class>,
+    caps: Option<Class>,
+    /// The other modes, in the order they were defined
+    modes: Vec<Class>,
+    attributes: Attributes,
+}
+
+impl Emphases {
+    fn is_caps(class: &Class) -> bool {
+        matches!(class.kind, Kind::Capitals)
+    }
+
+    fn is_mode(class: &Class) -> bool {
+        !matches!(class.kind, Kind::Typeform(_))
+    }
+
+    fn is_emphasizable(&self, c: char, class: &Class) -> bool {
+        if Self::is_mode(class) {
+            class.mode.emphasizable.contains(&c)
+        } else if class.noemphchars.is_empty() {
+            !self.attributes.space.contains(&c)
         } else {
-            Some(Indicator { classes })
+            !class.noemphchars.contains(&c)
+        }
+    }
+
+    fn resets_emph_mode(&self, c: char, class: &Class) -> bool {
+        let a = &self.attributes;
+        if Self::is_mode(class) {
+            if class.mode.active.contains(&c) || class.mode.linked.contains(&c) {
+                return false;
+            }
+            match &class.kind {
+                Kind::Capitals => !(a.letter.contains(&c) || a.capsmodechars.contains(&c)),
+                Kind::Mode(name) if name == "digit" => !a.numeric.contains(&c),
+                _ => !a.letter.contains(&c),
+            }
+        } else if a.letter.contains(&c) {
+            false
+        } else if class.emphmodechars.is_empty() {
+            a.space.contains(&c)
+        } else {
+            !class.emphmodechars.contains(&c)
+        }
+    }
+
+    fn is_emphasized(&self, c: char, class: &Class, typeform: bool) -> bool {
+        if !self.is_emphasizable(c, class) {
+            return false;
+        }
+        if Self::is_mode(class) {
+            class.mode.active.contains(&c)
+        } else {
+            typeform
+        }
+    }
+
+    fn is_emph_space(&self, c: char, class: &Class) -> bool {
+        let word_enabled = class.rules.begword.is_some();
+        if Self::is_caps(class) && !(word_enabled && !self.attributes.capsmodechars.is_empty()) {
+            return self.attributes.space.contains(&c);
+        }
+        !self.is_emphasizable(c, class) && (!word_enabled || self.resets_emph_mode(c, class))
+    }
+
+    /// liblouis's `markEmphases` for `chars`, the caller's emphasis given by `spans`
+    pub fn mark(&self, chars: &[char], spans: &[EmphasisSpan]) -> Marks<'_> {
+        let n = chars.len();
+        let mut marker = Marker {
+            emphases: self,
+            chars,
+            buffer: vec![Info::default(); n + 1],
+            words: vec![0; n + 2],
+        };
+        for class in self.classes.iter().chain(&self.caps).chain(&self.modes) {
+            let typeform: Vec<bool> = match &class.kind {
+                Kind::Typeform(name) => {
+                    let mut typeform = vec![false; n];
+                    for span in spans.iter().filter(|s| &s.class == name) {
+                        for t in typeform
+                            .iter_mut()
+                            .take(span.range.end.min(n))
+                            .skip(span.range.start)
+                        {
+                            *t = true;
+                        }
+                    }
+                    typeform
+                }
+                _ => vec![false; n],
+            };
+            marker.mark(class, &typeform);
+        }
+        Marks {
+            emphases: self,
+            buffer: marker.buffer,
+            chars: chars.to_vec(),
         }
     }
 }
 
-// ── Indicator ────────────────────────────────────────────────────────────────
-
-/// Compiled emphasis indicator for the emphasis classes of a table.
-#[derive(Debug, Clone)]
-pub struct Indicator {
-    classes: Vec<ClassIndicator>,
+struct Marker<'a> {
+    emphases: &'a Emphases,
+    chars: &'a [char],
+    buffer: Vec<Info>,
+    words: Vec<u8>,
 }
 
-impl Indicator {
-    fn marks(&self, chars: &[char], spans: &[EmphasisSpan]) -> Vec<Marks> {
-        self.classes
-            .iter()
-            .map(|class| {
-                let mut emphasized = vec![false; chars.len()];
-                for span in spans.iter().filter(|s| s.class == class.class_name) {
-                    for e in &mut emphasized
-                        [span.range.start.min(chars.len())..span.range.end.min(chars.len())]
-                    {
-                        *e = true;
+fn at(i: isize) -> usize {
+    usize::try_from(i).expect("liblouis never marks position -1")
+}
+
+impl Marker<'_> {
+    fn len(&self) -> usize {
+        self.chars.len()
+    }
+
+    fn word_char(&self, i: usize) -> bool {
+        self.words[i] & WORD_CHAR != 0
+    }
+
+    fn mark(&mut self, class: &Class, typeform: &[bool]) {
+        let e = self.emphases;
+        for i in 0..self.len() {
+            if e.is_emph_space(self.chars[i], class) {
+                self.words[i] &= !WORD_CHAR;
+            } else {
+                self.words[i] |= WORD_CHAR;
+            }
+            self.words[i] &= !WORD_WHOLE;
+        }
+        self.begin_end(class, typeform);
+        let rules = &class.rules;
+        if rules.begword.is_some() {
+            self.words(class);
+            if rules.len_phrase > 0 {
+                self.passages(class);
+            }
+            self.resets(class);
+            if rules.endword.is_none() {
+                self.all_symbols(class);
+            }
+        } else if rules.letter.is_some() {
+            if rules.beg.is_some() {
+                self.single_symbols(class);
+            } else {
+                self.all_symbols(class);
+            }
+        }
+        if Emphases::is_mode(class) {
+            // capitals are only marked where liblouis's typebuf has CAPSEMPH, which needs
+            // capsletter
+            let letter = rules.letter.is_some() || !Emphases::is_caps(class);
+            for i in 0..self.len() {
+                if !(letter && class.mode.active.contains(&self.chars[i])) {
+                    self.buffer[i].symbol &= !class.bit;
+                }
+            }
+        }
+    }
+
+    /// liblouis's `resolveEmphasisBeginEnd`
+    fn begin_end(&mut self, class: &Class, typeform: &[bool]) {
+        let v = class.bit;
+        let e = self.emphases;
+        let mut last_space: isize = -1;
+        let mut emph_start: isize = -1;
+        let mut last_word: isize = -1;
+        let mut emph = false;
+        let phrase_enabled = class.rules.begphrase.is_some();
+        let n = self.len() as isize;
+        let mut i: isize = 0;
+        while i < n {
+            let u = at(i);
+            let is_space = !self.word_char(u);
+            if is_space {
+                last_space = i;
+                if emph {
+                    last_word = i;
+                    emph = false;
+                }
+            }
+            if !is_space && e.is_emphasized(self.chars[u], class, typeform[u]) {
+                if emph_start < 0 {
+                    emph_start = i;
+                }
+                emph = true;
+            } else if !is_space && e.is_emphasizable(self.chars[u], class) && emph_start >= 0 {
+                self.buffer[at(emph_start)].begin |= v;
+                if emph {
+                    if phrase_enabled && emph_start < last_space {
+                        self.buffer[at(last_word)].end |= v;
+                        emph_start = -1;
+                        last_word = -1;
+                        emph = false;
+                        i = last_space + 1;
+                        continue;
+                    }
+                    self.buffer[u].end |= v;
+                } else {
+                    self.buffer[at(last_word)].end |= v;
+                }
+                emph_start = -1;
+                last_word = -1;
+                emph = false;
+            }
+            i += 1;
+        }
+        if emph_start >= 0 {
+            self.buffer[at(emph_start)].begin |= v;
+            if emph {
+                let n = self.len();
+                self.buffer[n].end |= v;
+            } else {
+                self.buffer[at(last_word)].end |= v;
+            }
+        }
+    }
+
+    /// Takes the WORD_CHAR marks off the characters after the last emphasizable one of
+    /// a word, and with them a word end mark (part of `resolveEmphasisWords`)
+    fn trim_word(&mut self, v: u64, last_char: isize, until: usize) {
+        for j in (last_char + 1).max(0) as usize..until {
+            self.words[j] &= !WORD_CHAR;
+        }
+        if last_char >= 0 && self.buffer[at(last_char)].symbol & v == 0 {
+            let lc = at(last_char);
+            if self.buffer[lc].word & v != 0 && self.buffer[lc].end & v == 0 {
+                self.buffer[lc].symbol |= v;
+            }
+            for j in lc..until.saturating_sub(1) {
+                if self.buffer[j + 1].end & v != 0 {
+                    self.buffer[j + 1].end &= !v;
+                    self.buffer[j + 1].word &= !v;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// liblouis's `resolveEmphasisWords`
+    fn words(&mut self, class: &Class) {
+        let v = class.bit;
+        let e = self.emphases;
+        let n = self.len();
+        let mut in_word = false;
+        let mut in_emp = false;
+        let mut word_start: isize = -1;
+        let mut char_cnt = 0;
+        let mut last_char: isize = -1;
+        let letter_defined = class.rules.letter.is_some();
+        let endphraseafter_defined = class.rules.begphrase.is_some()
+            && (class.rules.endphrase_after.is_some() || class.rules.end.is_some());
+
+        for i in 0..n {
+            if !in_emp && self.buffer[i].begin & v != 0 {
+                in_emp = true;
+                self.buffer[i].begin &= !v;
+                if in_word {
+                    word_start = i as isize;
+                }
+                if !self.word_char(i) {
+                    word_start = -1;
+                }
+            }
+
+            if in_emp && self.buffer[i].end & v != 0 {
+                in_emp = false;
+                self.buffer[i].end &= !v;
+                if in_word && word_start >= 0 {
+                    if letter_defined && char_cnt == 1 {
+                        self.buffer[at(word_start)].symbol |= v;
+                    } else {
+                        self.buffer[at(word_start)].word |= v;
+                        if self.word_char(i) {
+                            self.buffer[i].end |= v;
+                            self.buffer[i].word |= v;
+                        }
                     }
                 }
-                class.mark(chars, &emphasized)
-            })
-            .collect()
-    }
-
-    /// Where liblouis's emphasis buffer marks anything for an emphasis class, which keeps
-    /// some contractions from spanning the position (`checkEmphasisChange`)
-    pub fn marked(&self, input: &str, spans: &[EmphasisSpan]) -> Vec<bool> {
-        let chars: Vec<char> = input.chars().collect();
-        let marks = self.marks(&chars, spans);
-        (0..=chars.len())
-            .map(|at| marks.iter().any(|m| m.any(at)))
-            .collect()
-    }
-
-    /// Returns sparse `(position, translation)` pairs for the given input and emphasis
-    /// spans, in the order liblouis's `insertEmphasesAt` inserts them: at each position
-    /// first the end indicators, the one whose emphasis began last first, then the begin
-    /// indicators, the one whose emphasis reaches furthest first, then the letter
-    /// indicators.
-    ///
-    /// Position `n` (where `n = input.chars().count()`) is valid and used for
-    /// translations that must appear after all input characters.
-    pub fn precompute(
-        &self,
-        input: &str,
-        spans: &[EmphasisSpan],
-    ) -> Vec<(usize, ResolvedTranslation)> {
-        let chars: Vec<char> = input.chars().collect();
-        let marks = self.marks(&chars, spans);
-        let classes: Vec<(&ClassIndicator, &Marks)> = self.classes.iter().zip(&marks).collect();
-        let mut result = Vec::new();
-        for at in 0..=chars.len() {
-            let mut ends: Vec<(usize, &ClassIndicator, &Marks)> = classes
-                .iter()
-                .map(|&(class, marks)| (ClassIndicator::end_count(marks, at), class, marks))
-                .filter(|(count, ..)| *count > 0)
-                .collect();
-            // the first defined of those that began equally long ago ends first
-            ends.sort_by_key(|(count, ..)| *count);
-            for (_, class, marks) in ends {
-                if let Some(t) = class.end_indicator(marks, at) {
-                    result.push((at, t.clone()));
-                }
             }
-            let mut begins: Vec<(usize, usize, &ClassIndicator, &Marks)> = classes
-                .iter()
-                .enumerate()
-                .map(|(i, &(class, marks))| (class.begin_count(marks, &chars, at), i, class, marks))
-                .filter(|(count, ..)| *count > 0)
-                .collect();
-            // the last defined of those that reach equally far begins first
-            begins.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-            for (_, _, class, marks) in begins {
-                for t in class.begin_indicators(marks, at) {
-                    result.push((at, t.clone()));
+
+            if !in_word && self.word_char(i) && e.is_emphasizable(self.chars[i], class) {
+                in_word = true;
+                if in_emp {
+                    word_start = i as isize;
                 }
+                self.trim_word(v, last_char, i);
             }
-            for &(class, marks) in classes.iter().rev() {
-                if marks.symbol.get(at).copied().unwrap_or(false)
-                    && let Some(t) = &class.emphletter
-                {
-                    result.push((at, t.clone()));
+
+            if in_word && !self.word_char(i) {
+                if in_emp && word_start >= 0 {
+                    if letter_defined && char_cnt == 1 {
+                        self.buffer[at(word_start)].symbol |= v;
+                    } else {
+                        self.buffer[at(word_start)].word |= v;
+                    }
+                }
+                in_word = false;
+                word_start = -1;
+            }
+
+            if i as isize == word_start {
+                last_char = i as isize;
+                char_cnt = 1;
+            } else if in_word && (endphraseafter_defined || e.is_emphasizable(self.chars[i], class))
+            {
+                last_char = i as isize;
+                if in_emp {
+                    char_cnt += 1;
                 }
             }
         }
-        result
+
+        if in_emp {
+            self.buffer[n].end &= !v;
+            if in_word && word_start >= 0 {
+                if letter_defined && char_cnt == 1 {
+                    self.buffer[at(word_start)].symbol |= v;
+                } else {
+                    self.buffer[at(word_start)].word |= v;
+                }
+            }
+        }
+
+        self.trim_word(v, last_char, n);
+
+        let mut word_start: isize = -1;
+        for i in 0..n {
+            if self.buffer[i].symbol & v != 0 {
+                if (i == 0 || !self.word_char(i - 1)) && (i + 1 == n || !self.word_char(i + 1)) {
+                    self.words[i] |= WORD_WHOLE;
+                }
+            } else if self.buffer[i].word & v != 0 {
+                if self.buffer[i].end & v != 0 {
+                    if word_start >= 0 && self.word_char(i) {
+                        self.words[at(word_start)] &= !WORD_WHOLE;
+                    }
+                    word_start = -1;
+                } else {
+                    if i == 0 || !self.word_char(i - 1) {
+                        self.words[i] |= WORD_WHOLE;
+                    }
+                    word_start = i as isize;
+                }
+            }
+        }
+    }
+
+    /// liblouis's `convertToPassage`
+    fn convert_to_passage(
+        &mut self,
+        class: &Class,
+        pass_start: usize,
+        pass_end: usize,
+        word_start: usize,
+    ) {
+        let v = class.bit;
+        for i in pass_start..=pass_end {
+            self.buffer[i].symbol &= !v;
+            self.buffer[i].word &= !v;
+            self.words[i] &= !WORD_WHOLE;
+        }
+        self.buffer[pass_start].begin |= v;
+        let rules = &class.rules;
+        if rules.end.is_some() || rules.endphrase_after.is_some() {
+            self.buffer[pass_end].end |= v;
+        } else if let Some(before) = &rules.endphrase_before {
+            if rules
+                .begword
+                .as_ref()
+                .is_some_and(|begword| begword.output() == before.output())
+            {
+                self.buffer[word_start].word |= v;
+                self.words[word_start] |= WORD_WHOLE;
+            } else {
+                self.buffer[word_start].end |= v;
+            }
+        }
+    }
+
+    /// liblouis's `resolveEmphasisPassages`
+    fn passages(&mut self, class: &Class) {
+        let v = class.bit;
+        let n = self.len();
+        let is_mode = Emphases::is_mode(class);
+        let mut in_word = false;
+        let mut last_word_end: isize = -1;
+        let mut in_emph_word = false;
+        let mut last_emph_symbol: isize = -1;
+        let mut in_pass = false;
+        let mut last_pass_word_start: isize = -1;
+        let mut last_pass_word_end: isize = -1;
+        let mut pass_start: isize = -1;
+        let mut pass_word_cnt: usize = 0;
+        let endphraseafter_defined =
+            class.rules.endphrase_after.is_some() || class.rules.end.is_some();
+        let len_phrase = class.rules.len_phrase;
+
+        for i in 0..n {
+            let ii = i as isize;
+            if !in_word && self.word_char(i) {
+                in_word = true;
+            } else if in_word && !self.word_char(i) {
+                in_word = false;
+                last_word_end = ii;
+            }
+
+            let b = self.buffer[i];
+            let mut end_passage = false;
+            if !in_emph_word && (b.symbol & v != 0 || (b.word & v != 0 && b.end & v == 0)) {
+                if b.symbol & v != 0 {
+                    last_emph_symbol = ii;
+                } else {
+                    in_emph_word = true;
+                }
+                if in_pass {
+                    if !is_mode || self.words[i] & WORD_WHOLE != 0 {
+                        last_pass_word_start = ii;
+                        pass_word_cnt += 1;
+                    } else {
+                        end_passage = true;
+                    }
+                }
+            } else if (in_emph_word && b.word & v != 0 && b.end & v != 0) || last_word_end == ii {
+                in_emph_word = false;
+                if in_pass {
+                    last_pass_word_end = ii;
+                }
+            }
+
+            if !end_passage && !in_pass && (in_emph_word || last_emph_symbol == ii) {
+                if !is_mode || self.words[i] & WORD_WHOLE != 0 {
+                    in_pass = true;
+                    pass_start = ii;
+                    last_pass_word_start = ii;
+                    last_pass_word_end = -1;
+                    pass_word_cnt = 1;
+                }
+            } else if in_pass {
+                if end_passage || (in_word && !(in_emph_word || last_emph_symbol == ii)) {
+                    in_pass = false;
+                    if last_pass_word_end < last_pass_word_start {
+                        last_pass_word_end = ii;
+                    }
+                    if !endphraseafter_defined && last_pass_word_end != last_word_end {
+                        pass_word_cnt = pass_word_cnt.saturating_sub(1);
+                    }
+                    if pass_word_cnt >= len_phrase {
+                        self.convert_to_passage(
+                            class,
+                            at(pass_start),
+                            at(last_pass_word_end),
+                            at(last_pass_word_start),
+                        );
+                    }
+                } else if i == n - 1 && pass_word_cnt >= len_phrase {
+                    if last_pass_word_end < last_pass_word_start {
+                        last_pass_word_end = n as isize;
+                    }
+                    self.convert_to_passage(
+                        class,
+                        at(pass_start),
+                        at(last_pass_word_end),
+                        at(last_pass_word_start),
+                    );
+                }
+            }
+        }
+    }
+
+    /// liblouis's `resolveEmphasisSingleSymbols`
+    fn single_symbols(&mut self, class: &Class) {
+        let v = class.bit;
+        for i in 0..self.len() {
+            if self.buffer[i].begin & v != 0 && self.buffer[i + 1].end & v != 0 {
+                self.buffer[i].begin &= !v;
+                self.buffer[i + 1].end &= !v;
+                self.buffer[i].symbol |= v;
+            }
+        }
+    }
+
+    /// liblouis's `resolveEmphasisAllSymbols`
+    fn all_symbols(&mut self, class: &Class) {
+        let v = class.bit;
+        let n = self.len();
+        if class.rules.begword.is_none() {
+            let mut in_emph = false;
+            for i in 0..n {
+                if in_emph {
+                    if self.buffer[i].end & v != 0 {
+                        in_emph = false;
+                        self.buffer[i].end &= !v;
+                    }
+                } else if self.buffer[i].begin & v != 0 {
+                    in_emph = true;
+                    self.buffer[i].begin &= !v;
+                }
+                if in_emph {
+                    self.buffer[i].symbol |= v;
+                }
+            }
+        } else if class.rules.endword.is_none() {
+            let mut in_pass = false;
+            let mut in_word = false;
+            let mut word_start = 0;
+            for i in 0..n {
+                if in_pass && (self.buffer[i].end & v != 0 || self.buffer[i].word & v != 0) {
+                    in_pass = false;
+                }
+                if in_pass {
+                    continue;
+                }
+                if self.buffer[i].begin & v != 0 {
+                    in_pass = true;
+                    continue;
+                }
+                if !in_word && self.buffer[i].word & v != 0 {
+                    in_word = true;
+                    word_start = i;
+                }
+                if in_word {
+                    if self.buffer[i].word & v != 0 && self.buffer[i].end & v != 0 {
+                        in_word = false;
+                        self.buffer[i].end &= !v;
+                        self.buffer[i].word &= !v;
+                        self.buffer[word_start].word &= !v;
+                        for j in word_start..i {
+                            self.buffer[j].symbol |= v;
+                        }
+                    } else if !self.word_char(i) {
+                        in_word = false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// liblouis's `resolveEmphasisResets`
+    fn resets(&mut self, class: &Class) {
+        let v = class.bit;
+        let e = self.emphases;
+        let n = self.len();
+        let mut in_word = false;
+        let mut in_pass = false;
+        let mut word_start: isize = -1;
+        let mut word_reset = false;
+        let mut letter_cnt = 0;
+        let mut pass_end: isize = -1;
+        let letter_defined = class.rules.letter.is_some();
+        let chars = self.chars;
+        let resets = |i: usize| e.resets_emph_mode(chars[i], class);
+
+        let mut i = 0;
+        while i < n {
+            let ii = i as isize;
+            if in_pass {
+                if self.buffer[i].end & v != 0 {
+                    in_pass = false;
+                } else if self.buffer[i].word & v != 0 {
+                    in_pass = false;
+                    pass_end = ii;
+                }
+            }
+            if in_pass {
+                i += 1;
+                continue;
+            }
+            if self.buffer[i].begin & v != 0 {
+                in_pass = true;
+                i += 1;
+                continue;
+            }
+            if !in_word {
+                if self.buffer[i].word & v != 0 {
+                    if resets(i) && letter_defined && pass_end != ii {
+                        self.buffer[i].symbol |= v;
+                        if self.words[i + 1] & WORD_CHAR != 0 {
+                            self.buffer[i + 1].word |= v;
+                            if self.words[i] & WORD_WHOLE != 0 {
+                                self.words[i + 1] |= WORD_WHOLE;
+                            }
+                            if pass_end == ii {
+                                pass_end += 1;
+                            }
+                        }
+                        self.buffer[i].word &= !v;
+                        self.words[i] &= !WORD_WHOLE;
+                        i += 1;
+                        continue;
+                    }
+                    in_word = true;
+                    word_start = ii;
+                    letter_cnt = 0;
+                    word_reset = false;
+                } else if self.buffer[i].symbol & v != 0 && resets(i) {
+                    self.buffer[i].symbol &= !v;
+                }
+            }
+
+            if in_word {
+                if !self.word_char(i)
+                    || (self.buffer[i].word & v != 0 && self.buffer[i].end & v != 0)
+                {
+                    in_word = false;
+                    if letter_defined && letter_cnt == 1 && word_start != pass_end {
+                        let ws = at(word_start);
+                        self.buffer[ws].symbol |= v;
+                        self.buffer[ws].word &= !v;
+                        self.words[ws] &= !WORD_WHOLE;
+                        self.buffer[i].end &= !v;
+                        self.buffer[i].word &= !v;
+                    }
+                    if word_reset || resets(i) {
+                        self.buffer[i].end &= !v;
+                        self.buffer[i].word &= !v;
+                    }
+                    if ii == word_start {
+                        self.words[at(word_start)] &= !WORD_WHOLE;
+                        self.buffer[i].end &= !v;
+                        self.buffer[i].word &= !v;
+                    }
+                } else {
+                    if resets(i) {
+                        if letter_defined && letter_cnt == 1 && word_start != pass_end {
+                            let ws = at(word_start);
+                            self.buffer[ws].symbol |= v;
+                            self.buffer[ws].word &= !v;
+                            self.words[ws] &= !WORD_WHOLE;
+                        }
+                        word_reset = true;
+                        i += 1;
+                        continue;
+                    }
+                    if word_reset {
+                        if word_start == pass_end {
+                            self.buffer[at(pass_end)].word &= !v;
+                        }
+                        pass_end = -1;
+                        word_reset = false;
+                        word_start = ii;
+                        letter_cnt = 0;
+                        self.buffer[i].word |= v;
+                    }
+                    letter_cnt += 1;
+                }
+            }
+            i += 1;
+        }
+
+        if in_word {
+            if letter_defined && letter_cnt == 1 && word_start != pass_end {
+                let ws = at(word_start);
+                self.buffer[ws].symbol |= v;
+                self.buffer[ws].word &= !v;
+                self.words[ws] &= !WORD_WHOLE;
+                self.buffer[n].end &= !v;
+                self.buffer[n].word &= !v;
+            }
+            if word_reset {
+                self.buffer[n].end &= !v;
+                self.buffer[n].word &= !v;
+            }
+        }
+    }
+}
+
+/// The emphasis and capital marks of one input
+#[derive(Debug, Clone)]
+pub struct Marks<'a> {
+    emphases: &'a Emphases,
+    buffer: Vec<Info>,
+    chars: Vec<char>,
+}
+
+impl Marks<'_> {
+    /// Whether any class marks position `pos`
+    pub fn marked_at(&self, pos: usize) -> bool {
+        self.buffer.get(pos).is_some_and(|b| b.any() != 0)
+    }
+
+    /// liblouis's `checkEmphasisChange`: whether a mark falls inside `pos..pos + len`
+    pub fn changes_within(&self, pos: usize, len: usize) -> bool {
+        (pos + 1..pos + len).any(|i| self.marked_at(i))
+    }
+
+    /// The capital end indicators of `at`
+    pub fn caps_end_at(&self, at: usize) -> Vec<ResolvedTranslation> {
+        let mut out = Vec::new();
+        self.caps_end(at, &mut out);
+        out
+    }
+
+    /// The emphasis end and start indicators of `at`
+    pub fn emphasis_at(&self, at: usize) -> Vec<ResolvedTranslation> {
+        let mut out = Vec::new();
+        self.emphasis_end(at, &mut out);
+        self.emphasis_begin(at, &mut out);
+        out
+    }
+
+    /// The capital start indicators of `pos`, inserted each time the loop visits it
+    pub fn caps_begin_at(&self, pos: usize) -> Vec<ResolvedTranslation> {
+        let mut out = Vec::new();
+        self.caps_begin(pos, &mut out);
+        out
+    }
+
+    /// The end indicators of capitals and then the other modes
+    fn caps_end(&self, at: usize, out: &mut Vec<ResolvedTranslation>) {
+        for mode in self.emphases.caps.iter().chain(&self.emphases.modes) {
+            if self.buffer[at].any() & mode.bit != 0 {
+                self.insert_end(at, mode, out);
+            }
+        }
+    }
+
+    /// The start indicators of the other modes, the last defined first, and then of
+    /// capitals, closest to the word
+    fn caps_begin(&self, at: usize, out: &mut Vec<ResolvedTranslation>) {
+        if at >= self.buffer.len() {
+            return;
+        }
+        for mode in self.emphases.modes.iter().rev().chain(&self.emphases.caps) {
+            if self.buffer[at].any() & mode.bit != 0 {
+                self.insert_begin(at, mode, out);
+                self.insert_symbol(at, mode, out);
+            }
+        }
+    }
+
+    fn emphasis_end(&self, at: usize, out: &mut Vec<ResolvedTranslation>) {
+        let mut counts: Vec<usize> = self
+            .emphases
+            .classes
+            .iter()
+            .map(|class| self.end_count(at, class))
+            .collect();
+        while let Some(min) = (0..counts.len())
+            .filter(|&i| counts[i] > 0)
+            .min_by_key(|&i| counts[i])
+        {
+            counts[min] = 0;
+            self.insert_end(at, &self.emphases.classes[min], out);
+        }
+    }
+
+    fn emphasis_begin(&self, at: usize, out: &mut Vec<ResolvedTranslation>) {
+        let classes = &self.emphases.classes;
+        let mut counts: Vec<usize> = classes
+            .iter()
+            .map(|class| self.begin_count(at, class))
+            .collect();
+        loop {
+            // of equal counts the later class goes first
+            let mut max: Option<usize> = None;
+            for i in (0..counts.len()).rev() {
+                if counts[i] > 0 && max.is_none_or(|m| counts[i] > counts[m]) {
+                    max = Some(i);
+                }
+            }
+            let Some(max) = max else { break };
+            counts[max] = 0;
+            self.insert_begin(at, &classes[max], out);
+        }
+        for class in classes.iter().rev() {
+            if self.buffer[at].any() & class.bit != 0 {
+                self.insert_symbol(at, class, out);
+            }
+        }
+    }
+
+    fn end_count(&self, at: usize, class: &Class) -> usize {
+        let v = class.bit;
+        if self.buffer[at].end & v == 0 {
+            return 0;
+        }
+        1 + (0..at)
+            .rev()
+            .take_while(|&i| (self.buffer[i].begin | self.buffer[i].word) & v == 0)
+            .count()
+    }
+
+    fn begin_count(&self, at: usize, class: &Class) -> usize {
+        let v = class.bit;
+        let n = self.chars.len();
+        if self.buffer[at].begin & v != 0 {
+            1 + (at + 1..n)
+                .take_while(|&i| self.buffer[i].end & v == 0)
+                .count()
+        } else if self.buffer[at].word & v != 0 {
+            let a = &self.emphases.attributes;
+            1 + (at + 1..n)
+                .take_while(|&i| {
+                    let c = self.chars[i];
+                    self.buffer[i].end & v == 0
+                        && !a.seqdelimiter.contains(&c)
+                        && !self.emphases.is_emph_space(c, class)
+                })
+                .count()
+        } else {
+            0
+        }
+    }
+
+    fn insert_symbol(&self, at: usize, class: &Class, out: &mut Vec<ResolvedTranslation>) {
+        if self.buffer[at].symbol & class.bit != 0
+            && let Some(t) = &class.rules.letter
+        {
+            out.push(t.clone());
+        }
+    }
+
+    fn insert_begin(&self, at: usize, class: &Class, out: &mut Vec<ResolvedTranslation>) {
+        let v = class.bit;
+        let b = self.buffer[at];
+        let rules = &class.rules;
+        if b.begin & v != 0
+            && let Some(t) = rules.begphrase.as_ref().or(rules.beg.as_ref())
+        {
+            out.push(t.clone());
+        }
+        if b.word & v != 0
+            && b.end & v == 0
+            && let Some(t) = &rules.begword
+        {
+            out.push(t.clone());
+        }
+    }
+
+    fn insert_end(&self, at: usize, class: &Class, out: &mut Vec<ResolvedTranslation>) {
+        let v = class.bit;
+        let b = self.buffer[at];
+        let rules = &class.rules;
+        if b.end & v == 0 {
+            return;
+        }
+        let t = if b.word & v != 0 {
+            rules.endword.as_ref()
+        } else {
+            rules
+                .end
+                .as_ref()
+                .or(rules.endphrase_after.as_ref())
+                .or(rules.endphrase_before.as_ref())
+        };
+        if let Some(t) = t {
+            out.push(t.clone());
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::RuleParser;
+    use crate::parser::{CharacterClasses, RuleParser};
 
     fn rule(s: &str) -> AnchoredRule {
         AnchoredRule::new(RuleParser::new(s).rule().unwrap(), None, 0)
     }
 
-    fn space_ctx() -> TableContext {
+    fn ctx() -> TableContext {
         TableContext::new(
             CharacterClasses::new(&[
                 (CharacterClass::Space, &[' ']),
-                (CharacterClass::Letter, &['a', 'b', 'c', 'd', 'e', 'f']),
+                (
+                    CharacterClass::Letter,
+                    &['a', 'b', 'c', 'd', 'A', 'B', 'C', 'D'],
+                ),
+                (CharacterClass::Uppercase, &['A', 'B', 'C', 'D']),
+                (CharacterClass::Lowercase, &['a', 'b', 'c', 'd']),
             ]),
             CharacterClasses::default(),
             Default::default(),
         )
     }
 
-    fn pairs(t: &[(usize, ResolvedTranslation)]) -> Vec<(usize, String)> {
-        t.iter()
-            .map(|(pos, r)| (*pos, r.output().to_string()))
+    fn caps_builder() -> IndicatorBuilder {
+        let mut b = IndicatorBuilder::new();
+        for (upper, lower) in [('A', 'a'), ('B', 'b'), ('C', 'c'), ('D', 'd')] {
+            b.base("uppercase", upper, lower);
+        }
+        b.capsletter("⠨", &rule("capsletter 46"));
+        b.begcapsword("⠘", &rule("begcapsword 45"));
+        b.endcapsword("⠠", &rule("endcapsword 6"));
+        b
+    }
+
+    /// The indicators inserted at each position when the loop visits every one of them
+    fn visit_all(emphases: &Emphases, input: &str, spans: &[EmphasisSpan]) -> Vec<String> {
+        let chars: Vec<char> = input.chars().collect();
+        let marks = emphases.mark(&chars, spans);
+        (0..=chars.len())
+            .map(|pos| {
+                marks
+                    .caps_end_at(pos)
+                    .into_iter()
+                    .chain(marks.emphasis_at(pos))
+                    .chain(marks.caps_begin_at(pos))
+                    .map(|t| t.output().to_string())
+                    .collect()
+            })
             .collect()
     }
 
-    fn italic(range: std::ops::Range<usize>) -> Vec<EmphasisSpan> {
-        vec![EmphasisSpan::new("italic", range)]
+    #[test]
+    fn capital_tiers() {
+        let emphases = caps_builder().build(&ctx()).unwrap();
+        assert_eq!(visit_all(&emphases, "Ab", &[]), vec!["⠨", "", ""]);
+        assert_eq!(visit_all(&emphases, "AB a", &[]), vec!["⠘", "", "", "", ""]);
+        assert_eq!(visit_all(&emphases, "ABc", &[]), vec!["⠘", "", "⠠", ""]);
     }
 
-    fn word_class() -> Indicator {
+    #[test]
+    fn capital_start_repeats_on_each_visit() {
+        let emphases = caps_builder().build(&ctx()).unwrap();
+        let marks = emphases.mark(&['A'], &[]);
+        assert_eq!(marks.caps_begin_at(0)[0].output(), "⠨");
+        assert!(marks.caps_end_at(0).is_empty());
+    }
+
+    #[test]
+    fn marks_inside_a_word() {
+        let emphases = caps_builder().build(&ctx()).unwrap();
+        let chars: Vec<char> = "aBCd".chars().collect();
+        let marks = emphases.mark(&chars, &[]);
+        assert!(marks.changes_within(0, 2));
+        assert!(!marks.changes_within(1, 1));
+        assert_eq!(marks.caps_begin_at(1)[0].output(), "⠘");
+        assert_eq!(marks.caps_end_at(3)[0].output(), "⠠");
+    }
+
+    #[test]
+    fn other_modes_begin_before_capitals() {
+        let mut b = caps_builder();
+        b.begmodeword("foreign", "⠰", &rule("begmodeword foreign 56"));
+        let ctx = TableContext::new(
+            CharacterClasses::new(&[
+                (CharacterClass::Space, &[' ']),
+                (CharacterClass::Letter, &['a', 'b', 'A', 'B']),
+                (CharacterClass::Uppercase, &['A', 'B']),
+                (CharacterClass::from("foreign"), &['a', 'b', 'A', 'B']),
+            ]),
+            CharacterClasses::default(),
+            Default::default(),
+        );
+        let emphases = b.build(&ctx).unwrap();
+        assert_eq!(visit_all(&emphases, "Ab", &[]), vec!["⠰⠨", "", ""]);
+    }
+
+    #[test]
+    fn emphasis_words_and_passages() {
         let mut b = IndicatorBuilder::new();
         b.emphclass("italic");
-        b.emphletter("italic", "⠨", &rule("emphletter italic 46"));
         b.begemphword("italic", "⠸", &rule("begemphword italic 456"));
         b.endemphword("italic", "⠠", &rule("endemphword italic 6"));
         b.begemphphrase("italic", "⠸⠸", &rule("begemphphrase italic 456-456"));
         b.endemphphrase(
             "italic",
-            "⠸",
-            &Position::Before,
-            &rule("endemphphrase italic before 456"),
+            "⠠⠄",
+            &Position::After,
+            &rule("endemphphrase italic after 6-3"),
         );
-        b.build(&space_ctx()).unwrap()
-    }
-
-    #[test]
-    fn a_single_letter_gets_the_letter_indicator() {
-        let result = word_class().precompute("abc", &italic(1..2));
-        assert_eq!(pairs(&result), vec![(1, "⠨".to_string())]);
-    }
-
-    #[test]
-    fn a_word_ending_at_a_space_needs_no_end_indicator() {
-        let result = word_class().precompute("ab cd", &italic(0..3));
-        assert_eq!(pairs(&result), vec![(0, "⠸".to_string())]);
-    }
-
-    #[test]
-    fn emphasis_ending_inside_a_word_is_closed() {
-        let result = word_class().precompute("abcd", &italic(0..2));
+        b.lenemphphrase("italic", 2);
+        let emphases = b.build(&ctx()).unwrap();
+        let italic = |range| [EmphasisSpan::new("italic", range)];
         assert_eq!(
-            pairs(&result),
-            vec![(0, "⠸".to_string()), (2, "⠠".to_string())]
-        );
-    }
-
-    #[test]
-    fn a_passage_ends_with_the_word_indicator_before_its_last_word() {
-        let result = word_class().precompute("ab cd ef ab", &italic(0..11));
-        assert_eq!(
-            pairs(&result),
-            vec![(0, "⠸⠸".to_string()), (9, "⠸".to_string())]
-        );
-        // three words are not enough
-        let result = word_class().precompute("ab cd ef", &italic(0..8));
-        assert_eq!(
-            pairs(&result),
-            vec![
-                (0, "⠸".to_string()),
-                (3, "⠸".to_string()),
-                (6, "⠸".to_string())
-            ]
-        );
-    }
-
-    #[test]
-    fn begemph_skips_spaces_unless_noemphchars_says_otherwise() {
-        let mut b = IndicatorBuilder::new();
-        b.begemph("italic", "⠁", &rule("begemph italic 1"));
-        b.endemph("italic", "⠃", &rule("endemph italic 12"));
-        let indicator = b.build(&space_ctx()).unwrap();
-        let result = indicator.precompute(" ab cd", &italic(0..4));
-        assert_eq!(
-            pairs(&result),
-            vec![(1, "⠁".to_string()), (3, "⠃".to_string())]
-        );
-
-        let mut b = IndicatorBuilder::new();
-        b.begemph("italic", "⠁", &rule("begemph italic 1"));
-        b.endemph("italic", "⠃", &rule("endemph italic 12"));
-        b.noemphchars("italic", "%");
-        let indicator = b.build(&space_ctx()).unwrap();
-        let result = indicator.precompute(" ab cd", &italic(0..4));
-        assert_eq!(
-            pairs(&result),
-            vec![(0, "⠁".to_string()), (4, "⠃".to_string())]
-        );
-    }
-
-    #[test]
-    fn indicators_nest() {
-        let mut b = IndicatorBuilder::new();
-        b.begemph("italic", "⠁", &rule("begemph italic 1"));
-        b.endemph("italic", "⠁", &rule("endemph italic 1"));
-        b.begemph("underline", "⠃", &rule("begemph underline 12"));
-        b.endemph("underline", "⠃", &rule("endemph underline 12"));
-        let indicator = b.build(&space_ctx()).unwrap();
-        let outputs = |spans: &[EmphasisSpan]| {
-            let result = indicator.precompute("abcd", spans);
-            pairs(&result)
-                .into_iter()
-                .map(|(pos, s)| format!("{pos}{s}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
-        let underline = |range| EmphasisSpan::new("underline", range);
-        assert_eq!(
-            outputs(&[EmphasisSpan::new("italic", 0..2), underline(0..4)]),
-            "0⠃ 0⠁ 2⠁ 4⠃"
+            visit_all(&emphases, "ab cd", &italic(3..5)),
+            vec!["", "", "", "⠸", "", ""]
         );
         assert_eq!(
-            outputs(&[EmphasisSpan::new("italic", 2..4), underline(0..4)]),
-            "0⠃ 2⠁ 4⠁ 4⠃"
+            visit_all(&emphases, "abcd", &italic(0..2)),
+            vec!["⠸", "", "⠠", "", ""]
         );
-        // otherwise the first defined class is outermost
         assert_eq!(
-            outputs(&[EmphasisSpan::new("italic", 0..4), underline(0..4)]),
-            "0⠃ 0⠁ 4⠁ 4⠃"
-        );
-    }
-
-    #[test]
-    fn marks_include_emphasis_without_indicators() {
-        let mut b = IndicatorBuilder::new();
-        b.emphclass("italic");
-        let indicator = b.build(&space_ctx()).unwrap();
-        assert!(indicator.precompute("abcd", &italic(1..3)).is_empty());
-        assert_eq!(
-            indicator.marked("abcd", &italic(1..3)),
-            vec![false, true, false, true, false]
+            visit_all(&emphases, "ab cd", &italic(0..5)),
+            vec!["⠸⠸", "", "", "", "", "⠠⠄"]
         );
     }
 }

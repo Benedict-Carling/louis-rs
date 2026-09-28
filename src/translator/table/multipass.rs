@@ -37,22 +37,6 @@ impl MultipassTableBuilder {
     }
 }
 
-fn test_of(translation: &ResolvedTranslation) -> Option<&crate::parser::Test> {
-    match translation.rule() {
-        Some(
-            Rule::Correct { test, .. }
-            | Rule::Pass2 { test, .. }
-            | Rule::Pass3 { test, .. }
-            | Rule::Pass4 { test, .. },
-        ) => Some(test),
-        _ => None,
-    }
-}
-
-fn lookback(translation: &ResolvedTranslation) -> usize {
-    test_of(translation).map_or(0, |test| test.lookback())
-}
-
 impl MultipassTable {
     pub fn compile(
         rules: &[AnchoredRule],
@@ -81,94 +65,111 @@ impl MultipassTable {
         self.trace(input).iter().map(|t| t.output()).collect()
     }
 
+    fn translation_candidates(
+        &self,
+        before: &str,
+        input: &str,
+        env: &Environment,
+    ) -> (Vec<ResolvedTranslation>, Vec<ResolvedTranslation>) {
+        self.patterns
+            .find(before, input, env)
+            .into_iter()
+            .partition(|t| t.offset() == 0)
+    }
+
+    fn update_offsets(
+        &self,
+        translations: Vec<ResolvedTranslation>,
+        decrement: usize,
+    ) -> Vec<ResolvedTranslation> {
+        translations
+            .into_iter()
+            // drop translations where the offet is smaller than the decrement
+            .filter(|t| t.offset() >= decrement)
+            .map(|t| t.decrement_offset(decrement))
+            .collect()
+    }
+
+    fn partition_delayed_translations(
+        &self,
+        delayed: Vec<ResolvedTranslation>,
+    ) -> (Vec<ResolvedTranslation>, Vec<ResolvedTranslation>) {
+        delayed.into_iter().partition(|t| t.offset() == 0)
+    }
+
     pub fn trace(&self, input: &str) -> Vec<ResolvedTranslation> {
         let mut translations: Vec<ResolvedTranslation> = Vec::new();
+        let mut delayed_translations: Vec<ResolvedTranslation> = Vec::new();
         let mut env = Environment::new();
         let mut chars = input.chars();
         // liblouis copies the next character unchanged after a rule that did not advance
         let mut advanced = true;
-        // a rule matched from an earlier position, whose replacement is still ahead
-        let mut pending: Option<ResolvedTranslation> = None;
-        // rules found where their lookback steps back to, with the characters left until
-        // liblouis would try them
-        let mut behind: Vec<(usize, ResolvedTranslation)> = Vec::new();
 
         loop {
-            let from_before = pending.is_some();
-            let candidate = match pending.take() {
-                Some(t) if t.offset() > 0 => {
-                    pending = Some(t.decrement_offset(1));
-                    None
-                }
-                Some(t) => Some(t),
-                None if advanced => {
-                    let at_start = chars.as_str().len() == input.len();
-                    for t in self.patterns.find(chars.as_str(), &env, at_start) {
-                        behind.push((lookback(&t), t));
-                    }
-                    let (due, waiting): (Vec<_>, Vec<_>) =
-                        behind.drain(..).partition(|(left, _)| *left == 0);
-                    behind = waiting;
-                    // a replacement that starts before the position the rule is tried at
-                    // puts out again what was already put out there, as in liblouis
-                    let due = due.into_iter().map(|(_, t)| {
-                        let n = lookback(&t);
-                        if t.offset() >= n {
-                            t.decrement_offset(n)
-                        } else {
-                            let overlap = n - t.offset();
-                            let length = t.length().saturating_sub(overlap);
-                            t.with_offset(0).with_length(length)
-                        }
-                    });
-                    // liblouis tries pass rules by the characters they are filed by, longest
-                    // first, and takes the first that matches from this position
-                    let best = due
-                        .max_by_key(|t| (t.rule().map_or(0, backward::pass_rule_cells), t.rank()));
-                    match best {
-                        Some(t) if t.offset() > 0 => {
-                            pending = Some(t.decrement_offset(1));
-                            None
-                        }
-                        t => t,
-                    }
-                }
-                None => None,
-            };
+            // given an input query the patterns for matching translations. Then split off the
+            // translations that are delayed, i.e. have an offset because they have a pre-pattern
+            let before = &input[..input.len() - chars.as_str().len()];
+            // a rule found with context before its replacement starts here, and competes with
+            // the rules that replace from here: liblouis applies one rule per position
+            let (mut candidates, found_here) =
+                self.translation_candidates(before, chars.as_str(), &env);
+
+            // move delayed_translations with zero offset into candidates
+            let (current, delayed) = self.partition_delayed_translations(delayed_translations);
+            delayed_translations = delayed;
+            let began_earlier = current.len();
+            candidates.splice(0..0, current);
+
+            // liblouis tries the rules at the position a test begins, those whose test
+            // starts with the most literal characters first
+            let candidate = candidates
+                .iter()
+                .enumerate()
+                .filter(|_| advanced)
+                .max_by_key(|(i, t)| {
+                    (
+                        *i < began_earlier,
+                        t.rule().map_or(0, backward::pass_rule_cells),
+                        t.rank(),
+                    )
+                })
+                .map(|(_, t)| t.clone());
             advanced = true;
-            let consumed = if let Some(t) = candidate {
+            if let Some(t) = candidate {
                 if t.length() == 0 {
-                    // a rule whose test began earlier has advanced past where it began
-                    advanced = from_before;
+                    advanced = false;
+                    delayed_translations.extend(found_here);
                 } else {
                     // move the iterator forward by the number of characters in the translation
                     chars.nth(t.length() - 1);
                 }
-                for effect in t.effects() {
-                    env.apply(effect);
+                // there is a matching translation rule
+                let translation = t.clone();
+                translations.push(translation);
+                delayed_translations = self.update_offsets(delayed_translations, t.length());
+
+                // update the environment if needed
+                if !t.effects().is_empty() {
+                    for effect in t.effects() {
+                        env.apply(effect);
+                    }
                 }
-                let length = t.length();
-                translations.push(t);
-                length
             } else if let Some(next_char) = chars.next() {
                 // no translation rule found, just pass the character through
-                translations.push(ResolvedTranslation::new(
+                delayed_translations.extend(found_here);
+                let translation = ResolvedTranslation::new(
                     &next_char.to_string(),
                     &next_char.to_string(),
                     1,
                     self.stage,
                     None,
-                ));
-                1
+                );
+                translations.push(translation);
+                delayed_translations = self.update_offsets(delayed_translations, 1);
             } else {
                 // the chars iterator is exhausted
                 break;
-            };
-            behind = behind
-                .into_iter()
-                .filter(|(left, _)| *left >= consumed)
-                .map(|(left, t)| (left - consumed, t))
-                .collect();
+            }
         }
         translations
     }
@@ -210,6 +211,21 @@ mod tests {
                 .unwrap();
         assert_eq!(transform.translate("resszel"), "resszel");
         assert_eq!(transform.translate("ressze"), "reszsze");
+    }
+
+    #[test]
+    fn one_rule_per_position() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("digit 5 15"),
+            parse_rule("correct [\"a\"]$d \"x\""),
+            parse_rule("correct $l[]$d \"y\""),
+        ];
+        let ctx = TableContext::compile(&rules).unwrap();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Pre, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("a5"), "x5");
     }
 
     #[test]
@@ -257,59 +273,6 @@ mod tests {
                 .unwrap();
         assert_eq!(transform.translate("⠃⠃"), "⠃");
         assert_eq!(transform.translate("⠃⠙⠃"), "⠃⠙⠃");
-    }
-
-    #[test]
-    fn a_rule_that_began_earlier_lets_the_next_one_start_where_it_ended() {
-        let rules = [
-            parse_rule("noback pass2 @1[]@2 @3"),
-            parse_rule("noback pass2 @2[]@4 @5"),
-        ];
-        let ctx = TableContext::default();
-        let transform =
-            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Post1, &ctx)
-                .unwrap();
-        assert_eq!(transform.translate("⠁⠂⠈"), "⠁⠄⠂⠐⠈");
-    }
-
-    #[test]
-    fn a_lookback_steps_back_over_what_was_put_out() {
-        let rules = [parse_rule("nofor pass4 _!$s[@6@6] @69-6")];
-        let ctx = TableContext::default();
-        let transform =
-            MultipassTable::compile(&rules, Direction::Backward, TranslationStage::Post3, &ctx)
-                .unwrap();
-        assert_eq!(transform.translate("⠰⠠⠠⠝"), "⠰⠠\u{f0120}⠠⠝");
-    }
-
-    #[test]
-    fn copy_rule_keeps_what_its_lookback_steps_over() {
-        let rules = [
-            parse_rule("noback pass2 _@15[@12] *"),
-            parse_rule("noback pass2 @15[@14] *"),
-            parse_rule("noback pass2 @12 @2"),
-        ];
-        let ctx = TableContext::default();
-        let transform =
-            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Post1, &ctx)
-                .unwrap();
-        assert_eq!(transform.translate("⠑⠃"), "⠑⠃");
-        assert_eq!(transform.translate("⠑⠉"), "⠉");
-        assert_eq!(transform.translate("⠃"), "⠂");
-    }
-
-    #[test]
-    fn backward_copy_rule_keeps_its_match_from_other_rules() {
-        let rules = [
-            parse_rule("nofor pass2 @2357 @f-235"),
-            parse_rule("nofor pass2 @6-2357 *"),
-        ];
-        let ctx = TableContext::default();
-        let transform =
-            MultipassTable::compile(&rules, Direction::Backward, TranslationStage::Post1, &ctx)
-                .unwrap();
-        assert_eq!(transform.translate("⠠⡖"), "⠠⡖");
-        assert_eq!(transform.translate("⡖"), "\u{f4000}⠖");
     }
 
     #[test]

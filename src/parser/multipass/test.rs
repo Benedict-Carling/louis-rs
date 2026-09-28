@@ -20,18 +20,6 @@ impl Test {
         &self.tests
     }
 
-    /// How far a leading `_n` steps back from where liblouis tries the rule.
-    pub fn lookback(&self) -> usize {
-        match self
-            .tests
-            .iter()
-            .find(|t| !matches!(t, TestInstruction::Variable { .. }))
-        {
-            Some(TestInstruction::Lookback { len }) => usize::from(*len),
-            _ => 0,
-        }
-    }
-
     /// The number of characters liblouis indexes a `context` rule under: those of the first
     /// string the test checks, less any it steps back over (`passFindCharacters`)
     pub fn leading_chars(&self) -> usize {
