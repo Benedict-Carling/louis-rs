@@ -1964,8 +1964,11 @@ impl PrimaryTable {
             let in_cursor_word = cursor_word
                 .as_ref()
                 .is_some_and(|word| word.contains(&char_pos));
-            if !(revisit && applied_before) && !in_cursor_word {
-                translations.extend(indications.translations_at(char_pos, revisit));
+            if !(revisit && applied_before) {
+                let at = indications.translations_at(char_pos, revisit);
+                if !in_cursor_word {
+                    translations.extend(at);
+                }
             }
             applied_before = false;
             if !revisit {
