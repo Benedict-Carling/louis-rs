@@ -16,62 +16,22 @@
 //! * [`emphasis::Emphases`]: marks emphasis and capitals the way liblouis does, and
 //!   inserts their indicators as the translation loop reaches each position
 //! * [`numeric::Indicator`]: detects digit sequences and emits number-sign indicators
-//! * [`mode::Indicator`]: detects character class runs and emits mode indicators
 //! * [`lettersign::Indicator`]: detects contractions that require a letter sign
 //! * [`nocontract::Indicator`]: detects contractions that require a no-contract sign
 
 use crate::emphasis::EmphasisSpan;
-use crate::parser::Rule;
 use crate::translator::ResolvedTranslation;
 
-mod class_indicator;
 pub mod computer_braille;
 pub mod emphasis;
 pub mod lettersign;
-pub mod mode;
 pub mod nocontract;
 pub mod numeric;
-
-/// Finds maximal spans within `chars[start..end)` where `predicate` holds.
-///
-/// Used by indicators that need to segment a range into alternating "matching" and
-/// "non-matching" runs.
-fn find_spans(
-    chars: &[char],
-    start: usize,
-    end: usize,
-    predicate: impl Fn(char) -> bool,
-) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut pos = start;
-    while pos < end {
-        while pos < end && !predicate(chars[pos]) {
-            pos += 1;
-        }
-        if pos >= end {
-            break;
-        }
-        let span_start = pos;
-        while pos < end && predicate(chars[pos]) {
-            pos += 1;
-        }
-        spans.push((span_start, pos));
-    }
-    spans
-}
-
-fn is_mode_end(rule: Option<&Rule>) -> bool {
-    matches!(
-        rule,
-        Some(Rule::Endmodeword { .. } | Rule::Endmode { .. } | Rule::Endmodephrase { .. })
-    )
-}
 
 #[derive(Debug, Clone)]
 pub enum Indicator {
     ComputerBraille(computer_braille::Indicator),
     LetterSign(lettersign::Indicator),
-    Mode(mode::Indicator),
     NoContract(nocontract::Indicator),
     Numeric(numeric::Indicator),
 }
@@ -92,10 +52,6 @@ pub struct PrecomputedIndications<'a> {
     /// start ones, and after the capital start ones
     translations: Vec<[Vec<ResolvedTranslation>; 3]>,
     marks: Option<emphasis::Marks<'a>>,
-    /// The end and start indicators of the other modes, which liblouis inserts with the
-    /// capital ones
-    mode_ends: Vec<Vec<ResolvedTranslation>>,
-    mode_begins: Vec<Vec<ResolvedTranslation>>,
     /// liblouis's `insertEmphasesFrom`
     from: usize,
     /// A numeric indicator stepped as the translation loop visits positions
@@ -107,14 +63,10 @@ pub struct PrecomputedIndications<'a> {
 impl PrecomputedIndications<'_> {
     /// The start indicators of the modes and capitals at `pos`, modes first
     fn mode_begin_at(&self, pos: usize) -> Vec<ResolvedTranslation> {
-        let mut out = self.mode_begins.get(pos).cloned().unwrap_or_default();
-        out.extend(
-            self.marks
-                .as_ref()
-                .map(|m| m.caps_begin_at(pos))
-                .unwrap_or_default(),
-        );
-        out
+        self.marks
+            .as_ref()
+            .map(|m| m.caps_begin_at(pos))
+            .unwrap_or_default()
     }
 
     /// The indications at `pos`. Call it each time the translation loop visits a
@@ -133,9 +85,6 @@ impl PrecomputedIndications<'_> {
         for at in self.from..=pos.min(self.chars.len()) {
             if let Some(m) = &self.marks {
                 reached.extend(m.caps_end_at(at));
-            }
-            reached.extend(self.mode_ends.get(at).cloned().unwrap_or_default());
-            if let Some(m) = &self.marks {
                 reached.extend(m.emphasis_at(at));
             }
             if at < pos {
@@ -183,20 +132,8 @@ impl Indicators {
         let chars: Vec<char> = input.chars().collect();
         let mut translations = vec![<[Vec<ResolvedTranslation>; 3]>::default(); chars.len() + 1];
         let mut live_numeric = None;
-        let mut mode_ends = vec![Vec::new(); chars.len() + 1];
-        let mut mode_begins = vec![Vec::new(); chars.len() + 1];
 
         for indicator in &self.indicators {
-            if let Indicator::Mode(i) = indicator {
-                for (pos, t) in i.precompute(input) {
-                    if is_mode_end(t.rule()) {
-                        mode_ends[pos].push(t);
-                    } else {
-                        mode_begins[pos].push(t);
-                    }
-                }
-                continue;
-            }
             let (bucket, pairs) = match indicator {
                 Indicator::ComputerBraille(i) => (0, i.precompute(input, spans)),
                 Indicator::Numeric(i) if i.is_live() => {
@@ -204,7 +141,6 @@ impl Indicators {
                     continue;
                 }
                 Indicator::Numeric(i) => (2, i.precompute(input)),
-                Indicator::Mode(_) => unreachable!("handled above"),
                 Indicator::LetterSign(i) => (1, i.precompute(input)),
                 Indicator::NoContract(i) => (1, i.precompute(input)),
             };
@@ -216,8 +152,6 @@ impl Indicators {
         PrecomputedIndications {
             translations,
             marks: self.emphases.as_ref().map(|e| e.mark(&chars, spans)),
-            mode_ends,
-            mode_begins,
             from: 0,
             live_numeric,
             in_numeric: false,
@@ -237,21 +171,6 @@ mod tests {
 
     fn rule(s: &str) -> AnchoredRule {
         AnchoredRule::new(RuleParser::new(s).rule().unwrap(), None, 0)
-    }
-
-    #[test]
-    fn find_spans_returns_maximal_matching_runs() {
-        let chars: Vec<char> = "  ab cd  e".chars().collect();
-        assert_eq!(
-            find_spans(&chars, 0, chars.len(), |c| c != ' '),
-            vec![(2, 4), (5, 7), (9, 10)]
-        );
-    }
-
-    #[test]
-    fn find_spans_respects_the_given_range() {
-        let chars: Vec<char> = "aabbaabb".chars().collect();
-        assert_eq!(find_spans(&chars, 2, 6, |c| c == 'b'), vec![(2, 4)]);
     }
 
     #[test]

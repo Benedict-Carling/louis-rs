@@ -15,7 +15,7 @@ use crate::{
         effect::Environment,
         indication::{
             Indicator, Indicators, PrecomputedIndications, computer_braille, emphasis, lettersign,
-            mode, nocontract, numeric,
+            nocontract, numeric,
         },
         match_pattern::{MatchPatterns, MatchPatternsBuilder},
         position_constraints::{
@@ -179,7 +179,6 @@ struct PrimaryTableBuilder {
     match_patterns: MatchPatternsBuilder,
     context_patterns: ContextPatternsBuilder,
     numeric_indicator: numeric::IndicatorBuilder,
-    mode_indicator: mode::IndicatorBuilder,
     lettersign_indicator: lettersign::IndicatorBuilder,
     nocontract_indicator: nocontract::IndicatorBuilder,
     emphasis_indicator: emphasis::IndicatorBuilder,
@@ -247,7 +246,6 @@ impl PrimaryTableBuilder {
             match_patterns: MatchPatternsBuilder::new(),
             context_patterns: ContextPatternsBuilder::new().for_direction(direction),
             numeric_indicator: numeric::IndicatorBuilder::new(),
-            mode_indicator: mode::IndicatorBuilder::new(),
             lettersign_indicator: lettersign::IndicatorBuilder::new(),
             nocontract_indicator: nocontract::IndicatorBuilder::new(),
             emphasis_indicator: emphasis::IndicatorBuilder::new(),
@@ -362,7 +360,8 @@ impl PrimaryTableBuilder {
             .continuation_chars()
             .copied()
             .collect();
-        self.mode_indicator.numeric_mode_chars(numeric_mode_chars);
+        self.emphasis_indicator
+            .numeric_mode_chars(numeric_mode_chars);
         let dont_contract_constrainer = self
             .dont_contract_constrainer
             .build(self.numeric_indicator.runs().clone());
@@ -380,7 +379,6 @@ impl PrimaryTableBuilder {
                 .build(ctx, self.sequences.clone())
                 .map(Indicator::LetterSign),
             self.numeric_indicator.build().map(Indicator::Numeric),
-            self.mode_indicator.build(ctx).map(Indicator::Mode),
         ]
         .into_iter()
         .flatten()
@@ -710,32 +708,32 @@ impl PrimaryTable {
                 }
                 Rule::Modeletter { name, dots, .. } => {
                     builder
-                        .mode_indicator
+                        .emphasis_indicator
                         .modeletter(name, &dots.to_string(), rule);
                 }
                 Rule::Begmodeword { name, dots, .. } => {
                     builder
-                        .mode_indicator
+                        .emphasis_indicator
                         .begmodeword(name, &dots.to_string(), rule);
                 }
                 Rule::Endmodeword { name, dots, .. } => {
                     builder
-                        .mode_indicator
+                        .emphasis_indicator
                         .endmodeword(name, &dots.to_string(), rule);
                 }
                 Rule::Begmode { name, dots } => {
                     builder
-                        .mode_indicator
+                        .emphasis_indicator
                         .begmode(name, &dots.to_string(), rule);
                 }
                 Rule::Endmode { name, dots } => {
                     builder
-                        .mode_indicator
+                        .emphasis_indicator
                         .endmode(name, &dots.to_string(), rule);
                 }
                 Rule::Begmodephrase { name, dots } => {
                     builder
-                        .mode_indicator
+                        .emphasis_indicator
                         .begmodephrase(name, &dots.to_string(), rule);
                 }
                 Rule::Endmodephrase {
@@ -743,12 +741,17 @@ impl PrimaryTable {
                     dots,
                     position,
                 } => {
-                    builder
-                        .mode_indicator
-                        .endmodephrase(name, &dots.to_string(), position, rule);
+                    builder.emphasis_indicator.endmodephrase(
+                        name,
+                        &dots.to_string(),
+                        position,
+                        rule,
+                    );
                 }
                 Rule::Lenmodephrase { name, number } => {
-                    builder.mode_indicator.lenmodephrase(name, *number as usize);
+                    builder
+                        .emphasis_indicator
+                        .lenmodephrase(name, *number as usize);
                 }
                 Rule::Emphclass { name } => {
                     builder.emphasis_indicator.emphclass(name);
@@ -874,7 +877,6 @@ impl PrimaryTable {
                 // like liblouis, a character's own definition wins over its base
                 Rule::Base { derived, .. } if defined_chars.contains(derived) => {}
                 Rule::Base { derived, base, .. } => {
-                    builder.mode_indicator.base(*derived, *base);
                     if let Some(translation) = ctx.character_definitions().get(base).cloned() {
                         builder.insert_character(*derived, &translation, direction, rule);
                     } else {

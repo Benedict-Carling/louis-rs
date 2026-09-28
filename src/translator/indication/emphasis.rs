@@ -66,11 +66,32 @@ impl Rules {
     }
 }
 
-/// An emphasis class, or the capitals mode
+/// The characters a mode (capitals, or a `begmodeword`-family attribute) consults
+#[derive(Debug, Clone, Default)]
+struct ModeChars {
+    /// The characters of the mode's attribute
+    active: HashSet<char>,
+    /// Those and the characters sharing a base with one (liblouis's `isEmphasizable`)
+    emphasizable: HashSet<char>,
+    /// Characters that don't cancel the mode because they share a base with one of it
+    /// (the `linked` check of `resetsEmphMode`)
+    linked: HashSet<char>,
+}
+
+#[derive(Debug, Clone)]
+enum Kind {
+    /// An emphasis class, named as the caller's typeform names it
+    Typeform(String),
+    Capitals,
+    /// Another mode, named by its attribute
+    Mode(String),
+}
+
+/// An emphasis class or a mode (liblouis's `EmphasisClass`)
 #[derive(Debug, Clone)]
 struct Class {
-    /// The typeform class name, or `None` for capitals
-    name: Option<String>,
+    kind: Kind,
+    mode: ModeChars,
     bit: u64,
     rules: Rules,
     emphmodechars: Vec<char>,
@@ -82,15 +103,11 @@ struct Class {
 struct Attributes {
     space: HashSet<char>,
     letter: HashSet<char>,
-    uppercase: HashSet<char>,
     seqdelimiter: HashSet<char>,
     capsmodechars: HashSet<char>,
-    /// Characters that share a base with an uppercase letter (the `linked` list of
-    /// liblouis's `isEmphasizable`)
-    caps_emphasizable: HashSet<char>,
-    /// Characters that don't cancel capitals mode although not letters (the `linked`
-    /// check of `resetsEmphMode`)
-    caps_linked: HashSet<char>,
+    /// The characters that don't cancel a digit mode: digits, litdigits and the numeric
+    /// mode characters
+    numeric: HashSet<char>,
 }
 
 /// Builder for [`Emphases`]
@@ -98,7 +115,9 @@ struct Attributes {
 pub struct IndicatorBuilder {
     classes: Vec<Class>,
     caps: Option<Class>,
+    modes: Vec<Class>,
     capsmodechars: HashSet<char>,
+    numeric_mode_chars: HashSet<char>,
     /// `base` rules as (attribute, derived, base)
     bases: Vec<(String, char, char)>,
 }
@@ -112,7 +131,7 @@ impl IndicatorBuilder {
         if let Some(i) = self
             .classes
             .iter()
-            .position(|c| c.name.as_deref() == Some(name))
+            .position(|c| matches!(&c.kind, Kind::Typeform(n) if n == name))
         {
             return &mut self.classes[i];
         }
@@ -120,7 +139,8 @@ impl IndicatorBuilder {
         // liblouis gives the first three classes a default phrase length
         let len_phrase = if self.classes.len() < 3 { 4 } else { 0 };
         self.classes.push(Class {
-            name: Some(name.to_string()),
+            kind: Kind::Typeform(name.to_string()),
+            mode: ModeChars::default(),
             bit,
             rules: Rules {
                 len_phrase,
@@ -136,13 +156,82 @@ impl IndicatorBuilder {
         &mut self
             .caps
             .get_or_insert_with(|| Class {
-                name: None,
+                kind: Kind::Capitals,
+                mode: ModeChars::default(),
                 bit: CAPS_BIT,
                 rules: Rules::default(),
                 emphmodechars: Vec::new(),
                 noemphchars: Vec::new(),
             })
             .rules
+    }
+
+    fn mode_mut(&mut self, name: &str) -> &mut Rules {
+        if name == "uppercase" {
+            return self.caps_mut();
+        }
+        let i = match self
+            .modes
+            .iter()
+            .position(|c| matches!(&c.kind, Kind::Mode(n) if n == name))
+        {
+            Some(i) => i,
+            None => {
+                let bit = CAPS_BIT >> (1 + self.modes.len()).min(30);
+                self.modes.push(Class {
+                    kind: Kind::Mode(name.to_string()),
+                    mode: ModeChars::default(),
+                    bit,
+                    rules: Rules::default(),
+                    emphmodechars: Vec::new(),
+                    noemphchars: Vec::new(),
+                });
+                self.modes.len() - 1
+            }
+        };
+        &mut self.modes[i].rules
+    }
+
+    pub fn modeletter(&mut self, name: &str, dots: &str, origin: &AnchoredRule) {
+        self.mode_mut(name).letter = Some(make_translation(dots, origin));
+    }
+
+    pub fn begmodeword(&mut self, name: &str, dots: &str, origin: &AnchoredRule) {
+        self.mode_mut(name).begword = Some(make_translation(dots, origin));
+    }
+
+    pub fn endmodeword(&mut self, name: &str, dots: &str, origin: &AnchoredRule) {
+        self.mode_mut(name).endword = Some(make_translation(dots, origin));
+    }
+
+    pub fn begmode(&mut self, name: &str, dots: &str, origin: &AnchoredRule) {
+        self.mode_mut(name).beg = Some(make_translation(dots, origin));
+    }
+
+    pub fn endmode(&mut self, name: &str, dots: &str, origin: &AnchoredRule) {
+        self.mode_mut(name).end = Some(make_translation(dots, origin));
+    }
+
+    pub fn begmodephrase(&mut self, name: &str, dots: &str, origin: &AnchoredRule) {
+        self.mode_mut(name).begphrase = Some(make_translation(dots, origin));
+    }
+
+    pub fn endmodephrase(
+        &mut self,
+        name: &str,
+        dots: &str,
+        position: &Position,
+        origin: &AnchoredRule,
+    ) {
+        self.mode_mut(name).set_endphrase(dots, position, origin);
+    }
+
+    pub fn lenmodephrase(&mut self, name: &str, len: usize) {
+        self.mode_mut(name).len_phrase = len;
+    }
+
+    pub fn numeric_mode_chars(&mut self, chars: impl IntoIterator<Item = char>) {
+        self.numeric_mode_chars.extend(chars);
     }
 
     pub fn emphclass(&mut self, name: &str) {
@@ -237,12 +326,9 @@ impl IndicatorBuilder {
         self.bases.push((attribute.to_string(), derived, base));
     }
 
-    pub fn build(self, ctx: &TableContext) -> Option<Emphases> {
-        if self.classes.is_empty() && self.caps.is_none() {
-            return None;
-        }
-        let class = |c| ctx.character_classes().get(&c).unwrap_or_default();
-        let uppercase = class(CharacterClass::Uppercase);
+    /// liblouis's `isEmphasizable` and the `linked` check of `resetsEmphMode` for a mode
+    /// whose attribute has the characters `active`
+    fn mode_chars(&self, active: HashSet<char>) -> ModeChars {
         let base_of: HashMap<char, (&str, char)> = self
             .bases
             .iter()
@@ -255,42 +341,62 @@ impl IndicatorBuilder {
                 .or_default()
                 .push((attribute.as_str(), *derived));
         }
-        let mut caps_emphasizable = HashSet::new();
-        let mut caps_linked = HashSet::new();
-        let candidates = uppercase
-            .iter()
-            .chain(base_of.keys())
-            .chain(derived_of.keys())
-            .copied()
-            .collect::<HashSet<char>>();
+        let mut emphasizable = active.clone();
+        let mut linked = HashSet::new();
+        let candidates: HashSet<char> = base_of.keys().chain(derived_of.keys()).copied().collect();
         for c in candidates {
             let (mode, head) = match base_of.get(&c) {
                 Some(&(attribute, base)) => (Some(attribute), base),
                 None => (None, c),
             };
-            let linked = derived_of.get(&head).map(Vec::as_slice).unwrap_or_default();
-            if uppercase.contains(&head) || linked.iter().any(|(_, d)| uppercase.contains(d)) {
-                caps_emphasizable.insert(c);
+            let derived = derived_of.get(&head).map(Vec::as_slice).unwrap_or_default();
+            if active.contains(&head) || derived.iter().any(|(_, d)| active.contains(d)) {
+                emphasizable.insert(c);
             }
-            if linked
+            if derived
                 .iter()
-                .any(|&(m, d)| mode.is_none_or(|mode| mode == m) && uppercase.contains(&d))
+                .any(|&(m, d)| mode.is_none_or(|mode| mode == m) && active.contains(&d))
             {
-                caps_linked.insert(c);
+                linked.insert(c);
             }
         }
+        ModeChars {
+            active,
+            emphasizable,
+            linked,
+        }
+    }
+
+    pub fn build(mut self, ctx: &TableContext) -> Option<Emphases> {
+        if self.classes.is_empty() && self.caps.is_none() && self.modes.is_empty() {
+            return None;
+        }
+        let class = |c| ctx.character_classes().get(&c).unwrap_or_default();
+        let uppercase = class(CharacterClass::Uppercase);
+        if let Some(mut caps) = self.caps.take() {
+            caps.mode = self.mode_chars(uppercase);
+            self.caps = Some(caps);
+        }
+        let mut modes = std::mem::take(&mut self.modes);
+        for mode in &mut modes {
+            if let Kind::Mode(name) = &mode.kind {
+                mode.mode = self.mode_chars(class(CharacterClass::from(name.as_str())));
+            }
+        }
+        let mut numeric = self.numeric_mode_chars.clone();
+        numeric.extend(class(CharacterClass::Digit));
+        numeric.extend(class(CharacterClass::Litdigit));
         let attributes = Attributes {
             space: class(CharacterClass::Space),
             letter: class(CharacterClass::Letter),
-            uppercase,
             seqdelimiter: class(CharacterClass::Seqdelimiter),
             capsmodechars: self.capsmodechars,
-            caps_emphasizable,
-            caps_linked,
+            numeric,
         };
         Some(Emphases {
             classes: self.classes,
             caps: self.caps,
+            modes,
             attributes,
         })
     }
@@ -301,17 +407,23 @@ impl IndicatorBuilder {
 pub struct Emphases {
     classes: Vec<Class>,
     caps: Option<Class>,
+    /// The other modes, in the order they were defined
+    modes: Vec<Class>,
     attributes: Attributes,
 }
 
 impl Emphases {
     fn is_caps(class: &Class) -> bool {
-        class.name.is_none()
+        matches!(class.kind, Kind::Capitals)
+    }
+
+    fn is_mode(class: &Class) -> bool {
+        !matches!(class.kind, Kind::Typeform(_))
     }
 
     fn is_emphasizable(&self, c: char, class: &Class) -> bool {
-        if Self::is_caps(class) {
-            self.attributes.caps_emphasizable.contains(&c)
+        if Self::is_mode(class) {
+            class.mode.emphasizable.contains(&c)
         } else if class.noemphchars.is_empty() {
             !self.attributes.space.contains(&c)
         } else {
@@ -321,11 +433,15 @@ impl Emphases {
 
     fn resets_emph_mode(&self, c: char, class: &Class) -> bool {
         let a = &self.attributes;
-        if Self::is_caps(class) {
-            if a.uppercase.contains(&c) || a.caps_linked.contains(&c) {
+        if Self::is_mode(class) {
+            if class.mode.active.contains(&c) || class.mode.linked.contains(&c) {
                 return false;
             }
-            !(a.letter.contains(&c) || a.capsmodechars.contains(&c))
+            match &class.kind {
+                Kind::Capitals => !(a.letter.contains(&c) || a.capsmodechars.contains(&c)),
+                Kind::Mode(name) if name == "digit" => !a.numeric.contains(&c),
+                _ => !a.letter.contains(&c),
+            }
         } else if a.letter.contains(&c) {
             false
         } else if class.emphmodechars.is_empty() {
@@ -339,8 +455,8 @@ impl Emphases {
         if !self.is_emphasizable(c, class) {
             return false;
         }
-        if Self::is_caps(class) {
-            self.attributes.uppercase.contains(&c)
+        if Self::is_mode(class) {
+            class.mode.active.contains(&c)
         } else {
             typeform
         }
@@ -363,9 +479,9 @@ impl Emphases {
             buffer: vec![Info::default(); n + 1],
             words: vec![0; n + 2],
         };
-        for class in self.classes.iter().chain(&self.caps) {
-            let typeform: Vec<bool> = match &class.name {
-                Some(name) => {
+        for class in self.classes.iter().chain(&self.caps).chain(&self.modes) {
+            let typeform: Vec<bool> = match &class.kind {
+                Kind::Typeform(name) => {
                     let mut typeform = vec![false; n];
                     for span in spans.iter().filter(|s| &s.class == name) {
                         for t in typeform
@@ -378,7 +494,7 @@ impl Emphases {
                     }
                     typeform
                 }
-                None => vec![false; n],
+                _ => vec![false; n],
             };
             marker.mark(class, &typeform);
         }
@@ -438,10 +554,12 @@ impl Marker<'_> {
                 self.all_symbols(class);
             }
         }
-        if Emphases::is_caps(class) {
-            let capsletter = rules.letter.is_some();
+        if Emphases::is_mode(class) {
+            // capitals are only marked where liblouis's typebuf has CAPSEMPH, which needs
+            // capsletter
+            let letter = rules.letter.is_some() || !Emphases::is_caps(class);
             for i in 0..self.len() {
-                if !(capsletter && e.attributes.uppercase.contains(&self.chars[i])) {
+                if !(letter && class.mode.active.contains(&self.chars[i])) {
                     self.buffer[i].symbol &= !class.bit;
                 }
             }
@@ -672,7 +790,7 @@ impl Marker<'_> {
     fn passages(&mut self, class: &Class) {
         let v = class.bit;
         let n = self.len();
-        let is_mode = Emphases::is_caps(class);
+        let is_mode = Emphases::is_mode(class);
         let mut in_word = false;
         let mut last_word_end: isize = -1;
         let mut in_emph_word = false;
@@ -996,21 +1114,26 @@ impl Marks<'_> {
         out
     }
 
+    /// The end indicators of capitals and then the other modes
     fn caps_end(&self, at: usize, out: &mut Vec<ResolvedTranslation>) {
-        if let Some(caps) = &self.emphases.caps
-            && self.buffer[at].any() & caps.bit != 0
-        {
-            self.insert_end(at, caps, out);
+        for mode in self.emphases.caps.iter().chain(&self.emphases.modes) {
+            if self.buffer[at].any() & mode.bit != 0 {
+                self.insert_end(at, mode, out);
+            }
         }
     }
 
+    /// The start indicators of the other modes, the last defined first, and then of
+    /// capitals, closest to the word
     fn caps_begin(&self, at: usize, out: &mut Vec<ResolvedTranslation>) {
-        if let Some(caps) = &self.emphases.caps
-            && at < self.buffer.len()
-            && self.buffer[at].any() & caps.bit != 0
-        {
-            self.insert_begin(at, caps, out);
-            self.insert_symbol(at, caps, out);
+        if at >= self.buffer.len() {
+            return;
+        }
+        for mode in self.emphases.modes.iter().rev().chain(&self.emphases.caps) {
+            if self.buffer[at].any() & mode.bit != 0 {
+                self.insert_begin(at, mode, out);
+                self.insert_symbol(at, mode, out);
+            }
         }
     }
 
@@ -1213,6 +1336,24 @@ mod tests {
         assert!(!marks.changes_within(1, 1));
         assert_eq!(marks.caps_begin_at(1)[0].output(), "⠘");
         assert_eq!(marks.caps_end_at(3)[0].output(), "⠠");
+    }
+
+    #[test]
+    fn other_modes_begin_before_capitals() {
+        let mut b = caps_builder();
+        b.begmodeword("foreign", "⠰", &rule("begmodeword foreign 56"));
+        let ctx = TableContext::new(
+            CharacterClasses::new(&[
+                (CharacterClass::Space, &[' ']),
+                (CharacterClass::Letter, &['a', 'b', 'A', 'B']),
+                (CharacterClass::Uppercase, &['A', 'B']),
+                (CharacterClass::from("foreign"), &['a', 'b', 'A', 'B']),
+            ]),
+            CharacterClasses::default(),
+            Default::default(),
+        );
+        let emphases = b.build(&ctx).unwrap();
+        assert_eq!(visit_all(&emphases, "Ab", &[]), vec!["⠰⠨", "", ""]);
     }
 
     #[test]
