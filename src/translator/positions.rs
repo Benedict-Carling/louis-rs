@@ -1,6 +1,9 @@
 //! Mapping between input positions and output positions of a translation
 
-use crate::{parser::Direction, translator::ResolvedTranslation};
+use crate::{
+    parser::{Direction, Position, Rule},
+    translator::ResolvedTranslation,
+};
 
 /// The position on the other side of every char of one side of a stage: going forward, the
 /// input position of every output char, going backward the output position of every input
@@ -8,11 +11,18 @@ use crate::{parser::Direction, translator::ResolvedTranslation};
 /// and a last entry past the end points past the end, as in liblouis's `posMapping`.
 fn stage_mapping(steps: &[ResolvedTranslation], direction: Direction) -> Vec<usize> {
     let mut mapping = Vec::new();
-    let (mut input_offset, mut output_offset) = (0, 0);
+    let (mut input_offset, mut output_offset) = (0usize, 0usize);
     for step in steps {
         let (input_len, output_len) = (step.input().chars().count(), step.output().chars().count());
         match direction {
-            Direction::Forward => mapping.extend(std::iter::repeat_n(input_offset, output_len)),
+            Direction::Forward => {
+                let at = if input_len == 0 && step.rule().is_some_and(ends_after) {
+                    input_offset.saturating_sub(1)
+                } else {
+                    input_offset
+                };
+                mapping.extend(std::iter::repeat_n(at, output_len))
+            }
             Direction::Backward => mapping.extend(std::iter::repeat_n(output_offset, input_len)),
         }
         input_offset += input_len;
@@ -23,6 +33,25 @@ fn stage_mapping(steps: &[ResolvedTranslation], direction: Direction) -> Vec<usi
         Direction::Backward => output_offset,
     });
     mapping
+}
+
+/// An indicator liblouis puts out with the character before it (`insertEmphasisEnd`)
+fn ends_after(rule: &Rule) -> bool {
+    matches!(
+        rule,
+        Rule::Endemph { .. }
+            | Rule::Endemphword { .. }
+            | Rule::Endcaps { .. }
+            | Rule::Endcapsword { .. }
+            | Rule::Endemphphrase {
+                position: Position::After,
+                ..
+            }
+            | Rule::Endcapsphrase {
+                position: Position::After,
+                ..
+            }
+    )
 }
 
 /// The positions on the `from` side of the chars on the other side, derived from `mapping` (the
@@ -165,6 +194,20 @@ mod tests {
             .iter()
             .map(|(input, output)| translation(input, output))
             .collect()
+    }
+
+    #[test]
+    fn an_end_indicator_goes_with_the_character_before_it() {
+        let end = crate::parser::RuleParser::new("endemphword italic 6")
+            .rule()
+            .unwrap();
+        let stage = vec![
+            translation("a", "⠁"),
+            ResolvedTranslation::new("", "⠠", 0, TranslationStage::Main, Some(end.into())),
+            translation("b", "⠃"),
+        ];
+        let map = forward_map(2, &[stage]);
+        assert_eq!(map.input_positions(), [0, 0, 1]);
     }
 
     #[test]
