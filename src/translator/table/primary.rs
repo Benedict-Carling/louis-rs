@@ -1810,6 +1810,7 @@ impl PrimaryTable {
         let mut chars = input.chars();
         let mut prev: Option<char> = None;
         let mut seen: HashSet<TranslationSubset> = HashSet::default();
+        let mut seen_at: usize = 0;
         let mut char_pos: usize = 0;
         // A zero-length candidate (e.g. a zero-width `context`/`match` action) re-enters
         // the loop at the same char_pos, where liblouis inserts the capital start
@@ -1954,6 +1955,11 @@ impl PrimaryTable {
                 }
             }
             context_due = true;
+            // what applied without moving on is only remembered at its own position
+            if seen_at != char_pos {
+                seen.clear();
+                seen_at = char_pos;
+            }
             let revisit = last_indications_pos == Some(char_pos);
             if !revisit {
                 indications_from = translations.len();
@@ -2732,6 +2738,21 @@ mod tests {
     use search_path::SearchPath;
 
     use crate::parser::{RuleParser, expand_includes};
+
+    #[test]
+    fn zero_length_context_rule_applies_again_further_on() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("attribute foreign a"),
+            parse_rule("context []%foreign @5"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("aba"), "⠐⠁⠃⠐⠁");
+    }
 
     #[test]
     fn contraction_letsign_only_where_the_contraction_is_chosen() {
