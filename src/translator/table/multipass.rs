@@ -69,8 +69,6 @@ impl MultipassTable {
     /// most literal characters applies; the characters before its replacement are copied
     pub fn trace(&self, input: &str) -> Vec<ResolvedTranslation> {
         let mut translations: Vec<ResolvedTranslation> = Vec::new();
-        // rules found with a leading lookback, and how far ahead their test starts
-        let mut looking_back: Vec<(usize, ResolvedTranslation)> = Vec::new();
         // the rule that applies once the characters before its replacement are copied
         let mut forced: Option<ResolvedTranslation> = None;
         let mut env = Environment::new();
@@ -81,21 +79,11 @@ impl MultipassTable {
 
         loop {
             if forced.is_none() {
-                let at_start = chars.as_str().len() == input.len();
-                let (mut candidates, later): (Vec<_>, Vec<_>) = self
-                    .patterns
-                    .find(chars.as_str(), &env, at_start)
-                    .into_iter()
-                    .map(|t| (leading_lookback(&t).min(t.offset()), t))
-                    .partition(|(start, _)| *start == 0);
-                looking_back.extend(later);
-                let (due, later): (Vec<_>, Vec<_>) =
-                    looking_back.drain(..).partition(|(start, _)| *start == 0);
-                looking_back = later;
-                candidates.extend(due);
+                let before = &input[..input.len() - chars.as_str().len()];
+                let candidates = self.patterns.find(before, chars.as_str(), &env);
                 copied = false;
                 if advanced {
-                    forced = candidates.into_iter().map(|(_, t)| t).max_by_key(|t| {
+                    forced = candidates.into_iter().max_by_key(|t| {
                         let (empty, length, weight) = t.rank();
                         let cells = t.rule().map_or(0, backward::pass_rule_cells);
                         (cells, empty, length, weight - variable_tests(t))
@@ -103,7 +91,7 @@ impl MultipassTable {
                 }
             }
             advanced = true;
-            let step = match forced.take_if(|t| t.offset() == 0) {
+            match forced.take_if(|t| t.offset() == 0) {
                 Some(t) => {
                     // a rule whose test started at an earlier position has advanced
                     if t.length() == 0 && !copied {
@@ -115,7 +103,6 @@ impl MultipassTable {
                         env.apply(effect);
                     }
                     translations.push(t.clone());
-                    t.length()
                 }
                 None => match chars.next() {
                     Some(next_char) => {
@@ -129,16 +116,10 @@ impl MultipassTable {
                         ));
                         forced = forced.map(|t| t.decrement_offset(1));
                         copied = true;
-                        1
                     }
                     None => break,
                 },
-            };
-            looking_back = looking_back
-                .into_iter()
-                .filter(|(start, _)| *start >= step)
-                .map(|(start, t)| (start - step, t.decrement_offset(step)))
-                .collect();
+            }
         }
         translations
     }
@@ -158,26 +139,6 @@ fn variable_tests(translation: &ResolvedTranslation) -> usize {
             .iter()
             .filter(|t| matches!(t, TestInstruction::Variable { .. }))
             .count(),
-        _ => 0,
-    }
-}
-
-/// How far back the test's leading lookback reaches before the rule's position
-fn leading_lookback(translation: &ResolvedTranslation) -> usize {
-    match translation.rule() {
-        Some(
-            Rule::Correct { test, .. }
-            | Rule::Pass2 { test, .. }
-            | Rule::Pass3 { test, .. }
-            | Rule::Pass4 { test, .. },
-        ) => test
-            .tests()
-            .iter()
-            .map_while(|t| match t {
-                TestInstruction::Lookback { len } => Some(*len as usize),
-                _ => None,
-            })
-            .sum(),
         _ => 0,
     }
 }
@@ -369,5 +330,46 @@ mod tests {
                 .unwrap();
         assert_eq!(transform.translate("⠁⠁⠇⠁⠁⠸⠁⠁"), "⠁⠁⠇⠠⠠⠸⠁⠁");
         assert_eq!(transform.translate("🐂"), "🐂");
+    }
+
+    #[test]
+    fn one_rule_per_position() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("digit 5 15"),
+            parse_rule("correct [\"a\"]$d \"x\""),
+            parse_rule("correct $l[]$d \"y\""),
+        ];
+        let ctx = TableContext::compile(&rules).unwrap();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Pre, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("a5"), "x5");
+    }
+
+    #[test]
+    fn rules_starting_with_more_literal_cells_are_tried_first() {
+        let rules = [
+            parse_rule("noback pass2 @1-2[@3]@4 @5"),
+            parse_rule("noback pass2 @1[@3]@4 @6"),
+        ];
+        let ctx = TableContext::default();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Post1, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("⠁⠂⠄⠈"), "⠁⠂⠐⠈");
+    }
+
+    #[test]
+    fn a_rule_whose_test_began_earlier_comes_first() {
+        let rules = [
+            parse_rule("noback pass2 @1[@2] @4"),
+            parse_rule("noback pass2 [@2-2] @5"),
+        ];
+        let ctx = TableContext::default();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Post1, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("⠁⠂⠂"), "⠁⠈⠂");
     }
 }
