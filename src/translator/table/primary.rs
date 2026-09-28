@@ -4238,6 +4238,24 @@ mod tests {
         assert_eq!(table.translate("⠁⠨⠁"), "apa");
     }
 
+    /// A pass variable nothing has set yet reads 0
+    #[test]
+    fn backward_context_rule_tests_an_unset_variable_as_0() {
+        let rules: Vec<_> = ["digit 3 25", "nofor context #1=0@25 \"4\""]
+            .iter()
+            .map(|r| parse_rule(r))
+            .collect();
+        let context = TableContext::compile(&rules).unwrap();
+        let table = PrimaryTable::compile(
+            &rules,
+            Direction::Backward,
+            TranslationStage::Main,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(table.translate("⠒"), "4");
+    }
+
     /// liblouis tries no context rule where one has just applied without moving on
     #[test]
     fn context_rules_do_not_stack_at_one_position() {
