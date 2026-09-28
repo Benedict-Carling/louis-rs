@@ -10,10 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    parser::{
-        AnchoredRule, CharacterClass, CharacterClasses, Quantifier, Rule, TestInstruction,
-        WithClass,
-    },
+    parser::{AnchoredRule, CharacterClass, CharacterClasses, Rule, WithClass},
     translator::{ResolvedTranslation, table::TableContext},
 };
 
@@ -124,56 +121,10 @@ fn with_classes(rule: &Rule) -> &[WithClass] {
     }
 }
 
-/// How many characters or cells a `context` rule's test starts with literally, as
-/// liblouis's `passFindCharacters` counts them. liblouis files a `context` rule that has
-/// some among the other rules for them.
-fn leading_cells(tests: &[TestInstruction], lookback: &mut usize) -> Option<usize> {
-    for test in tests {
-        match test {
-            TestInstruction::String { s } => {
-                let count = s.chars().count();
-                if count > *lookback {
-                    return Some(count - *lookback);
-                }
-                *lookback -= count;
-            }
-            TestInstruction::Dots { dots } => {
-                let count = dots.len();
-                if count > *lookback {
-                    return Some(count - *lookback);
-                }
-                *lookback -= count;
-            }
-            TestInstruction::Attributes { quantifier, .. }
-            | TestInstruction::Class { quantifier, .. } => {
-                let count = match quantifier {
-                    None => 1,
-                    Some(Quantifier::Number(n)) => *n as usize,
-                    _ => return Some(0),
-                };
-                if count > *lookback {
-                    return Some(0);
-                }
-                *lookback -= count;
-            }
-            TestInstruction::Lookback { len } => *lookback += *len as usize,
-            TestInstruction::Replace { tests } => {
-                if let Some(count) = leading_cells(tests, lookback) {
-                    return Some(count);
-                }
-            }
-            TestInstruction::Variable { .. }
-            | TestInstruction::Negate { .. }
-            | TestInstruction::AtBeginning
-            | TestInstruction::AtEnd => {}
-        }
-    }
-    None
-}
-
+/// How many characters or cells liblouis files a `context` rule under among the other rules
 pub fn context_cells(rule: &Rule) -> usize {
     match rule {
-        Rule::Context { test, .. } => leading_cells(test.tests(), &mut 0).unwrap_or(0),
+        Rule::Context { test, .. } => test.leading_chars(),
         _ => 0,
     }
 }
@@ -186,7 +137,7 @@ pub fn pass_rule_cells(rule: &Rule) -> usize {
         | Rule::Context { test, .. }
         | Rule::Pass2 { test, .. }
         | Rule::Pass3 { test, .. }
-        | Rule::Pass4 { test, .. } => leading_cells(test.tests(), &mut 0).unwrap_or(0),
+        | Rule::Pass4 { test, .. } => test.leading_chars(),
         _ => 0,
     }
 }

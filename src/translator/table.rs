@@ -3,9 +3,13 @@ pub mod display;
 pub mod multipass;
 pub mod primary;
 
+use std::sync::Arc;
+
 use crate::{
     parser::{AnchoredRule, CharacterClass, CharacterClasses, Rule},
-    translator::{CharacterDefinition, TranslationError, swap::SwapClasses},
+    translator::{
+        CharacterDefinition, TranslationError, swap::SwapClasses, translation::CharacterDots,
+    },
 };
 
 #[derive(Debug, Default)]
@@ -19,6 +23,7 @@ pub struct TableContext {
     direction_dots_classes: Option<CharacterClasses>,
     swap_classes: SwapClasses,
     seq_after_patterns: Vec<String>,
+    character_dots: Arc<CharacterDots>,
 }
 
 impl TableContext {
@@ -36,6 +41,7 @@ impl TableContext {
             seq_after_patterns: Vec::new(),
             direction_character_classes: None,
             direction_dots_classes: None,
+            character_dots: Arc::default(),
         }
     }
 
@@ -53,6 +59,15 @@ impl TableContext {
 
     pub fn swap_classes(&self) -> &SwapClasses {
         &self.swap_classes
+    }
+
+    pub fn character_dots(&self) -> &Arc<CharacterDots> {
+        &self.character_dots
+    }
+
+    /// Each character's dots by the rule liblouis takes as its definition
+    pub fn definitions(&self) -> &CharacterDefinition {
+        self.character_dots.definitions()
     }
 
     /// This context with the character and dots classes of `other`
@@ -88,8 +103,7 @@ impl TableContext {
         let mut dots_classes = CharacterClasses::default();
         let mut swap_classes = SwapClasses::default();
         let mut seq_after_patterns = Vec::new();
-        // liblouis names the first four classes a table defines w, x, y and z
-        let mut user_classes: Vec<CharacterClass> = Vec::new();
+        let mut undefined = None;
 
         // First pass: everything that later rules need to *look up*. These include
         // character definitions (`space`, `letter`, `digit`, …), because `Rule::Base` and
@@ -220,13 +234,6 @@ impl TableContext {
                 }
                 Rule::Attribute { name, chars } | Rule::Class { name, chars } => {
                     let class = CharacterClass::from(name.as_str());
-                    let numbered = name.len() == 1 && name.chars().all(|c| c.is_ascii_digit());
-                    if matches!(class, CharacterClass::UserDefined(_))
-                        && !numbered
-                        && !user_classes.contains(&class)
-                    {
-                        user_classes.push(class.clone());
-                    }
                     for c in chars.chars() {
                         character_classes.insert(class.clone(), c);
                         dots_classes.insert_associated_dot(
@@ -269,6 +276,7 @@ impl TableContext {
                 Rule::Seqafterpattern { chars } => {
                     seq_after_patterns.push(chars.clone());
                 }
+                Rule::Undefined { dots } => undefined = Some(dots.to_string()),
                 Rule::Swapcc {
                     name,
                     chars,
@@ -322,16 +330,17 @@ impl TableContext {
                 _ => (),
             }
         }
-        for (order, class) in (1..=4).zip(user_classes) {
-            let by_order = CharacterClass::by_order(order);
+        for (n, class) in user_classes(rules).into_iter().take(4).enumerate() {
+            let ordinal = CharacterClass::Ordinal(n as u8 + 1);
             for c in character_classes.get(&class).unwrap_or_default() {
-                character_classes.insert(by_order.clone(), c);
+                character_classes.insert(ordinal.clone(), c);
             }
             for c in dots_classes.get(&class).unwrap_or_default() {
-                dots_classes.insert(by_order.clone(), c);
+                dots_classes.insert(ordinal.clone(), c);
             }
         }
         Ok(TableContext {
+            character_dots: Arc::new(CharacterDots::new(definition_rules(rules), undefined)),
             character_definitions,
             character_classes,
             dots_classes,
@@ -341,6 +350,93 @@ impl TableContext {
             direction_dots_classes: None,
         })
     }
+}
+
+/// The dots of each character by the rule liblouis takes as its definition: the first of its
+/// character definition opcodes, of which `litdigit` is none, else its base's
+fn definition_rules(rules: &[AnchoredRule]) -> CharacterDefinition {
+    let mut definitions = CharacterDefinition::new();
+    for rule in rules {
+        match &rule.rule {
+            Rule::Space {
+                character, dots, ..
+            }
+            | Rule::Punctuation {
+                character, dots, ..
+            }
+            | Rule::Digit {
+                character, dots, ..
+            }
+            | Rule::Letter {
+                character, dots, ..
+            }
+            | Rule::Lowercase {
+                character, dots, ..
+            }
+            | Rule::Uppercase {
+                character, dots, ..
+            }
+            | Rule::Sign {
+                character, dots, ..
+            }
+            | Rule::Math {
+                character, dots, ..
+            } if definitions.get(character).is_none() => {
+                definitions.insert(*character, &dots.to_string());
+            }
+            _ => (),
+        }
+    }
+    for rule in rules {
+        if let Rule::Base { derived, base, .. } = &rule.rule
+            && definitions.get(derived).is_none()
+            && let Some(dots) = definitions.get(base).cloned()
+        {
+            definitions.insert(*derived, &dots);
+        }
+    }
+    definitions
+}
+
+/// The classes a table defines beyond liblouis' predefined ones, in the order liblouis
+/// allocates their attributes
+fn user_classes(rules: &[AnchoredRule]) -> Vec<CharacterClass> {
+    let mut classes: Vec<CharacterClass> = Vec::new();
+    for rule in rules {
+        let name = match &rule.rule {
+            Rule::Attribute { name, .. } if !name.starts_with(|c: char| c.is_ascii_digit()) => name,
+            Rule::Class { name, .. }
+            | Rule::Base { name, .. }
+            | Rule::Modeletter { name, .. }
+            | Rule::Begmodeword { name, .. }
+            | Rule::Endmodeword { name, .. }
+            | Rule::Begmode { name, .. }
+            | Rule::Endmode { name, .. }
+            | Rule::Begmodephrase { name, .. }
+            | Rule::Endmodephrase { name, .. }
+            | Rule::Lenmodephrase { name, .. } => name,
+            _ => continue,
+        };
+        if matches!(
+            name.as_str(),
+            "space"
+                | "letter"
+                | "digit"
+                | "punctuation"
+                | "uppercase"
+                | "lowercase"
+                | "math"
+                | "sign"
+                | "litdigit"
+        ) {
+            continue;
+        }
+        let class = CharacterClass::from(name.as_str());
+        if !classes.contains(&class) {
+            classes.push(class);
+        }
+    }
+    classes
 }
 
 #[cfg(test)]
@@ -353,6 +449,32 @@ mod tests {
 
     fn parse_rule(source: &str) -> AnchoredRule {
         RuleParser::new(source).rule().unwrap().into()
+    }
+
+    #[test]
+    fn ordinal_classes() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("attribute 1 a"),
+            parse_rule("attribute letter b"),
+            parse_rule("attribute foo a"),
+            parse_rule("base uppercase A a"),
+            parse_rule("attribute bar b"),
+            parse_rule("attribute foo c"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        assert_eq!(
+            context.character_classes.get(&CharacterClass::Ordinal(1)),
+            Some(HashSet::from(['a', 'c']))
+        );
+        assert_eq!(
+            context.character_classes.get(&CharacterClass::Ordinal(2)),
+            Some(HashSet::from(['b']))
+        );
+        assert_eq!(
+            context.character_classes.get(&CharacterClass::Ordinal(3)),
+            None
+        );
     }
 
     #[test]

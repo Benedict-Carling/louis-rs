@@ -32,14 +32,8 @@ pub enum CharacterClass {
     Seqbeforechars,
     Seqafterchars,
     UserDefined(String),
-}
-
-impl CharacterClass {
-    /// The `n`th class a table defines, which multipass tests call `w`, `x`, `y` or `z`.
-    pub fn by_order(n: u8) -> Self {
-        // a class name read from a table cannot contain a NUL
-        CharacterClass::UserDefined(format!("\0{n}"))
-    }
+    /// The `n`th user-defined class of a table, which `$w`, `$x`, `$y` and `$z` test for
+    Ordinal(u8),
 }
 
 impl From<&str> for CharacterClass {

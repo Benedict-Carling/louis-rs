@@ -56,16 +56,20 @@ impl PositionConstraints {
         Self(Vec::new())
     }
 
-    pub fn dont_contract(&mut self, range: std::ops::Range<usize>) {
-        for constraints in &mut self.0[range] {
-            constraints.insert(Constraint::DontContract);
-        }
-    }
-
     pub fn dont_contract_at(&self, pos: usize) -> bool {
         self.0
             .get(pos)
             .is_some_and(|f| f.contains(Constraint::DontContract))
+    }
+
+    /// Take the contractions away from `start` up to and including the next reset character
+    pub fn dont_contract_from(&mut self, start: usize, reset: impl Fn(char) -> bool, input: &str) {
+        for (constraints, c) in self.0.iter_mut().zip(input.chars()).skip(start) {
+            constraints.insert(Constraint::DontContract);
+            if reset(c) {
+                break;
+            }
+        }
     }
 
     /// Translate `range` in computer braille, as liblouis's `compbrlAtCursor` does for the
@@ -249,10 +253,10 @@ impl PunctuationConstrainer {
                     }
                 }
             }
-            // postpunc: the mirror image, scanning backward from just before this
-            // position.
+            // postpunc: the mirror image, scanning backward from this position, which
+            // may itself be a letter too
             if pos == n - 1 || !self.letter_chars.contains(&chars[pos + 1]) {
-                for k in (0..pos).rev() {
+                for k in (0..=pos).rev() {
                     if self.letter_or_digit_chars.contains(&chars[k]) {
                         constraints[pos].insert(Constraint::PostpuncOk);
                         break;
@@ -565,5 +569,17 @@ mod tests {
         let c = constrainers.precompute("hello", &spans);
         assert_eq!(use_comp6(&c), vec![false, true, true, true, false]);
         assert_eq!(dont_contract(&c), vec![false, false, false, false, false]);
+    }
+
+    #[test]
+    fn postpunc_counts_its_own_letter_attribute() {
+        let constrainer = PunctuationConstrainer {
+            letter_chars: HashSet::from([':']),
+            letter_or_digit_chars: HashSet::from([':']),
+            space_chars: HashSet::from([' ']),
+        };
+        let constrainers = Constrainers::new(vec![Constrainer::Punctuation(constrainer)]);
+        let c = constrainers.precompute(" :", &[]);
+        assert!(c.postpunc_ok_at(1));
     }
 }
