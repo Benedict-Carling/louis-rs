@@ -20,6 +20,20 @@ impl Effect {
             kind: EffectKind::Set(value),
         }
     }
+
+    pub fn increment(slot: u8) -> Self {
+        Effect {
+            slot,
+            kind: EffectKind::Increment,
+        }
+    }
+
+    pub fn decrement(slot: u8) -> Self {
+        Effect {
+            slot,
+            kind: EffectKind::Decrement,
+        }
+    }
 }
 
 pub struct Environment(HashMap<u8, u8>);

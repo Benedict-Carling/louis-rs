@@ -17,6 +17,16 @@ impl Swapper {
         ))
     }
 
+    /// Whether the mapping covers `c`
+    pub fn contains(&self, c: char) -> bool {
+        self.0.contains_key(&c)
+    }
+
+    /// What `c` is swapped for
+    pub fn replacement(&self, c: char) -> Option<&str> {
+        self.0.get(&c).map(String::as_str)
+    }
+
     /// Swap the characters in the `input` according to the mapping defined in this Swapper.
     /// Like liblouis' `swapReplace`, characters the mapping doesn't cover are dropped.
     pub fn swap(&self, input: &str) -> String {

@@ -56,7 +56,9 @@ impl Test {
                     TestInstruction::Variable { .. }
                     | TestInstruction::AtBeginning
                     | TestInstruction::AtEnd => continue,
-                    TestInstruction::Negate { .. } => return Some(0),
+                    TestInstruction::Negate { .. }
+                    | TestInstruction::GroupStart { .. }
+                    | TestInstruction::GroupEnd { .. } => return Some(0),
                 };
                 if count > *lookback {
                     return Some(count - *lookback);
@@ -109,6 +111,7 @@ fn fixed_width(test: &TestInstruction) -> Option<usize> {
         TestInstruction::Variable { .. }
         | TestInstruction::AtBeginning
         | TestInstruction::AtEnd => Some(0),
+        TestInstruction::GroupStart { .. } | TestInstruction::GroupEnd { .. } => Some(1),
         TestInstruction::Lookback { .. } | TestInstruction::Replace { .. } => None,
     }
 }
@@ -238,6 +241,14 @@ pub enum TestInstruction {
     /// `~` (tilde): true only when there is no more input left, i.e. the match has reached the
     /// true end of the original string being translated.
     AtEnd,
+    /// `{name`: the opening character of the `grouping` rule called `name`
+    GroupStart {
+        name: String,
+    },
+    /// `}name`: the closing character of the `grouping` rule called `name`
+    GroupEnd {
+        name: String,
+    },
 }
 
 impl IsLiteral for TestInstruction {
@@ -269,7 +280,10 @@ fn is_attribute(c: &char) -> bool {
 }
 
 fn is_test(c: &char) -> bool {
-    matches!(c, '_' | '%' | '@' | '"' | '$' | '[' | '#' | '!' | '`' | '~')
+    matches!(
+        c,
+        '_' | '%' | '@' | '"' | '$' | '[' | '#' | '!' | '`' | '~' | '{' | '}'
+    )
 }
 
 fn is_class_digit(c: &char) -> bool {
@@ -424,18 +438,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn unescape_unicode(&mut self, len: usize) -> Result<char, ParseError> {
-        let mut s = String::new();
-        for _ in 0..len {
-            match self.chars.next() {
-                Some(c) => s.push(c),
-                None => return Err(ParseError::InvalidEscapeSequence { found: None }),
-            }
-        }
-        u32::from_str_radix(&s, 16)
-            .ok()
-            .and_then(char::from_u32)
-            .ok_or(ParseError::InvalidEscapeSequence { found: None })
+    fn unescape_unicode(&mut self, len: u8) -> Result<char, ParseError> {
+        crate::parser::unescape_unicode(&mut self.chars, len)
+            .map_err(|_| ParseError::InvalidEscapeSequence { found: None })
     }
 
     fn string(&mut self) -> Result<TestInstruction, ParseError> {
@@ -552,6 +557,26 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn name(&mut self) -> Result<String, ParseError> {
+        let mut name = String::new();
+        while let Some(c) = self.chars.next_if(char::is_ascii_alphabetic) {
+            name.push(c);
+        }
+        if name.is_empty() {
+            Err(ParseError::InvalidClass)
+        } else {
+            Ok(name)
+        }
+    }
+
+    fn group(&mut self) -> Result<TestInstruction, ParseError> {
+        match self.chars.next() {
+            Some('{') => Ok(TestInstruction::GroupStart { name: self.name()? }),
+            Some('}') => Ok(TestInstruction::GroupEnd { name: self.name()? }),
+            c => Err(ParseError::InvalidTest { found: c }),
+        }
+    }
+
     fn at_beginning(&mut self) -> Result<TestInstruction, ParseError> {
         self.consume('`')?;
         Ok(TestInstruction::AtBeginning)
@@ -574,6 +599,7 @@ impl<'a> Parser<'a> {
             Some('!') => Ok(self.negate()?),
             Some('`') => Ok(self.at_beginning()?),
             Some('~') => Ok(self.at_end()?),
+            Some('{' | '}') => Ok(self.group()?),
             Some(c) => Err(ParseError::InvalidTest { found: Some(*c) }),
             _ => Err(ParseError::InvalidTest { found: None }),
         }
@@ -701,6 +727,8 @@ mod display {
                     }
                     Ok(())
                 }
+                TestInstruction::GroupStart { name } => write!(f, "{{{}", name),
+                TestInstruction::GroupEnd { name } => write!(f, "}}{}", name),
                 TestInstruction::Negate { test } => {
                     write!(f, "!{}", test)
                 }
@@ -850,6 +878,10 @@ mod tests {
         assert_eq!(
             Parser::new(r#""a\\b""#).string(),
             Ok(TestInstruction::String { s: "a\\b".into() })
+        );
+        assert_eq!(
+            Parser::new(r#""\xd83d\xde02""#).string(),
+            Ok(TestInstruction::String { s: "😂".into() })
         );
     }
 

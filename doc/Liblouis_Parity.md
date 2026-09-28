@@ -149,44 +149,34 @@ Two cross-cutting items have no single file behind them:
   liblouis's order; and `itsANumber` and `noContractMode` are state set by the rules
   applied, as are capitalization's `nextUpper`/`allUpper`/`allUpperPhrase` and the emphasis
   of the text. *(M)*
-- **Engine debt.** Regexp negation of concatenation and alternation is wrong
-  (`!(e1e2)` ≠ `(!e1!e2)`); `Attribute::ByOrder` and `Any` are no-ops in
-  `match_pattern.rs` and all three are no-ops in `context_pattern.rs`; the
-  `syllable` opcode's cross-boundary restriction is unimplemented. A `_N` is honoured
-  only at the start of a test (matched from N characters back); elsewhere it is
-  dropped. *(M)*
+- **Engine debt.** `correct`, `pass2`–`pass4` and forward `context` rules run on a port
+  of liblouis's pass engine (`src/translator/pass.rs`): tests are programs run left to
+  right without backtracking, rules are tried by their leading literal characters.
+  Where liblouis then falls back on definition order, the rule that moves on further,
+  then the one that looked at more input, then at more conditions, wins; exact ties are
+  table bugs (see the ADR). Backward `context` rules with a leading literal still go
+  through the pattern engine, where regexp negation of concatenation and alternation is
+  wrong (`!(e1e2)` ≠ `(!e1!e2)`) and grouping never matches; `omit` and `;` ignore a
+  grouping, and the `syllable` opcode's cross-boundary restriction is unimplemented. *(M)*
 
-## Forty-four blocks that never run
+## Four blocks that never run
 
 A YAML file is a sequence of blocks, each with its own table. A block whose table
 won't load is reported on stderr and skipped, and the rest of the file still runs.
-Forty-four blocks across thirteen files are skipped this way, so those tests report
-neither passes nor failures — the one genuine unknown in this document, and the
-cheapest work in it.
+Tables are looked up in the YAML file's directory first, as `lou_checkyaml` changes
+into it, and a metadata query takes the table `lou_findTable` scores best. Four blocks
+are still skipped:
 
-| Reason                                    | Blocks | What it needs                                                                                                                                                                                           | Size |
-|-------------------------------------------|-------:|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------|
-| `multipass-vs-match_common.uti` not found |     25 | The include sits next to the YAML file rather than on `LOUIS_TABLE_PATH`. One missing fixture takes out every block of `multipass-vs-match.yaml`. | S    |
-| Parser gaps                               |      6 | An `InvalidAction` and an `EmptyTest` in each of `multipass-forward.yaml` and `multipass-backward.yaml`, plus an `OpcodeExpected` and a surrogate-pair escape.                                          | S    |
-| Ambiguous metadata queries                |      9 | `language=grc,region=en` and `language=de,grade=0` match two tables and `system=cmn-traditional` three. `lou_findTable` scores its candidates and always lands on one; we intersect and insist on exactly one.                  | M    |
-| Hyphenation dictionaries                  |      2 | `hyph_en_US.dic` rejected for its ISO-8859-1 encoding; `hyphenation.dic` not found.                                                                                                                     | S    |
-| `macro.utb` not found                     |      1 | Deliberate non-goal.                                                                                                                                                                                    | —    |
-| A query matching no table at all          |      1 | `language=grc,region=es` finds nothing on the search path. Possibly a bug in the spec rather than in us.                                                                                                | S    |
+| Reason                          | Blocks | What it needs                                                                                                                                                                  | Size |
+|---------------------------------|-------:|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------|
+| A tied metadata query           |      3 | `language=grc,region=en` scores `grc-international-en.utb` and `grc-international-en-composed.utb` equally; `lou_findTable` takes whichever the directory lists first.  | —    |
+| `macro` opcode                  |      1 | Deliberate non-goal; the reference build cannot compile `macro.utb` either.                                                                                                    | —    |
 
-Nine files report zero tests. Seven because every one of their blocks is skipped for
-a reason above: `multipass-vs-match.yaml`, `macro.yaml`, `grc-international-es.yaml`,
-`ja-kantenji.yaml`, `face-with-tears-of-joy.yaml`, `hyphenation.yaml` and
-`hyphenation_nocross_harness.yaml`. `no_8dot_harness.yaml` has no tests left upstream;
-they moved to `no.yaml`.
+The `hyphenate` and `hyphenateBraille` test modes run as `lou_hyphenate` does. Five of
+`hu-hu-g1-hyph_harness.yaml`'s tests fail with the output liblouis gives too: its
+checker prints hyphenation mismatches without counting them.
 
-The last is a separate problem: the `hyphenate` and `hyphenateBraille` test modes fall
-through a catch-all arm in `src/test.rs` and silently report nothing at all, and
-`hu-hu-g1-hyph_harness.yaml` consists only of such tests. `issue-332.yaml` has its
-`hyphenate` block skipped the same way while its remaining 19 tests all fail. *(S)*
-
-The `display` test mode runs. Of `de-eurobrl6.yaml`'s three blocks, two are held back
-by the ambiguous `{language: de, grade: 0}` query above; with the queries pinned to
-`de-g0.utb`, `de-g1.ctb` and `de-g2.ctb`, all 16 of its assertions pass.
+The `display` test mode runs, and all 16 assertions of `de-eurobrl6.yaml` pass.
 
 ## Missing API surface
 
@@ -202,12 +192,8 @@ by the ambiguous `{language: de, grade: 0}` query above; with the queries pinned
 
 Good entry points, roughly easiest first:
 
-1. **Wake up the 44 blocks that don't run.** Several independent small fixes,
-   listed above, and nobody knows what those tests will report. *(S each)*
-2. **The three parser gaps.** Small, concrete, and each has a failing file to check
-   against. *(S)*
-3. **Expose the four missing entry points.** Mechanical. *(S each)*
-4. **Survey a failure cluster.** Every row in the table above now names a cause, so
+1. **Expose the four missing entry points.** Mechanical. *(S each)*
+2. **Survey a failure cluster.** Every row in the table above now names a cause, so
    what's left is the ~2 500 failures spread across roughly 100 smaller files, and
    the residue of the two clusters already surveyed. Reading failure output rather
    than deep engine work — and each of the three clusters that got this treatment

@@ -119,6 +119,10 @@ impl Regexp {
             }
             TestInstruction::AtBeginning => Regexp::StartAnchor,
             TestInstruction::AtEnd => Regexp::EndAnchor,
+            // grouping is only implemented in the multipass engine, so such a rule never fires
+            TestInstruction::GroupStart { .. } | TestInstruction::GroupEnd { .. } => {
+                Regexp::CharacterClass(HashSet::new())
+            }
         }
     }
 
@@ -266,6 +270,9 @@ impl TranslationTarget {
             ActionInstruction::Assignment { .. }
             | ActionInstruction::Increment { .. }
             | ActionInstruction::Decrement { .. } => Ok(TranslationTarget::Literal("".to_string())),
+            ActionInstruction::GroupStart { .. } | ActionInstruction::GroupEnd { .. } => {
+                Ok(TranslationTarget::Literal("".to_string()))
+            }
         }
     }
 }

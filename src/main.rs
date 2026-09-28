@@ -387,7 +387,8 @@ fn check_yaml_file(path: &Path) -> Result<Vec<test::TestResult>, String> {
     let file =
         File::open(path).map_err(|e| format!("Could not open yaml file {:?} ({})", path, e))?;
     let mut parser = YAMLParser::new(file)
-        .map_err(|e| format!("Could not create parser {:?} ({:?})", path, e))?;
+        .map_err(|e| format!("Could not create parser {:?} ({:?})", path, e))?
+        .in_dir(path.parent().unwrap_or(Path::new(".")));
     parser
         .yaml()
         .map_err(|e| format!("{}: {}", path.display(), e))
