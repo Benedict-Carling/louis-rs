@@ -46,6 +46,8 @@ impl From<&str> for CharacterClass {
             "lowercase" => CharacterClass::Lowercase,
             "punctuation" => CharacterClass::Punctuation,
             "sign" => CharacterClass::Sign,
+            "math" => CharacterClass::Math,
+            "litdigit" => CharacterClass::Litdigit,
             "seqdelimiter" => CharacterClass::Seqdelimiter,
             "seqbeforechars" => CharacterClass::Seqbeforechars,
             "seqafterchars" => CharacterClass::Seqafterchars,

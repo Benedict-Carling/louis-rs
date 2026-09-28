@@ -4161,6 +4161,20 @@ mod tests {
     }
 
     #[test]
+    fn after_math_class() {
+        let rules = [
+            parse_rule("math + 235"),
+            parse_rule("lowercase b 12"),
+            parse_rule("after math always b 345"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("b+b"), "⠃⠖⠜");
+    }
+
+    #[test]
     fn context_with_variable() {
         let rules = [
             parse_rule("lowercase a 1"),
