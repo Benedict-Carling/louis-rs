@@ -20,6 +20,18 @@ impl Test {
         &self.tests
     }
 
+    /// How far a leading `_n` steps back from where liblouis tries the rule.
+    pub fn lookback(&self) -> usize {
+        match self
+            .tests
+            .iter()
+            .find(|t| !matches!(t, TestInstruction::Variable { .. }))
+        {
+            Some(TestInstruction::Lookback { len }) => usize::from(*len),
+            _ => 0,
+        }
+    }
+
     /// A leading lookback `_n` and the checks it steps back over, as the number of
     /// instructions they take and the `n` characters they check: the zero-width checks
     /// before it and the fixed-width ones after it that take the test back to where it

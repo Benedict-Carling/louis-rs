@@ -50,7 +50,7 @@ fn test_of(translation: &ResolvedTranslation) -> Option<&crate::parser::Test> {
 }
 
 fn lookback(translation: &ResolvedTranslation) -> usize {
-    test_of(translation).map_or(0, |test| test.lookbehind().1)
+    test_of(translation).map_or(0, |test| test.lookback())
 }
 
 impl MultipassTable {
@@ -89,8 +89,8 @@ impl MultipassTable {
         let mut advanced = true;
         // a rule matched from an earlier position, whose replacement is still ahead
         let mut pending: Option<ResolvedTranslation> = None;
-        // rules found before what their lookback steps over, with the characters left
-        // until liblouis would start matching them
+        // rules found where their lookback steps back to, with the characters left until
+        // liblouis would try them
         let mut behind: Vec<(usize, ResolvedTranslation)> = Vec::new();
 
         loop {
@@ -109,11 +109,21 @@ impl MultipassTable {
                     let (due, waiting): (Vec<_>, Vec<_>) =
                         behind.drain(..).partition(|(left, _)| *left == 0);
                     behind = waiting;
+                    // a replacement that starts before the position the rule is tried at
+                    // puts out again what was already put out there, as in liblouis
+                    let due = due.into_iter().map(|(_, t)| {
+                        let n = lookback(&t);
+                        if t.offset() >= n {
+                            t.decrement_offset(n)
+                        } else {
+                            let overlap = n - t.offset();
+                            let length = t.length().saturating_sub(overlap);
+                            t.with_offset(0).with_length(length)
+                        }
+                    });
                     // liblouis tries pass rules by the characters they are filed by, longest
                     // first, and takes the first that matches from this position
                     let best = due
-                        .into_iter()
-                        .map(|(_, t)| t)
                         .max_by_key(|t| (t.rule().map_or(0, backward::pass_rule_cells), t.rank()));
                     match best {
                         Some(t) if t.offset() > 0 => {
@@ -157,7 +167,7 @@ impl MultipassTable {
             behind = behind
                 .into_iter()
                 .filter(|(left, _)| *left >= consumed)
-                .map(|(left, t)| (left - consumed, t.decrement_offset(consumed)))
+                .map(|(left, t)| (left - consumed, t))
                 .collect();
         }
         translations
@@ -260,6 +270,16 @@ mod tests {
             MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Post1, &ctx)
                 .unwrap();
         assert_eq!(transform.translate("⠁⠂⠈"), "⠁⠄⠂⠐⠈");
+    }
+
+    #[test]
+    fn a_lookback_steps_back_over_what_was_put_out() {
+        let rules = [parse_rule("nofor pass4 _!$s[@6@6] @69-6")];
+        let ctx = TableContext::default();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Backward, TranslationStage::Post3, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("⠰⠠⠠⠝"), "⠰⠠\u{f0120}⠠⠝");
     }
 
     #[test]
