@@ -58,11 +58,22 @@ pub struct PrecomputedIndications<'a> {
     live_numeric: Option<&'a numeric::Indicator>,
     in_numeric: bool,
     chars: Vec<char>,
+    /// The positions in computer braille, where liblouis puts no other indicator
+    computer_braille: Vec<bool>,
 }
 
 impl PrecomputedIndications<'_> {
+    /// Whether `pos` is computer braille, where liblouis inserts no indicators but
+    /// computer braille's own
+    fn in_computer_braille(&self, pos: usize) -> bool {
+        self.computer_braille.get(pos).copied().unwrap_or(false)
+    }
+
     /// The start indicators of the modes and capitals at `pos`, modes first
     fn mode_begin_at(&self, pos: usize) -> Vec<ResolvedTranslation> {
+        if self.in_computer_braille(pos) {
+            return Vec::new();
+        }
         self.marks
             .as_ref()
             .map(|m| m.caps_begin_at(pos))
@@ -83,7 +94,9 @@ impl PrecomputedIndications<'_> {
         }
         let mut reached = Vec::new();
         for at in self.from..=pos.min(self.chars.len()) {
-            if let Some(m) = &self.marks {
+            if let Some(m) = &self.marks
+                && !self.in_computer_braille(at)
+            {
                 reached.extend(m.caps_end_at(at));
                 reached.extend(m.emphasis_at(at));
             }
@@ -92,9 +105,13 @@ impl PrecomputedIndications<'_> {
             }
         }
         self.from = pos + 1;
-        let numeric = self
-            .live_numeric
-            .and_then(|n| n.at(&mut self.in_numeric, &self.chars, pos));
+        let numeric = if self.in_computer_braille(pos) {
+            self.in_numeric = false;
+            None
+        } else {
+            self.live_numeric
+                .and_then(|n| n.at(&mut self.in_numeric, &self.chars, pos))
+        };
         let empty = Default::default();
         let [lead, mid, tail] = self.translations.get(pos).unwrap_or(&empty);
         lead.iter()
@@ -130,6 +147,12 @@ impl Indicators {
 
     pub fn precompute(&self, input: &str, spans: &[EmphasisSpan]) -> PrecomputedIndications<'_> {
         let chars: Vec<char> = input.chars().collect();
+        let mut computer_braille = vec![false; chars.len() + 1];
+        for span in spans.iter().filter(|s| s.class == "computer_braille") {
+            for pos in span.range.start..span.range.end.min(chars.len()) {
+                computer_braille[pos] = true;
+            }
+        }
         let mut translations = vec![<[Vec<ResolvedTranslation>; 3]>::default(); chars.len() + 1];
         let mut live_numeric = None;
 
@@ -145,6 +168,9 @@ impl Indicators {
                 Indicator::NoContract(i) => (1, i.precompute(input)),
             };
             for (pos, t) in pairs {
+                if computer_braille[pos] && !matches!(indicator, Indicator::ComputerBraille(_)) {
+                    continue;
+                }
                 translations[pos][bucket].push(t);
             }
         }
@@ -156,6 +182,7 @@ impl Indicators {
             live_numeric,
             in_numeric: false,
             chars,
+            computer_braille,
         }
     }
 }

@@ -20,33 +20,145 @@ impl Test {
         &self.tests
     }
 
+    /// The number of characters liblouis indexes a `context` rule under: those of the first
+    /// string the test checks, less any it steps back over (`passFindCharacters`)
+    pub fn leading_chars(&self) -> usize {
+        fn walk(tests: &[TestInstruction], lookback: &mut usize) -> Option<usize> {
+            for test in tests {
+                let test = match test {
+                    TestInstruction::Negate { test } => test.as_ref(),
+                    test => test,
+                };
+                let count = match test {
+                    TestInstruction::String { s } => s.chars().count(),
+                    TestInstruction::Dots { dots } => dots.len(),
+                    TestInstruction::Replace { tests } => match walk(tests, lookback) {
+                        Some(n) => return Some(n),
+                        None => continue,
+                    },
+                    TestInstruction::Lookback { len } => {
+                        *lookback += *len as usize;
+                        continue;
+                    }
+                    TestInstruction::Attributes { quantifier, .. }
+                    | TestInstruction::Class { quantifier, .. } => {
+                        let n = match quantifier {
+                            None => 1,
+                            Some(Quantifier::Number(n)) => *n as usize,
+                            _ => return Some(0),
+                        };
+                        if n > *lookback {
+                            return Some(0);
+                        }
+                        *lookback -= n;
+                        continue;
+                    }
+                    TestInstruction::Variable { .. }
+                    | TestInstruction::AtBeginning
+                    | TestInstruction::AtEnd => continue,
+                    TestInstruction::Negate { .. } => return Some(0),
+                };
+                if count > *lookback {
+                    return Some(count - *lookback);
+                }
+                *lookback -= count;
+            }
+            None
+        }
+        walk(&self.tests, &mut 0).unwrap_or(0)
+    }
+
     fn has_replace(&self) -> bool {
         self.tests
             .iter()
             .any(|t| matches!(t, TestInstruction::Replace { .. }))
     }
 
+    /// Without `[` and `]` liblouis replaces from the rule's position to where the test ends
     pub fn add_implicit_replace(self) -> Self {
         if self.has_replace() {
             return self;
         }
-        // liblouis replaces from where the match started, so what a leading `_N` steps
-        // back over is context
-        if let Some(TestInstruction::Lookback { len }) = self.tests.first() {
-            let len = usize::from(*len);
-            let rest = &self.tests[1..];
-            if rest.len() > len && rest[..len].iter().all(TestInstruction::matches_one_char) {
-                let mut tests = self.tests[..=len].to_vec();
-                tests.push(TestInstruction::Replace {
-                    tests: rest[len..].to_vec(),
-                });
-                return Self { tests };
-            }
+        let (before, rest) = split_leading_lookback(&self.tests);
+        let (replaced, after) = split_trailing_lookback(rest);
+        let mut tests = before.to_vec();
+        tests.push(TestInstruction::Replace {
+            tests: replaced.to_vec(),
+        });
+        if !after.is_empty() {
+            tests.extend_from_slice(after);
+            tests.extend(self.tests.last().cloned());
         }
-        Self {
-            tests: vec![TestInstruction::Replace { tests: self.tests }],
+        Self { tests }
+    }
+}
+
+/// The number of characters `test` always advances over, if fixed
+fn fixed_width(test: &TestInstruction) -> Option<usize> {
+    let repeat = |quantifier: &Option<Quantifier>| match quantifier {
+        None => Some(1),
+        Some(Quantifier::Number(n)) => Some(*n as usize),
+        _ => None,
+    };
+    match test {
+        TestInstruction::String { s } => Some(s.chars().count()),
+        TestInstruction::Dots { dots } => Some(dots.len()),
+        TestInstruction::Attributes { quantifier, .. }
+        | TestInstruction::Class { quantifier, .. } => repeat(quantifier),
+        TestInstruction::Negate { test } => fixed_width(test),
+        TestInstruction::Variable { .. }
+        | TestInstruction::AtBeginning
+        | TestInstruction::AtEnd => Some(0),
+        TestInstruction::Lookback { .. } | TestInstruction::Replace { .. } => None,
+    }
+}
+
+/// Split `tests` ending in `_N` into the tests before the last N characters and the tests
+/// that check those characters
+pub fn split_trailing_lookback(
+    tests: &[TestInstruction],
+) -> (&[TestInstruction], &[TestInstruction]) {
+    let Some((TestInstruction::Lookback { len }, rest)) = tests.split_last() else {
+        return (tests, &[]);
+    };
+    let mut width = 0;
+    for start in (0..rest.len()).rev() {
+        match fixed_width(&rest[start]) {
+            Some(w) => width += w,
+            None => break,
+        }
+        if width == *len as usize {
+            return (&rest[..start], &rest[start..]);
+        }
+        if width > *len as usize {
+            break;
         }
     }
+    (tests, &[])
+}
+
+/// Split `tests` starting with `_N` into that and the tests checking the N characters before
+/// the rule's position, and the rest
+pub fn split_leading_lookback(
+    tests: &[TestInstruction],
+) -> (&[TestInstruction], &[TestInstruction]) {
+    let Some((TestInstruction::Lookback { len }, rest)) = tests.split_first() else {
+        return (&[], tests);
+    };
+    let mut width = 0;
+    for (end, test) in rest.iter().enumerate() {
+        match fixed_width(test) {
+            Some(w) => width += w,
+            None => break,
+        }
+        if width == *len as usize {
+            return tests.split_at(end + 2);
+        }
+        if width > *len as usize {
+            break;
+        }
+    }
+    (&[], tests)
 }
 
 impl IsLiteral for Test {
@@ -126,19 +238,6 @@ pub enum TestInstruction {
     /// `~` (tilde): true only when there is no more input left, i.e. the match has reached the
     /// true end of the original string being translated.
     AtEnd,
-}
-
-impl TestInstruction {
-    fn matches_one_char(&self) -> bool {
-        let single = |q: &Option<Quantifier>| matches!(q, None | Some(Quantifier::Number(1)));
-        match self {
-            TestInstruction::String { s } => s.chars().count() == 1,
-            TestInstruction::Dots { dots } => dots.len() == 1,
-            TestInstruction::Attributes { quantifier, .. }
-            | TestInstruction::Class { quantifier, .. } => single(quantifier),
-            _ => false,
-        }
-    }
 }
 
 impl IsLiteral for TestInstruction {
@@ -531,6 +630,7 @@ mod display {
                     CharacterClass::Seqdelimiter => write!(f, "~"),
                     CharacterClass::Seqbeforechars => write!(f, "<"),
                     CharacterClass::Seqafterchars => write!(f, ">"),
+                    CharacterClass::Ordinal(_) => unreachable!(),
                     CharacterClass::UserDefined(name) => write!(f, "{}", name),
                 },
                 Attribute::ByOrder(order) => match order {
@@ -628,6 +728,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn leading_chars() {
+        let chars = |test: &str| Parser::new(test).tests().unwrap().leading_chars();
+        assert_eq!(chars(r#""ab"["c"]"#), 2);
+        assert_eq!(chars(r#"#1=1["abc"]"#), 3);
+        assert_eq!(chars(r#"_1$l["ab"]"#), 2);
+        assert_eq!(chars(r#"_1"ab""#), 1);
+        assert_eq!(chars(r#"$l["ab"]"#), 0);
+        assert_eq!(chars("#1=1"), 0);
+    }
+
+    #[test]
+    fn implicit_replace_ends_before_trailing_lookback() {
+        let test = |test: &str| Parser::new(test).tests().unwrap();
+        assert_eq!(
+            test(r#""ab"!"c"_"#).add_implicit_replace(),
+            Test::new(vec![
+                TestInstruction::Replace {
+                    tests: vec![TestInstruction::String { s: "ab".into() }]
+                },
+                TestInstruction::Negate {
+                    test: Box::new(TestInstruction::String { s: "c".into() })
+                },
+                TestInstruction::Lookback { len: 1 },
+            ])
+        );
+    }
+
+    #[test]
+    fn implicit_replace_starts_after_leading_lookback() {
+        let test = |test: &str| Parser::new(test).tests().unwrap();
+        assert_eq!(
+            test(r#"_$l"c"~"#).add_implicit_replace(),
+            Test::new(vec![
+                TestInstruction::Lookback { len: 1 },
+                TestInstruction::Attributes {
+                    attrs: HashSet::from([Attribute::Class(CharacterClass::Letter)]),
+                    quantifier: None,
+                },
+                TestInstruction::Replace {
+                    tests: vec![
+                        TestInstruction::String { s: "c".into() },
+                        TestInstruction::AtEnd
+                    ]
+                },
+            ])
+        );
+    }
+
+    #[test]
     fn ascii_number() {
         assert_eq!(Parser::new("123").ascii_number(), Ok(123));
         assert_eq!(Parser::new("1").ascii_number(), Ok(1));
@@ -720,22 +869,6 @@ mod tests {
             Parser::new("![$d]").negate(),
             Err(ParseError::NegatedReplacement)
         );
-    }
-
-    #[test]
-    fn implicit_replace_starts_after_a_leading_lookback() {
-        let test = Parser::new("_$l@456")
-            .tests()
-            .unwrap()
-            .add_implicit_replace();
-        assert!(matches!(
-            test.tests().as_slice(),
-            [
-                TestInstruction::Lookback { len: 1 },
-                TestInstruction::Attributes { .. },
-                TestInstruction::Replace { tests }
-            ] if matches!(tests.as_slice(), [TestInstruction::Dots { .. }])
-        ));
     }
 
     #[test]

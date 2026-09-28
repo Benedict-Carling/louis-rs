@@ -32,6 +32,8 @@ pub enum CharacterClass {
     Seqbeforechars,
     Seqafterchars,
     UserDefined(String),
+    /// The `n`th user-defined class of a table, which `$w`, `$x`, `$y` and `$z` test for
+    Ordinal(u8),
 }
 
 impl From<&str> for CharacterClass {

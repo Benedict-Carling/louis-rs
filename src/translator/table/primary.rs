@@ -390,7 +390,7 @@ impl PrimaryTableBuilder {
             digit_chars: class(CharacterClass::Digit),
             character_translations: self.character_translations,
             direction,
-            fallback_definitions: ctx.character_definitions().clone(),
+            fallback_definitions: ctx.definitions().clone(),
             case: CaseClasses::from_context(ctx),
             capsletter_defined: self.capsletter_defined,
             syllables: self.syllables,
@@ -537,15 +537,25 @@ impl PrimaryTable {
             builder.emphasis_indicator.base(&name, derived, base);
         }
 
-        // decpoint and hyphen take precedence over other character definition rules, so insert
-        // them first
+        // hyphen takes precedence over other character definition rules, so insert it first
         for rule in rules {
             match &rule.rule {
                 Rule::Decpoint {
                     character, dots, ..
                 } => {
+                    // liblouis only takes a decimal point before a digit
                     if direction == Direction::Forward {
-                        builder.insert_character(*character, &dots.to_string(), direction, rule);
+                        builder.get_trie_mut(rule).insert(
+                            &character.to_string(),
+                            &dots.to_string(),
+                            None,
+                            Some(Transition::End(vec![CharacterClass::Digit])),
+                            direction,
+                            rule.precedence(),
+                            vec![],
+                            TranslationStage::Main,
+                            rule,
+                        );
                     }
                     // A decimal point extends the numeric run: digits that follow it
                     // must not get a second numsign.  Registering it as a midnum
@@ -649,6 +659,19 @@ impl PrimaryTable {
                 }
                 Rule::Capsnocont {} => {
                     builder.dont_contract_constrainer.capsnocont();
+                }
+                Rule::Nocont { chars } if direction == Direction::Forward => {
+                    builder.get_trie_mut(rule).insert(
+                        chars,
+                        "",
+                        None,
+                        None,
+                        direction,
+                        rule.precedence(),
+                        vec![],
+                        TranslationStage::Main,
+                        rule,
+                    );
                 }
                 Rule::Numericmodechars { chars } => {
                     builder.numeric_indicator.runs().numericmodechars(chars);
@@ -899,6 +922,19 @@ impl PrimaryTable {
                     builder.comp6_trie.insert(
                         &character,
                         &dots,
+                        None,
+                        None,
+                        direction,
+                        rule.precedence(),
+                        vec![],
+                        TranslationStage::Main,
+                        rule,
+                    );
+                }
+                Rule::Repeated { chars, dots, .. } if direction == Direction::Forward => {
+                    builder.get_trie_mut(rule).insert(
+                        chars,
+                        &dots.to_string(),
                         None,
                         None,
                         direction,
@@ -1460,7 +1496,14 @@ impl PrimaryTable {
                 _ => (),
             }
         }
-        let numeric_chars: HashSet<char> = [CharacterClass::Digit, CharacterClass::Litdigit]
+        // only liblouis' numeric mode counts a litdigit as a digit
+        let numeric_classes: &[CharacterClass] =
+            if builder.numeric_indicator.runs().uses_numeric_mode() {
+                &[CharacterClass::Digit, CharacterClass::Litdigit]
+            } else {
+                &[CharacterClass::Digit]
+            };
+        let numeric_chars: HashSet<char> = numeric_classes
             .iter()
             .flat_map(|class| ctx.character_classes().get(class).unwrap_or_default())
             .collect();
@@ -1711,6 +1754,23 @@ impl PrimaryTable {
     }
 
     pub fn trace(&self, input: &str, options: &TranslationOptions) -> Vec<ResolvedTranslation> {
+        let mut nocont_words = Vec::new();
+        loop {
+            match self.trace_without_contractions_in(input, options, &nocont_words) {
+                Ok(translations) => return translations,
+                Err(word) => nocont_words.push(word),
+            }
+        }
+    }
+
+    /// Translate `input` with no contractions in the words starting at `nocont_words`, or
+    /// return the start of the word a `nocont` rule takes the contractions back from
+    fn trace_without_contractions_in(
+        &self,
+        input: &str,
+        options: &TranslationOptions,
+        nocont_words: &[usize],
+    ) -> Result<Vec<ResolvedTranslation>, usize> {
         let mut translations: Vec<ResolvedTranslation> = Vec::new();
         let mut delayed_translations: Vec<ResolvedTranslation> = Vec::new();
 
@@ -1733,12 +1793,19 @@ impl PrimaryTable {
             None => options.emphasis().to_vec(),
         };
 
+        // liblouis' compbrlStart and compbrlEnd
+        let compbrl_at_cursor = self
+            .cursor_word(input, options)
+            .map(|range| (range.start, range.end));
         let mut indications = self.indicators.precompute(input, &enriched_spans);
         let constraints = self.constrainers.precompute(input, &enriched_spans);
-        let constraints = match self.cursor_word(input, options) {
+        let mut constraints = match self.cursor_word(input, options) {
             Some(range) => constraints.with_comp6(range),
             None => constraints,
         };
+        for &word in nocont_words {
+            constraints.dont_contract_from(word, |c| self.space_chars.contains(&c), input);
+        }
         let input_chars: Vec<char> = input.chars().collect();
         let stands_alone = |t: &ResolvedTranslation, pos: usize| match &self.sequences {
             Some(sequences)
@@ -1846,8 +1913,12 @@ impl PrimaryTable {
             // First check for nocross candidates
             // the checks of liblouis's `for_selectRule` that depend on indication state
             let dont_contract = constraints.dont_contract_at(char_pos);
-            let selectable =
-                |t: &ResolvedTranslation| !(dont_contract && t.rule().is_some_and(is_contraction));
+            let selectable = |t: &ResolvedTranslation| {
+                !(dont_contract && t.rule().is_some_and(is_contraction))
+                    && !(matches!(t.rule(), Some(Rule::Repeated { .. }))
+                        && compbrl_at_cursor
+                            .is_some_and(|(start, end)| (start..=end).contains(&char_pos)))
+            };
 
             let nocross_candidate = self
                 .nocross_candidates(chars.as_str(), prev, char_pos, &constraints)
@@ -1879,6 +1950,7 @@ impl PrimaryTable {
                 chars.as_str(),
                 &env,
             );
+            let mut forced_here = false;
             if self.direction == Direction::Forward {
                 let is_pass_rule = |t: &ResolvedTranslation| {
                     t.rule()
@@ -1893,6 +1965,7 @@ impl PrimaryTable {
                 context_candidates.retain(|t| !is_pass_rule(t));
                 context_delayed.retain(|t| !is_pass_rule(t));
                 if forced.is_none() && !constraints.use_comp6_at(char_pos) {
+                    forced_here = pass_rule.is_some();
                     forced = pass_rule;
                     forced_at = char_pos;
                 }
@@ -1979,11 +2052,17 @@ impl PrimaryTable {
                         .rev()
                         .max_by_key(|t| (t.length() == 0, BackwardSelector::order(t)))
                 }
+                None if self.direction == Direction::Forward => select_forward(unseen),
                 // use the longest translation
                 None => unseen.max_by_key(|translation| translation.rank()),
             };
-            // liblouis's findForPassRule overrides the rule for_selectRule chose, and copies
-            // the characters before the replacement one by one
+            // liblouis's findForPassRule overrides the rule for_selectRule chose unless that is
+            // a `context` rule, and copies the characters before the replacement one by one
+            if forced_here
+                && candidate.is_some_and(|t| matches!(t.rule(), Some(Rule::Context { .. })))
+            {
+                forced = None;
+            }
             let forced_now = forced.take_if(|t| t.offset() == 0);
             let forced_earlier = forced_now.is_some() && forced_at < char_pos;
             let began_earlier = |t: &ResolvedTranslation| {
@@ -2110,6 +2189,16 @@ impl PrimaryTable {
                 delayed_translations = self.update_offsets(delayed_translations, nocross.length());
                 delayed_translations
                     .extend(self.match_candidates_within(consumed, nocross.length()));
+            } else if let Some(t) = candidate
+                && self.direction == Direction::Forward
+                && matches!(t.rule(), Some(Rule::Nocont { .. }))
+            {
+                // liblouis' doNocont goes back to the start of the word
+                let word = input_chars[..char_pos]
+                    .iter()
+                    .rposition(|c| self.space_chars.contains(c))
+                    .map_or(0, |p| p + 1);
+                return Err(word);
             } else if let Some(t) = candidate {
                 // an endnum rule takes back the letter sign inserted before it (liblouis's
                 // CTO_EndNum case in translateString)
@@ -2195,6 +2284,28 @@ impl PrimaryTable {
                         None,
                     ));
                 }
+                // liblouis skips the repetitions that follow a `repeated` rule
+                if self.direction == Direction::Forward
+                    && let Some(Rule::Repeated {
+                        chars: repeated, ..
+                    }) = t.rule()
+                {
+                    let len = repeated.chars().count();
+                    let limit = compbrl_at_cursor.map_or(usize::MAX, |(start, _)| start);
+                    while char_pos < limit && chars.as_str().starts_with(repeated.as_str()) {
+                        chars.nth(len - 1);
+                        prev = repeated.chars().last();
+                        char_pos += len;
+                        translations.push(ResolvedTranslation::new(
+                            repeated,
+                            "",
+                            len,
+                            TranslationStage::Main,
+                            None,
+                        ));
+                        delayed_translations = self.update_offsets(delayed_translations, len);
+                    }
+                }
 
                 // update the environment if needed
                 if !t.effects().is_empty() {
@@ -2204,9 +2315,24 @@ impl PrimaryTable {
                 }
             } else if let Some(next_char) = chars.next() {
                 prev = Some(next_char);
+                let computer_braille = constraints.use_comp6_at(char_pos);
                 char_pos += 1;
                 // no translation rule found
-                if let Some(translation) = self.character_translations.get(&next_char) {
+                let definition = self
+                    .fallback_definitions
+                    .get(&next_char)
+                    .filter(|_| computer_braille && self.direction == Direction::Forward);
+                if let Some(dots) = definition {
+                    // liblouis puts a character's definition in computer braille
+                    translations.push(ResolvedTranslation::new(
+                        &next_char.to_string(),
+                        dots,
+                        1,
+                        TranslationStage::Main,
+                        None,
+                    ));
+                    delayed_translations = self.update_offsets(delayed_translations, 1);
+                } else if let Some(translation) = self.character_translations.get(&next_char) {
                     translations.push(translation.clone());
                     delayed_translations = self.update_offsets(delayed_translations, 1);
                 } else if self.direction == Direction::Backward {
@@ -2234,7 +2360,7 @@ impl PrimaryTable {
                     // otherwise handle it as a undefined character
                     let translation = ResolvedTranslation::new(
                         &next_char.to_string(),
-                        &self.handle_undefined_char(next_char),
+                        &undefined_char_dots(next_char, &self.fallback_definitions),
                         1,
                         TranslationStage::Main,
                         None,
@@ -2249,7 +2375,7 @@ impl PrimaryTable {
                 break;
             }
         }
-        translations
+        Ok(translations)
     }
 
     /// liblouis's `isRepeatedWord` with the check `for_selectRule` makes of a `repword`
@@ -2331,24 +2457,22 @@ impl PrimaryTable {
             _ => self.letter_or_litdigit_chars.contains(&next),
         }
     }
+}
 
-    /// liblouis's `undefinedCharacter`: the character as it would be written in a table,
-    /// quoted and in hex, each character shown by its single-cell definition or else by
-    /// its fallback cell
-    fn handle_undefined_char(&self, ch: char) -> String {
-        let escaped = match ch as u32 {
-            c @ ..=0xffff => format!("'\\x{c:04x}'"),
-            c @ ..=0xfffff => format!("'\\y{c:x}'"),
-            c => format!("'\\z{c:08x}'"),
-        };
-        escaped
-            .chars()
-            .map(|c| match self.fallback_definitions.get(&c) {
-                Some(t) if t.chars().count() == 1 => t.clone(),
-                _ => fallback(c).to_string(),
-            })
-            .collect()
-    }
+/// Pick the forward candidate as liblouis does: a `context` rule ranks by the characters it
+/// is indexed under, and wins ties
+fn select_forward<'a>(
+    candidates: impl Iterator<Item = &'a ResolvedTranslation>,
+) -> Option<&'a ResolvedTranslation> {
+    candidates.max_by_key(|t| match t.rule() {
+        Some(rule @ Rule::Context { .. }) => (
+            t.length() == 0,
+            backward::context_cells(rule),
+            true,
+            t.weight(),
+        ),
+        _ => (t.length() == 0, t.length(), false, t.weight()),
+    })
 }
 
 /// A cell no rule back-translates, shown as its dot numbers between `\` and `/`
@@ -2400,16 +2524,29 @@ fn is_contraction(rule: &Rule) -> bool {
     )
 }
 
-/// Map a char to dots according to the North American Braille Computer Code (NABCC)
-///
-/// A fallback mapping for character to braille in case the table does
-/// not provide a mapping. This is used as a last resort when printing
-/// unicode escapes for undefined characters when the table does not
-/// define the character mappings that are needed. Only the characters
-/// that [`PrimaryTable::handle_undefined_char`] can produce are mapped.
+/// The escape liblouis prints for a character the table does not define, in the table's dots
+pub(crate) fn undefined_char_dots(ch: char, definitions: &CharacterDefinition) -> String {
+    let code = ch as u32;
+    let escape = match code {
+        0..=0xffff => format!("\\x{code:04x}"),
+        0x10000..=0xfffff => format!("\\y{code:05x}"),
+        _ => format!("\\z{code:08x}"),
+    };
+    format!("'{escape}'")
+        .chars()
+        .map(|c| match definitions.get(&c) {
+            Some(dots) if dots.chars().count() == 1 => dots.clone(),
+            _ => fallback(c).to_string(),
+        })
+        .collect()
+}
+
+/// Map a char to dots according to the North American Braille Computer Code (NABCC), as
+/// liblouis' `_lou_charToFallbackDots` does for the characters of an undefined character's
+/// escape that the table does not define
 fn fallback(ch: char) -> char {
     let c = if ch.is_ascii() { ch as u32 } else { '?' as u32 };
-    // liblouis's `_lou_charToFallbackDots`: fold the ASCII range onto 0x20..0x5F
+    // fold the ASCII range onto 0x20..0x5F
     let (c, dot7) = match c {
         0x7f.. => (c & !0x20, 0x40),
         0x60.. => (c & !0x20, 0),
@@ -2435,6 +2572,16 @@ mod tests {
     use search_path::SearchPath;
 
     use crate::parser::{RuleParser, expand_includes};
+
+    #[test]
+    fn undefined_char_escape() {
+        let mut definitions = CharacterDefinition::new();
+        definitions.insert('x', "⠭");
+        assert_eq!(
+            undefined_char_dots('\u{5be}', &definitions),
+            "⠄\u{2873}⠭⠴⠢⠃⠑⠄"
+        );
+    }
 
     #[test]
     fn unknown_dots_shows_dot_numbers() {
@@ -3954,6 +4101,119 @@ mod tests {
     }
 
     #[test]
+    fn context_ranks_by_leading_chars() {
+        let translate = |rule: &str, input: &str| {
+            let rules = [
+                parse_rule("lowercase a 1"),
+                parse_rule("lowercase b 2"),
+                parse_rule("lowercase c 3"),
+                parse_rule("always ab 12"),
+                parse_rule(rule),
+            ];
+            let context = TableContext::compile(&rules).unwrap();
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap()
+                .translate(input)
+        };
+        // indexed under "a", it loses to the longer "ab" however much it matches
+        assert_eq!(translate("noback context \"a\"$l$l @6", "abc"), "⠃⠄");
+        // indexed under as many characters as "ab", it wins
+        assert_eq!(translate("noback context \"ab\"$l @6", "abc"), "⠠");
+        // indexed under none, it overrides "ab"
+        assert_eq!(translate("noback context $l\"b\" @6", "ab"), "⠠");
+    }
+
+    #[test]
+    fn decpoint_only_before_a_digit() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("digit 1 1"),
+            parse_rule("punctuation . 256"),
+            parse_rule("decpoint . 46"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("a.1"), "⠁⠨⠁");
+        assert_eq!(table.translate("a."), "⠁⠲");
+    }
+
+    #[test]
+    fn computer_braille_puts_definitions_without_indicators() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("digit 4 256"),
+            parse_rule("litdigit 4 145"),
+            parse_rule("numsign 3456"),
+            parse_rule("punctuation : 25"),
+            parse_rule("punctuation / 34"),
+            parse_rule("space \\s 0"),
+            parse_rule("begcomp 456-346"),
+            parse_rule("endcomp 456-156"),
+            parse_rule("compbrl ://"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("a://4 4"), "⠸⠬⠁⠒⠌⠌⠲⠸⠱⠀⠼⠙");
+    }
+
+    fn repeated_and_nocont_table() -> PrimaryTable {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase c 14"),
+            parse_rule("punctuation - 36"),
+            parse_rule("space \\s 0"),
+            parse_rule("repeated -- 36"),
+            parse_rule("always ab 2"),
+            parse_rule("nocont c"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context).unwrap()
+    }
+
+    #[test]
+    fn repeated_skips_the_repetitions() {
+        let table = repeated_and_nocont_table();
+        assert_eq!(table.translate("a----b"), "⠁⠤⠃");
+        assert_eq!(table.translate("a-----b"), "⠁⠤⠤⠃");
+        // but not in the word at the cursor in compbrlAtCursor mode
+        let mut modes = crate::translator::TranslationModes::empty();
+        modes.insert(TranslationMode::CompbrlAtCursor);
+        let options = TranslationOptions::default()
+            .with_mode(modes)
+            .with_cursor_pos(4);
+        assert_eq!(
+            table.translate_with_options("a---- -----", &options),
+            "⠁⠤⠤⠤⠤⠀⠤⠤⠤"
+        );
+    }
+
+    #[test]
+    fn nocont_takes_back_the_contractions_of_its_word() {
+        let table = repeated_and_nocont_table();
+        assert_eq!(table.translate("ab abc ab"), "⠂⠀⠁⠃⠉⠀⠂");
+    }
+
+    #[test]
+    fn no_numsign_before_a_litdigit_outside_numeric_mode() {
+        let rules = [
+            parse_rule("litdigit 1 1"),
+            parse_rule("digit 2 12"),
+            parse_rule("numsign 3456"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("1"), "⠁");
+        assert_eq!(table.translate("2"), "⠼⠃");
+    }
+
+    #[test]
     fn numsign_before_a_digit() {
         let rules = [
             parse_rule("lowercase a 1"),
@@ -4176,5 +4436,46 @@ mod tests {
         .unwrap();
         assert_eq!(table.translate("⠘⠁⠀⠃⠰⠀⠁"), "A B a");
         assert_eq!(table.translate("⠨⠨⠁⠃⠀⠁"), "AB a");
+    }
+
+    #[test]
+    fn backward_joinword_puts_a_space_before_the_next_cell() {
+        let rules = [
+            parse_rule("space \\s 0"),
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase y 13456"),
+            parse_rule("space \\s 0"),
+            parse_rule("joinword by 356"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table = PrimaryTable::compile(
+            &rules,
+            Direction::Backward,
+            TranslationStage::Main,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(table.translate("⠴⠁"), "by a");
+    }
+
+    #[test]
+    fn backward_capsletter_wins_over_a_letter_sharing_its_dots() {
+        // liblouis tries a cell's other rules before its character definitions
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("base uppercase A a"),
+            parse_rule("letter b 6"),
+            parse_rule("capsletter 6"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table = PrimaryTable::compile(
+            &rules,
+            Direction::Backward,
+            TranslationStage::Main,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(table.translate("⠠⠁"), "A");
     }
 }
