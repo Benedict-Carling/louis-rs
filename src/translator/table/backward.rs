@@ -39,6 +39,9 @@ pub struct Situation<'a> {
     /// Whether the input may be the start of a word still being typed (liblouis's
     /// `partialTrans` mode), so no word can be taken to end with it.
     pub partial: bool,
+    /// Whether the caller wants the emphasis of the text, so the indicators that only
+    /// say how it was emphasized are read too (liblouis's `hasTypebuf`).
+    pub emphasis_output: bool,
 }
 
 fn last_char(output: &[ResolvedTranslation]) -> Option<char> {
@@ -171,6 +174,19 @@ fn leading_cells(tests: &[TestInstruction], lookback: &mut usize) -> Option<usiz
 pub fn context_cells(rule: &Rule) -> usize {
     match rule {
         Rule::Context { test, .. } => leading_cells(test.tests(), &mut 0).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// How many characters or cells a multipass rule's test starts with literally, which
+/// liblouis tries the rules of a pass by, most first
+pub fn pass_rule_cells(rule: &Rule) -> usize {
+    match rule {
+        Rule::Correct { test, .. }
+        | Rule::Context { test, .. }
+        | Rule::Pass2 { test, .. }
+        | Rule::Pass3 { test, .. }
+        | Rule::Pass4 { test, .. } => leading_cells(test.tests(), &mut 0).unwrap_or(0),
         _ => 0,
     }
 }
@@ -581,6 +597,11 @@ impl BackwardSelector {
                     && after_is(&[Litdigit])
                     && candidate.output().chars().count() > 1)
             }
+            Rule::Emphletter { .. }
+            | Rule::Begemphword { .. }
+            | Rule::Endemphword { .. }
+            | Rule::Begemphphrase { .. }
+            | Rule::Endemphphrase { .. } => situation.emphasis_output,
             Rule::Syllable { .. } | Rule::Match { .. } => false,
             Rule::Context { .. } => context_cells(rule) > 0,
             _ => true,

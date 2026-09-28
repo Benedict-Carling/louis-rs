@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use crate::{
     Direction,
-    parser::{AnchoredRule, HasDirection, Rule},
+    parser::{AnchoredRule, Rule},
     translator::{ResolvedTranslation, TranslationStage},
 };
 
@@ -31,34 +31,26 @@ pub struct DisplayTable {
 }
 
 impl DisplayTable {
+    /// Like liblouis, every rule that puts a character and a cell in a display table counts:
+    /// `display` rules, single-cell character definitions and `grouping`.
     pub fn compile(rules: &[AnchoredRule], direction: Direction) -> DisplayTable {
         let mut mappings = HashMap::new();
-        let rules: Vec<_> = rules.iter().filter(|r| r.is_direction(direction)).collect();
-
-        for rule in rules {
-            match &rule.rule {
-                Rule::Display {
-                    character, dots, ..
-                } => {
-                    let braille = dots.to_unicode();
-                    // swap `from` and `to` for backwards translation
-                    let (from, to) = match direction {
-                        Direction::Forward => (braille, *character),
-                        Direction::Backward => (*character, braille),
-                    };
-                    let mapping = DisplayMapping {
-                        to,
-                        origin: rule.clone(),
-                    };
-                    if cfg!(feature = "backwards_compatibility") {
-                        // first rule wins
-                        mappings.entry(from).or_insert(mapping);
-                    } else {
-                        // last rule wins
-                        mappings.insert(from, mapping);
-                    }
-                }
-                _ => (), // ignore all other rules for display tables
+        for (character, braille, rule) in char_dots_pairs(rules) {
+            // swap `from` and `to` for backwards translation
+            let (from, to) = match direction {
+                Direction::Forward => (braille, character),
+                Direction::Backward => (character, braille),
+            };
+            let mapping = DisplayMapping {
+                to,
+                origin: rule.clone(),
+            };
+            if cfg!(feature = "backwards_compatibility") {
+                // first rule wins
+                mappings.entry(from).or_insert(mapping);
+            } else {
+                // last rule wins
+                mappings.insert(from, mapping);
             }
         }
         DisplayTable { mappings }
@@ -107,13 +99,13 @@ impl DisplayTable {
 /// Each character paired with its cell by a rule liblouis puts in a display table, in table
 /// order: `display` rules, character definitions with a single cell and both characters of a
 /// `grouping`. So a translation table that includes no display table still has one.
-fn char_dots_pairs(rules: &[AnchoredRule]) -> Vec<(char, char)> {
+fn char_dots_pairs(rules: &[AnchoredRule]) -> Vec<(char, char, &AnchoredRule)> {
     let mut pairs = Vec::new();
     for rule in rules {
         match &rule.rule {
             Rule::Display {
                 character, dots, ..
-            } => pairs.push((*character, dots.to_unicode())),
+            } => pairs.push((*character, dots.to_unicode(), rule)),
             Rule::Space {
                 character, dots, ..
             }
@@ -141,15 +133,15 @@ fn char_dots_pairs(rules: &[AnchoredRule]) -> Vec<(char, char)> {
             | Rule::Math {
                 character, dots, ..
             } if dots.len() == 1 => {
-                pairs.push((*character, dots.iter().next().unwrap().to_unicode()))
+                pairs.push((*character, dots.iter().next().unwrap().to_unicode(), rule))
             }
             Rule::Grouping {
                 chars, left, right, ..
             } => {
                 let mut chars = chars.chars();
                 if let (Some(open), Some(close)) = (chars.next(), chars.next()) {
-                    pairs.push((open, left.to_unicode()));
-                    pairs.push((close, right.to_unicode()));
+                    pairs.push((open, left.to_unicode(), rule));
+                    pairs.push((close, right.to_unicode(), rule));
                 }
             }
             _ => (),
@@ -178,7 +170,7 @@ pub struct CharToDots {
 impl CharToDots {
     pub fn compile(rules: &[AnchoredRule]) -> CharToDots {
         let mut mappings = HashMap::new();
-        for (character, dots) in char_dots_pairs(rules) {
+        for (character, dots, _) in char_dots_pairs(rules) {
             // ucBrl output only has room for dots 1 to 8
             let cell = char::from_u32(0x2800 | (dots as u32 & 0xff)).unwrap();
             add_mapping(&mut mappings, character, cell);
@@ -209,7 +201,7 @@ impl ImpliedDisplay {
     pub fn compile(rules: &[AnchoredRule]) -> ImpliedDisplay {
         let mut chars = HashMap::new();
         let mut cells = HashMap::new();
-        for (character, cell) in char_dots_pairs(rules) {
+        for (character, cell, _) in char_dots_pairs(rules) {
             add_mapping(&mut chars, cell, character);
             add_mapping(&mut cells, character, cell);
         }
@@ -254,6 +246,18 @@ mod tests {
         assert_eq!(display_table.translate("⠀"), " ");
         assert_eq!(display_table.translate(""), "");
         assert_eq!(display_table.translate("x"), "x"); // unknown chars are translated to themselves
+    }
+
+    #[test]
+    #[cfg(feature = "backwards_compatibility")]
+    fn display_table_includes_character_definitions() {
+        let rules = [
+            parse_rule("letter a 1"),
+            parse_rule("display / 1"),
+            parse_rule("display _ 2"),
+        ];
+        let table = DisplayTable::compile(&rules, Direction::Forward);
+        assert_eq!(table.translate("⠁⠂"), "a_");
     }
 
     #[test]

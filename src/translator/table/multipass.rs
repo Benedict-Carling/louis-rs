@@ -1,7 +1,7 @@
 use crate::translator::ResolvedTranslation;
 use crate::translator::context_pattern::{ContextPatterns, ContextPatternsBuilder};
 use crate::translator::effect::Environment;
-use crate::translator::table::TableContext;
+use crate::translator::table::{TableContext, backward};
 use crate::{
     Direction,
     parser::{AnchoredRule, Rule},
@@ -51,18 +51,6 @@ fn test_of(translation: &ResolvedTranslation) -> Option<&crate::parser::Test> {
 
 fn lookback(translation: &ResolvedTranslation) -> usize {
     test_of(translation).map_or(0, |test| test.lookbehind().1)
-}
-
-fn leading_chars(translation: &ResolvedTranslation) -> usize {
-    match translation.rule() {
-        Some(
-            Rule::Correct { test, .. }
-            | Rule::Pass2 { test, .. }
-            | Rule::Pass3 { test, .. }
-            | Rule::Pass4 { test, .. },
-        ) => test.leading_chars(),
-        _ => 0,
-    }
 }
 
 impl MultipassTable {
@@ -125,7 +113,7 @@ impl MultipassTable {
                     let best = due
                         .into_iter()
                         .map(|(_, t)| t)
-                        .max_by_key(|t| (leading_chars(t), t.rank()));
+                        .max_by_key(|t| (t.rule().map_or(0, backward::pass_rule_cells), t.rank()));
                     match best {
                         Some(t) if t.offset() > 0 => {
                             pending = Some(t.decrement_offset(1));
@@ -287,6 +275,32 @@ mod tests {
                 .unwrap();
         assert_eq!(transform.translate("⠠⡖"), "⠠⡖");
         assert_eq!(transform.translate("⡖"), "\u{f4000}⠖");
+    }
+
+    #[test]
+    fn rules_starting_with_more_literal_cells_are_tried_first() {
+        let rules = [
+            parse_rule("noback pass2 @1-2[@3]@4 @5"),
+            parse_rule("noback pass2 @1[@3]@4 @6"),
+        ];
+        let ctx = TableContext::default();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Post1, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("⠁⠂⠄⠈"), "⠁⠂⠐⠈");
+    }
+
+    #[test]
+    fn a_rule_whose_test_began_earlier_comes_first() {
+        let rules = [
+            parse_rule("noback pass2 @1[@2] @4"),
+            parse_rule("noback pass2 [@2-2] @5"),
+        ];
+        let ctx = TableContext::default();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Post1, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("⠁⠂⠂"), "⠁⠈⠂");
     }
 
     #[test]

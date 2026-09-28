@@ -65,57 +65,6 @@ impl Test {
         }
     }
 
-    /// The number of characters liblouis files a pass rule by (`passFindCharacters`): those
-    /// of the first string or dots the test checks, less what a lookback steps back over. 0
-    /// when an attribute or class check comes first.
-    pub fn leading_chars(&self) -> usize {
-        fn scan(tests: &[TestInstruction], lookback: &mut usize) -> Option<usize> {
-            for test in tests {
-                let test = match test {
-                    TestInstruction::Negate { test } => test.as_ref(),
-                    test => test,
-                };
-                match test {
-                    TestInstruction::String { s } => {
-                        let count = s.chars().count();
-                        if count > *lookback {
-                            return Some(count - *lookback);
-                        }
-                        *lookback -= count;
-                    }
-                    TestInstruction::Dots { dots } => {
-                        let count = dots.len();
-                        if count > *lookback {
-                            return Some(count - *lookback);
-                        }
-                        *lookback -= count;
-                    }
-                    TestInstruction::Attributes { quantifier, .. }
-                    | TestInstruction::Class { quantifier, .. } => {
-                        let n = match quantifier {
-                            None => 1,
-                            Some(Quantifier::Number(n)) => usize::from(*n),
-                            _ => return Some(0),
-                        };
-                        if n > *lookback {
-                            return Some(0);
-                        }
-                        *lookback -= n;
-                    }
-                    TestInstruction::Lookback { len } => *lookback += usize::from(*len),
-                    TestInstruction::Replace { tests } => {
-                        if let Some(n) = scan(tests, lookback) {
-                            return Some(n);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        scan(&self.tests, &mut 0).unwrap_or(0)
-    }
-
     fn has_replace(&self) -> bool {
         self.tests
             .iter()
