@@ -8,10 +8,9 @@
 //! its matching algorithm, not its bundled pattern corpus or its
 //! print-text case-folding.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-/// A parsed hyphenation table: patterns plus the boundary minima
-/// liblouis's `LEFTHYPHENMIN`/`RIGHTHYPHENMIN` header declares.
+/// A parsed hyphenation table.
 #[derive(PartialEq, Debug, Default, Clone)]
 pub struct HyphenationTable {
     // Key: a pattern's letters, e.g. "ab" for the source pattern ".ab3a"
@@ -20,8 +19,8 @@ pub struct HyphenationTable {
     // Value: the score at each gap around those letters -- one more
     // entry than there are characters in the key.
     patterns: HashMap<String, Vec<u8>>,
-    left_min: usize,
-    right_min: usize,
+    // Every prefix of a pattern's letters: the states of liblouis's pattern automaton.
+    prefixes: HashSet<String>,
 }
 
 /// A bad `LEFTHYPHENMIN`/`RIGHTHYPHENMIN` value is a configuration
@@ -35,118 +34,99 @@ pub enum ParseError {
         directive: &'static str,
         found: String,
     },
-    #[error("line {line}: pattern {pattern:?} has no hyphenation value")]
-    PatternWithoutValue { line: usize, pattern: String },
-    #[error("unsupported encoding {encoding:?}: only UTF-8 .dic files are supported")]
-    UnsupportedEncoding { encoding: String },
+    #[error("the file is neither ISO8859-1 nor valid UTF-8")]
+    InvalidUtf8,
 }
 
 impl HyphenationTable {
+    /// Parse a `.dic` file's bytes, which are Latin-1 when its first line names an `ISO`
+    /// encoding, as liblouis reads them, and UTF-8 otherwise.
+    pub fn parse_bytes(bytes: &[u8]) -> Result<Self, ParseError> {
+        let source = if bytes.trim_ascii_start().starts_with(b"ISO") {
+            bytes.iter().map(|&b| char::from(b)).collect()
+        } else {
+            String::from_utf8(bytes.to_vec()).map_err(|_| ParseError::InvalidUtf8)?
+        };
+        Self::parse(&source)
+    }
+
     /// Parse a `.dic` hyphenation-pattern file.
     ///
-    /// `LEFTHYPHENMIN`/`RIGHTHYPHENMIN` set the boundary minima when
-    /// present; otherwise they default to `(1, 1)`, the least
-    /// restrictive bound.
+    /// `LEFTHYPHENMIN`/`RIGHTHYPHENMIN` headers are checked but play no part:
+    /// liblouis's `hyphenateWord` has no boundary minima.
     pub fn parse(source: &str) -> Result<Self, ParseError> {
-        let mut table = HyphenationTable {
-            left_min: 1,
-            right_min: 1,
-            ..Default::default()
-        };
+        let mut table = HyphenationTable::default();
 
         for (lineno, raw_line) in source.lines().enumerate() {
             let line = raw_line.trim();
             if line.is_empty() {
                 continue;
             }
-            // The first line is an encoding marker; we only support UTF-8.
-            if lineno == 0 {
-                if line.eq_ignore_ascii_case("UTF-8") {
-                    continue;
-                }
-                if line.eq_ignore_ascii_case("ISO8859-1") {
-                    return Err(ParseError::UnsupportedEncoding {
-                        encoding: line.to_string(),
-                    });
-                }
+            // The first line is an encoding marker, the text is already decoded
+            if lineno == 0 && (line.starts_with("UTF-8") || line.starts_with("ISO")) {
+                continue;
             }
             // Comment lines.
             if line.starts_with('#') || line.starts_with('%') {
                 continue;
             }
             if let Some(rest) = line.strip_prefix("LEFTHYPHENMIN") {
-                table.left_min = parse_hyphenmin(rest, lineno, "LEFTHYPHENMIN")?;
+                parse_hyphenmin(rest, lineno, "LEFTHYPHENMIN")?;
                 continue;
             }
             if let Some(rest) = line.strip_prefix("RIGHTHYPHENMIN") {
-                table.right_min = parse_hyphenmin(rest, lineno, "RIGHTHYPHENMIN")?;
+                parse_hyphenmin(rest, lineno, "RIGHTHYPHENMIN")?;
                 continue;
             }
-            let (letters, tally) = parse_pattern(line, lineno)?;
+            let (letters, tally) = parse_pattern(line);
+            let chars: Vec<char> = letters.chars().collect();
+            for len in 1..=chars.len() {
+                table.prefixes.insert(chars[..len].iter().collect());
+            }
             table.patterns.insert(letters, tally);
         }
 
         Ok(table)
     }
 
-    /// For each internal gap of `word`, whether it's a valid hyphenation
-    /// break (odd score, staying `left_min`/`right_min` characters away
-    /// from either edge). `result[i]` is the gap between word-char `i`
-    /// and word-char `i + 1`; a word of fewer than two characters has no
-    /// internal gaps and returns an empty vector.
-    pub fn break_points(&self, word: &str) -> Vec<bool> {
-        let char_count = word.chars().count();
-        if char_count < 2 {
-            return Vec::new();
-        }
-        if char_count < self.left_min.saturating_add(self.right_min) {
-            return vec![false; char_count - 1];
-        }
-
-        let wrapped = format!(".{word}.");
-        // Byte offset of each char boundary in `wrapped`, plus a sentinel
-        // at the end, so `&wrapped[a..b]` slices land on char boundaries.
-        let bounds: Vec<usize> = wrapped
-            .char_indices()
-            .map(|(b, _)| b)
-            .chain(std::iter::once(wrapped.len()))
+    /// liblouis's `hyphenateWord`: the score of the gap before each character of `word`
+    /// (index 0 is the gap before the first), odd scores marking breaks.
+    ///
+    /// liblouis walks the word, wrapped in `.`, through an automaton of the patterns'
+    /// prefixes: after each character it is in the longest suffix read so far that is such
+    /// a prefix, and only that state's own pattern is applied. The boundary minima play no
+    /// part, and the word is expected to be lowercased already.
+    pub fn hyphens(&self, word: &[char]) -> Vec<u8> {
+        let wrapped: Vec<char> = std::iter::once('.')
+            .chain(word.iter().copied())
+            .chain(std::iter::once('.'))
             .collect();
-        let wrapped_chars = bounds.len() - 1;
-
-        // scores[g] = the highest value any matching pattern assigns to
-        // the gap immediately before the g-th character of `wrapped`. A
-        // gap's final score can only be known once every pattern has been
-        // tried, since a later match may raise it past an earlier one --
-        // so this pass can't stop early even though each gap only needs a
-        // yes/no answer in the end.
-        let mut scores = vec![0u8; wrapped_chars + 1];
-        for start in 0..wrapped_chars {
-            for end in (start + 1)..=wrapped_chars {
-                if let Some(tally) = self.patterns.get(&wrapped[bounds[start]..bounds[end]]) {
-                    for (k, &v) in tally.iter().enumerate() {
-                        let gap = start + k;
-                        if v > scores[gap] {
-                            scores[gap] = v;
-                        }
+        let mut scores = vec![0u8; word.len()];
+        let mut state = 0;
+        for end in 1..=wrapped.len() {
+            state = (end - state - 1..end)
+                .find(|&start| {
+                    self.prefixes
+                        .contains(&wrapped[start..end].iter().collect::<String>())
+                })
+                .map_or(0, |start| end - start);
+            let key: String = wrapped[end - state..end].iter().collect();
+            if let Some(tally) = self.patterns.get(&key) {
+                // tally[k] scores the gap before wrapped[end - state + k], i.e. before
+                // word character end - state + k - 1
+                for (k, &v) in tally.iter().enumerate() {
+                    let Some(gap) = (end + k).checked_sub(state + 1) else {
+                        continue;
+                    };
+                    if let Some(score) = scores.get_mut(gap)
+                        && v > *score
+                    {
+                        *score = v;
                     }
                 }
             }
         }
-
-        // Gap `g` sits right before wrapped-char `g`; wrapped-char `i` is
-        // word-char `i - 1` (wrapped-char 0 is the leading '.'). So `g` is
-        // a genuine internal word break -- between word chars (g-2) and
-        // (g-1) -- for g in [2, char_count], landing on word char-index
-        // (g - 1). `result[i]` is that break for g = i + 2.
-        (0..char_count - 1)
-            .map(|i| {
-                let g = i + 2;
-                let char_idx = g - 1;
-                !scores[g].is_multiple_of(2)
-                    && char_idx >= self.left_min
-                    && char_idx <= char_count - self.right_min
-            })
-            .collect()
+        scores
     }
 }
 
@@ -166,9 +146,9 @@ fn parse_hyphenmin(
 }
 
 /// ".ab3a" -> ("aba", `[0,0,3,0]`) -- letters plus one score per gap
-/// (len(letters) + 1 of them). Fails if no digit was found, since such a
-/// pattern could never produce a break anywhere.
-fn parse_pattern(pattern: &str, lineno: usize) -> Result<(String, Vec<u8>), ParseError> {
+/// (len(letters) + 1 of them). A pattern without a digit breaks nowhere, but liblouis still
+/// counts it among the patterns the automaton reads.
+fn parse_pattern(pattern: &str) -> (String, Vec<u8>) {
     let mut letters = String::new();
     let mut tally = vec![0u8];
     for ch in pattern.chars() {
@@ -180,40 +160,15 @@ fn parse_pattern(pattern: &str, lineno: usize) -> Result<(String, Vec<u8>), Pars
             tally.push(0);
         }
     }
-    if tally.iter().all(|&v| v == 0) {
-        return Err(ParseError::PatternWithoutValue {
-            line: lineno + 1,
-            pattern: pattern.to_string(),
-        });
-    }
-    Ok((letters, tally))
+    (letters, tally)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn reads_hyphenmin_header() {
-        let t =
-            HyphenationTable::parse("UTF-8\nLEFTHYPHENMIN 2\nRIGHTHYPHENMIN 3\n.ab3a\n").unwrap();
-        assert_eq!((t.left_min, t.right_min), (2, 3));
-    }
-
-    #[test]
-    fn defaults_when_header_absent() {
-        let t = HyphenationTable::parse("UTF-8\n.ab3a\n").unwrap();
-        assert_eq!((t.left_min, t.right_min), (1, 1));
-    }
-
-    #[test]
-    fn huge_hyphenmin_does_not_overflow() {
-        // Regression test: left_min + right_min used to overflow usize in break_points when a
-        // .dic file declared an unreasonably large LEFTHYPHENMIN/RIGHTHYPHENMIN. A word can never
-        // be long enough to satisfy such a bound anyway, so it should just report no breaks.
-        let t =
-            HyphenationTable::parse("UTF-8\nLEFTHYPHENMIN 18446744073709551615\n.ab3a\n").unwrap();
-        assert_eq!(t.break_points("ab"), vec![false]);
+    fn hyphens(t: &HyphenationTable, word: &str) -> Vec<u8> {
+        t.hyphens(&word.chars().collect::<Vec<_>>())
     }
 
     #[test]
@@ -222,43 +177,63 @@ mod tests {
     }
 
     #[test]
-    fn rejects_iso8859_1_encoding() {
-        assert!(HyphenationTable::parse("ISO8859-1\n.ab3a\n").is_err());
+    fn reads_iso8859_1_as_latin1() {
+        let t = HyphenationTable::parse_bytes(b"ISO8859-1\n.\xe93a\n").unwrap();
+        assert_eq!(hyphens(&t, "éa"), vec![0, 3]);
+        assert!(HyphenationTable::parse_bytes(b"UTF-8\n.\xe93a\n").is_err());
+    }
+
+    #[test]
+    fn huge_hyphenmin_is_accepted() {
+        assert!(
+            HyphenationTable::parse("UTF-8\nLEFTHYPHENMIN 18446744073709551615\n.ab3a\n").is_ok()
+        );
     }
 
     #[test]
     fn finds_a_break() {
-        // ".ab3a" -- the '3' sits between 'b' and the second 'a', so for
-        // the word "aba" that's a break after 2 characters: "ab|a".
-        let t =
-            HyphenationTable::parse("UTF-8\nLEFTHYPHENMIN 1\nRIGHTHYPHENMIN 1\n.ab3a\n").unwrap();
-        assert_eq!(t.break_points("aba"), vec![false, true]);
+        // ".ab3a" -- the '3' sits before the second 'a', so "aba" breaks as "ab|a"
+        let t = HyphenationTable::parse("UTF-8\n.ab3a\n").unwrap();
+        assert_eq!(hyphens(&t, "aba"), vec![0, 0, 3]);
     }
 
     #[test]
-    fn respects_minima() {
+    fn ignores_minima() {
         let t =
             HyphenationTable::parse("UTF-8\nLEFTHYPHENMIN 2\nRIGHTHYPHENMIN 2\n.ab3a\n").unwrap();
-        // break at char-index 2 is not <= char_count(3) - right_min(2) = 1
-        assert_eq!(t.break_points("aba"), vec![false, false]);
+        assert_eq!(hyphens(&t, "aba"), vec![0, 0, 3]);
+    }
+
+    #[test]
+    fn keeps_the_highest_score() {
+        let t = HyphenationTable::parse("UTF-8\na1b\nb2c\nab4c\n").unwrap();
+        assert_eq!(hyphens(&t, "abc"), vec![0, 1, 4]);
+    }
+
+    /// Only the pattern of the longest matching prefix applies, so a pattern that is a
+    /// suffix of a longer prefix goes unused, as in liblouis
+    #[test]
+    fn applies_only_the_longest_state() {
+        let t = HyphenationTable::parse("UTF-8\nb1c\nabcd1\n").unwrap();
+        assert_eq!(hyphens(&t, "abce"), vec![0, 0, 0, 0]);
+        assert_eq!(hyphens(&t, "xbce"), vec![0, 0, 1, 0]);
     }
 
     #[test]
     fn no_match_means_no_breaks() {
         let t = HyphenationTable::parse("UTF-8\ns1b\n").unwrap();
-        assert_eq!(t.break_points("fff"), vec![false, false]);
+        assert_eq!(hyphens(&t, "fff"), vec![0, 0, 0]);
     }
 
     #[test]
     fn skips_comments_and_blank_lines() {
         let t = HyphenationTable::parse("UTF-8\n# a comment\n\n% also a comment\n.ab3a\n").unwrap();
-        assert_eq!(t.break_points("aba"), vec![false, true]);
+        assert_eq!(hyphens(&t, "aba"), vec![0, 0, 3]);
     }
 
     #[test]
-    fn short_word_has_no_gaps() {
+    fn empty_word() {
         let t = HyphenationTable::parse("UTF-8\n.ab3a\n").unwrap();
-        assert_eq!(t.break_points(""), Vec::<bool>::new());
-        assert_eq!(t.break_points("a"), Vec::<bool>::new());
+        assert_eq!(hyphens(&t, ""), Vec::<u8>::new());
     }
 }

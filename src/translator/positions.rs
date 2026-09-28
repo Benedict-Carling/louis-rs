@@ -1,65 +1,80 @@
 //! Mapping between input positions and output positions of a translation
 
-use crate::{parser::Direction, translator::ResolvedTranslation};
+use crate::{
+    parser::{Direction, Position, Rule},
+    translator::ResolvedTranslation,
+};
 
-/// The (input length, output length) of every translation step of one stage -- all the position
-/// algorithms need.
-fn stage_lengths(steps: &[ResolvedTranslation], direction: Direction) -> Vec<(usize, usize)> {
-    steps
-        .iter()
-        .map(|step| {
-            let (input, output) = (step.input().chars().count(), step.output().chars().count());
-            match direction {
-                Direction::Forward => (input, output),
-                Direction::Backward => (output, input),
+/// The position on the other side of every char of one side of a stage: going forward, the
+/// input position of every output char, going backward the output position of every input
+/// char. Every char a translation step produces (or consumes) points at the start of the step,
+/// and a last entry past the end points past the end, as in liblouis's `posMapping`.
+fn stage_mapping(steps: &[ResolvedTranslation], direction: Direction) -> Vec<usize> {
+    let mut mapping = Vec::new();
+    let (mut input_offset, mut output_offset) = (0usize, 0usize);
+    for step in steps {
+        let (input_len, output_len) = (step.input().chars().count(), step.output().chars().count());
+        match direction {
+            Direction::Forward => {
+                let at = if input_len == 0 && step.rule().is_some_and(ends_after) {
+                    input_offset.saturating_sub(1)
+                } else {
+                    input_offset
+                };
+                mapping.extend(std::iter::repeat_n(at, output_len))
             }
-        })
-        .collect()
-}
-
-pub(crate) fn compute_output_positions(translations: &[(usize, usize)]) -> Vec<usize> {
-    let mut output_positions: Vec<usize> = Vec::new();
-    let mut output_offset: usize = 0;
-    // An inserted, indicator-only unit (empty input) has no input char of its own to record a
-    // position for. liblouis attributes its output to the next real input char instead of
-    // skipping past it, so remember where such a run started until that char shows up.
-    let mut pending_insertion_start: Option<usize> = None;
-
-    for &(input_len, output_len) in translations {
-        if input_len == 0 {
-            pending_insertion_start.get_or_insert(output_offset);
-        } else if output_len == 0 {
-            // A deleted unit produces no output of its own, so liblouis leaves its input chars
-            // pointing at the last cell already emitted -- the *preceding* character's -- rather
-            // than at the next one. At the very start of the output there is no preceding cell,
-            // and everything clamps to 0.
-            let position = pending_insertion_start
-                .take()
-                .unwrap_or_else(|| output_offset.saturating_sub(1));
-            output_positions.extend(std::iter::repeat_n(position, input_len));
-        } else {
-            let first = pending_insertion_start.take().unwrap_or(output_offset);
-            output_positions.push(first);
-            for i in 1..input_len {
-                output_positions.push(output_offset + i.min(output_len - 1));
-            }
-        }
-        output_offset += output_len;
-    }
-    output_positions
-}
-
-pub(crate) fn compute_input_positions(translations: &[(usize, usize)]) -> Vec<usize> {
-    let mut input_positions: Vec<usize> = Vec::new();
-    let mut input_offset: usize = 0;
-
-    for &(input_len, output_len) in translations {
-        for i in 0..output_len {
-            input_positions.push(input_offset + i.min(input_len.saturating_sub(1)));
+            Direction::Backward => mapping.extend(std::iter::repeat_n(output_offset, input_len)),
         }
         input_offset += input_len;
+        output_offset += output_len;
     }
-    input_positions
+    mapping.push(match direction {
+        Direction::Forward => input_offset,
+        Direction::Backward => output_offset,
+    });
+    mapping
+}
+
+/// An indicator liblouis puts out with the character before it (`insertEmphasisEnd`)
+fn ends_after(rule: &Rule) -> bool {
+    matches!(
+        rule,
+        Rule::Endemph { .. }
+            | Rule::Endemphword { .. }
+            | Rule::Endcaps { .. }
+            | Rule::Endcapsword { .. }
+            | Rule::Endemphphrase {
+                position: Position::After,
+                ..
+            }
+            | Rule::Endcapsphrase {
+                position: Position::After,
+                ..
+            }
+    )
+}
+
+/// The positions on the `from` side of the chars on the other side, derived from `mapping` (the
+/// other side's position of every `from` char) the way liblouis does: a char gets the first of
+/// the chars mapped to the last position at or before it.
+fn invert(mapping: &[usize], len: usize) -> Vec<usize> {
+    let mut inverse = vec![0; len];
+    let mut next = 0;
+    let mut last: Option<usize> = None;
+    for (k, &position) in mapping.iter().enumerate() {
+        if last.is_none_or(|last| position > mapping[last]) {
+            while next < position.min(len) {
+                inverse[next] = last.unwrap_or(0);
+                next += 1;
+            }
+            next = next.max(position.min(len));
+            last = Some(k);
+        }
+    }
+    for position in inverse.iter_mut().skip(next) {
+        *position = last.unwrap_or(0);
+    }
+    inverse
 }
 
 /// Where every input char ends up in the output and where every output char comes from,
@@ -89,39 +104,34 @@ impl PositionMap {
         stages: &[Vec<ResolvedTranslation>],
         direction: Direction,
     ) -> Self {
-        // an index equal to the length of the text it points into means "past the end"
-        let mut output_positions: Vec<usize> = (0..input_len).collect();
-        let mut input_positions: Vec<usize> = (0..input_len).collect();
+        // liblouis keeps a single mapping from the braille side to the text side, composed
+        // over the passes: indexed by output going forward and by input going backward
+        let mut mapping: Vec<usize> = (0..=input_len).collect();
         let mut output_len = input_len;
         for steps in stages {
-            let lengths = stage_lengths(steps, direction);
-            let (stage_output_positions, stage_input_positions) = match direction {
-                Direction::Forward => (
-                    compute_output_positions(&lengths),
-                    compute_input_positions(&lengths),
-                ),
-                Direction::Backward => (
-                    compute_input_positions(&lengths),
-                    compute_output_positions(&lengths),
-                ),
+            let stage = stage_mapping(steps, direction);
+            output_len = steps.iter().map(|t| t.output().chars().count()).sum();
+            mapping = match direction {
+                Direction::Forward => stage
+                    .iter()
+                    .map(|&p| mapping.get(p).copied().unwrap_or(input_len))
+                    .collect(),
+                Direction::Backward => mapping
+                    .iter()
+                    .map(|&p| stage.get(p).copied().unwrap_or(output_len))
+                    .collect(),
             };
-            let stage_output_len = stage_input_positions.len();
-            debug_assert_eq!(stage_output_positions.len(), output_len);
-            output_positions = output_positions
-                .iter()
-                .map(|&p| {
-                    stage_output_positions
-                        .get(p)
-                        .copied()
-                        .unwrap_or(stage_output_len)
-                })
-                .collect();
-            input_positions = stage_input_positions
-                .iter()
-                .map(|&p| input_positions.get(p).copied().unwrap_or(input_len))
-                .collect();
-            output_len = stage_output_len;
         }
+        let (mut output_positions, mut input_positions) = match direction {
+            Direction::Forward => {
+                let mapping = &mapping[..output_len];
+                (invert(mapping, input_len), mapping.to_vec())
+            }
+            Direction::Backward => {
+                let mapping = &mapping[..input_len];
+                (mapping.to_vec(), invert(mapping, output_len))
+            }
+        };
         clamp_to_last(&mut output_positions, output_len);
         clamp_to_last(&mut input_positions, input_len);
         Self {
@@ -171,11 +181,6 @@ mod tests {
         ResolvedTranslation::new(input, output, 0, TranslationStage::Main, None)
     }
 
-    /// The (input length, output length) pair the position algorithms actually consume.
-    fn align(input: &str, output: &str) -> (usize, usize) {
-        (input.chars().count(), output.chars().count())
-    }
-
     fn forward_map(input_len: usize, stages: &[Vec<ResolvedTranslation>]) -> PositionMap {
         PositionMap::from_trace(input_len, stages, Direction::Forward)
     }
@@ -184,51 +189,25 @@ mod tests {
         PositionMap::from_trace(input_len, stages, Direction::Backward)
     }
 
-    #[test]
-    fn output_positions() {
-        assert_eq!(compute_output_positions(&[align("abc", "⠁⠃⠇")]), [0, 1, 2]);
-        assert_eq!(compute_output_positions(&[align("foo", "⠁")]), [0, 0, 0]);
-        assert_eq!(compute_output_positions(&[align("foo", "⠁⠃")]), [0, 1, 1]);
-        assert_eq!(compute_output_positions(&[align("a", "⠁⠃⠇")]), [0]);
-        assert_eq!(
-            compute_output_positions(&[align("abc", "⠁⠃⠇"), align("abc", "⠁⠃⠇")]),
-            [0, 1, 2, 3, 4, 5]
-        );
-        assert_eq!(
-            compute_output_positions(&[align("foo", "⠁"), align("abc", "⠁⠃⠇")]),
-            [0, 0, 0, 1, 2, 3]
-        );
-        assert_eq!(
-            compute_output_positions(&[align("a", "⠁⠃⠇"), align("abc", "⠁⠃⠇")]),
-            [0, 3, 4, 5]
-        );
-    }
-
-    #[test]
-    fn input_positions() {
-        assert_eq!(compute_input_positions(&[align("abc", "⠁⠃⠇")]), [0, 1, 2]);
-        assert_eq!(compute_input_positions(&[align("foo", "⠁")]), [0]);
-        assert_eq!(compute_input_positions(&[align("foo", "⠁⠃")]), [0, 1]);
-        assert_eq!(compute_input_positions(&[align("a", "⠁⠃⠇")]), [0, 0, 0]);
-        assert_eq!(
-            compute_input_positions(&[align("abc", "⠁⠃⠇"), align("abc", "⠁⠃⠇")]),
-            [0, 1, 2, 3, 4, 5]
-        );
-        assert_eq!(
-            compute_input_positions(&[align("foo", "⠁"), align("abc", "⠁⠃⠇")]),
-            [0, 3, 4, 5]
-        );
-        assert_eq!(
-            compute_input_positions(&[align("a", "⠁⠃⠇"), align("abc", "⠁⠃⠇")]),
-            [0, 0, 0, 1, 2, 3]
-        );
-    }
-
     fn stage(steps: &[(&str, &str)]) -> Vec<ResolvedTranslation> {
         steps
             .iter()
             .map(|(input, output)| translation(input, output))
             .collect()
+    }
+
+    #[test]
+    fn an_end_indicator_goes_with_the_character_before_it() {
+        let end = crate::parser::RuleParser::new("endemphword italic 6")
+            .rule()
+            .unwrap();
+        let stage = vec![
+            translation("a", "⠁"),
+            ResolvedTranslation::new("", "⠠", 0, TranslationStage::Main, Some(end.into())),
+            translation("b", "⠃"),
+        ];
+        let map = forward_map(2, &[stage]);
+        assert_eq!(map.input_positions(), [0, 0, 1]);
     }
 
     #[test]

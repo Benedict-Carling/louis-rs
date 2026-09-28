@@ -2,9 +2,10 @@
 
 use std::collections::HashSet;
 
-use crate::parser::multipass::test::Operator;
+use crate::parser::multipass::test::{Operator, split_leading_lookback, split_trailing_lookback};
 use crate::parser::{Action, ActionInstruction, HasPrecedence, Quantifier, Test, TestInstruction};
 
+use crate::Direction;
 use crate::parser::{AnchoredRule, Attribute, CharacterClass, CharacterClasses};
 use crate::translator::effect::{Effect, Environment};
 use crate::translator::regexp::{self, CompiledRegexp, Regexp};
@@ -17,53 +18,61 @@ use crate::translator::{ResolvedTranslation, TranslationError, TranslationStage}
 
 impl Regexp {
     fn from_test(test: &Test, whole_match: bool, ctx: &CharacterClasses) -> Self {
-        let regexp = Regexp::from_instructions(test.tests(), whole_match, ctx);
-        if whole_match {
-            Regexp::Consume(Box::new(regexp))
-        } else {
-            regexp
+        Regexp::from_test_in(test, whole_match, ctx, Direction::Forward)
+    }
+
+    fn from_test_in(
+        test: &Test,
+        whole_match: bool,
+        ctx: &CharacterClasses,
+        direction: Direction,
+    ) -> Self {
+        if !whole_match {
+            return Regexp::from_instructions(test.tests(), whole_match, ctx, direction);
         }
+        // `*` consumes from the rule's position to where the test ends, so the characters a
+        // leading or trailing `_N` steps back over are checked but not consumed
+        let (before, rest) = split_leading_lookback(test.tests());
+        let (consumed, after) = split_trailing_lookback(rest);
+        let mut regexp = Regexp::Consume(Box::new(Regexp::from_instructions(
+            consumed, true, ctx, direction,
+        )));
+        if !before.is_empty() {
+            regexp = Regexp::Concat(
+                Box::new(Regexp::from_instructions(before, true, ctx, direction)),
+                Box::new(regexp),
+            );
+        }
+        if !after.is_empty() {
+            regexp = Regexp::Concat(
+                Box::new(regexp),
+                Box::new(Regexp::from_instructions(after, true, ctx, direction)),
+            );
+        }
+        regexp
     }
 
     fn from_instructions(
         instructions: &[TestInstruction],
         whole_match: bool,
         ctx: &CharacterClasses,
+        direction: Direction,
     ) -> Self {
-        match instructions.len() {
-            0 => Regexp::Empty,
-            1 => Regexp::from_instruction(&instructions[0], whole_match, ctx),
-            _ => {
-                let mut ast = Regexp::from_instruction(&instructions[0], whole_match, ctx);
-                for instruction in &instructions[1..] {
-                    let other = Regexp::from_instruction(instruction, whole_match, ctx);
-                    ast = Regexp::Concat(Box::new(ast), Box::new(other));
-                }
-                ast
-            }
-        }
+        instructions
+            .iter()
+            .map(|instruction| Regexp::from_instruction(instruction, whole_match, ctx, direction))
+            .reduce(|ast, other| Regexp::Concat(Box::new(ast), Box::new(other)))
+            .unwrap_or(Regexp::Empty)
     }
 
     fn from_instruction(
         instruction: &TestInstruction,
         whole_match: bool,
         ctx: &CharacterClasses,
+        direction: Direction,
     ) -> Self {
         match instruction {
-            // liblouis' `_N` rewinds a single mutable cursor by N so a later test can peek at
-            // already-consumed (or, at the end of a test, not-yet-consumed) text without that
-            // text becoming part of the replaceable span — its own matcher needs this because it
-            // has no other way to look outside the span it's currently walking. We don't: (1)
-            // `ResolvedTranslation::resolve` sets the reported length to the *captured bracket's*
-            // length alone, never however much surrounding "before"/"after" content was checked,
-            // so a check placed before or after the bracket is never mistakenly swallowed into
-            // the consumed span regardless of `_N`'s value; and (2) `context_candidates` is
-            // queried at every cursor position (like `match`'s `pre`), so a check placed before
-            // the bracket is naturally discovered starting at the earlier position and held via
-            // `delayed_translations`/`offset()` until the cursor catches up. Dropping `_N`
-            // entirely and just compiling the surrounding checks in place is therefore already
-            // correct, not a stand-in for a real implementation — hence `Empty`, not some
-            // "unimplemented" marker.
+            // a leading `_N` is handled by matching from N characters back (see `find`)
             TestInstruction::Lookback { .. } => Regexp::Empty,
             TestInstruction::Variable { var, op, operand } => match op {
                 Operator::Eq => Regexp::VariableEqual(*var, *operand),
@@ -80,12 +89,28 @@ impl Regexp {
             TestInstruction::Class { name, quantifier } => {
                 Regexp::from_class(name, quantifier, ctx)
             }
-            TestInstruction::Negate { test } => {
-                Regexp::from_instruction(test, whole_match, ctx).negate()
-            }
+            TestInstruction::Negate { test } => match (direction, test.as_ref()) {
+                (Direction::Backward, TestInstruction::Attributes { attrs, quantifier }) => {
+                    Regexp::backward_negation(Regexp::attributes_set(attrs, ctx), quantifier)
+                }
+                (Direction::Backward, TestInstruction::Class { name, quantifier }) => {
+                    Regexp::backward_negation(Some(Regexp::class_set(name, ctx)), quantifier)
+                }
+                (Direction::Forward, TestInstruction::Attributes { attrs, quantifier }) => {
+                    Regexp::forward_negation(Regexp::attributes_set(attrs, ctx), quantifier)
+                }
+                (Direction::Forward, TestInstruction::Class { name, quantifier }) => {
+                    Regexp::forward_negation(Some(Regexp::class_set(name, ctx)), quantifier)
+                }
+                _ => Regexp::from_instruction(test, whole_match, ctx, direction).negate(),
+            },
             TestInstruction::Replace { tests } => {
-                let regexp =
-                    Regexp::Capture(Box::new(Regexp::from_instructions(tests, whole_match, ctx)));
+                let regexp = Regexp::Capture(Box::new(Regexp::from_instructions(
+                    tests,
+                    whole_match,
+                    ctx,
+                    direction,
+                )));
                 if whole_match {
                     regexp
                 } else {
@@ -94,24 +119,51 @@ impl Regexp {
             }
             TestInstruction::AtBeginning => Regexp::StartAnchor,
             TestInstruction::AtEnd => Regexp::EndAnchor,
+            // grouping is only implemented in the multipass engine, so such a rule never fires
+            TestInstruction::GroupStart { .. } | TestInstruction::GroupEnd { .. } => {
+                Regexp::CharacterClass(HashSet::new())
+            }
         }
     }
 
-    fn quantified(self, quantifier: &Option<Quantifier>) -> Self {
+    /// A quantified attribute test: liblouis's `passDoTest` takes as many matching
+    /// characters as the quantifier allows and never gives any back
+    fn possessive(characters: Option<HashSet<char>>, quantifier: &Option<Quantifier>) -> Self {
+        let (single, not_ahead) = match characters {
+            Some(characters) => (
+                Regexp::CharacterClass(characters.clone()),
+                Regexp::NotCharacterClassAhead(characters),
+            ),
+            None => (Regexp::Any, Regexp::EndAnchor),
+        };
         match quantifier {
-            None => self,
-            Some(Quantifier::Number(n)) => Regexp::RepeatExactly(*n, Box::new(self)),
+            None => single,
+            Some(Quantifier::Number(n)) => Regexp::RepeatExactly(*n, Box::new(single)),
             Some(Quantifier::Range(min, max)) => {
-                Regexp::RepeatAtLeastAtMost(*min, *max, Box::new(self))
+                let tail = (*min..*max).fold(Regexp::Empty, |rest, _| {
+                    Regexp::Either(
+                        Box::new(Regexp::Concat(Box::new(single.clone()), Box::new(rest))),
+                        Box::new(not_ahead.clone()),
+                    )
+                });
+                Regexp::Concat(
+                    Box::new(Regexp::RepeatExactly(*min, Box::new(single))),
+                    Box::new(tail),
+                )
             }
-            Some(Quantifier::OneOrMore) => Regexp::OneOrMore(Box::new(self)),
+            Some(Quantifier::OneOrMore) => Regexp::Concat(
+                Box::new(Regexp::OneOrMore(Box::new(single))),
+                Box::new(not_ahead),
+            ),
         }
     }
 
     fn from_class(name: &str, quantifier: &Option<Quantifier>, ctx: &CharacterClasses) -> Self {
-        let class = CharacterClass::from(name);
-        let characters = ctx.get(&class).unwrap_or_default(); // FIXME: should probably fail if we cannot find the class
-        Regexp::CharacterClass(characters).quantified(quantifier)
+        Regexp::possessive(Some(Regexp::class_set(name, ctx)), quantifier)
+    }
+
+    fn class_set(name: &str, ctx: &CharacterClasses) -> HashSet<char> {
+        ctx.get(&CharacterClass::from(name)).unwrap_or_default() // FIXME: should probably fail if we cannot find the class
     }
 
     fn from_multipass_attributes(
@@ -119,10 +171,15 @@ impl Regexp {
         quantifier: &Option<Quantifier>,
         ctx: &CharacterClasses,
     ) -> Self {
-        // liblouis compiles `a` to the full attribute mask, so it matches any character no
-        // matter what else is in the list -- an alternative with everything else is pointless
+        Regexp::possessive(Regexp::attributes_set(attrs, ctx), quantifier)
+    }
+
+    /// The characters an attribute test matches, or `None` for every character: liblouis
+    /// compiles `a` to the full attribute mask, so it matches any character no matter what
+    /// else is in the list
+    fn attributes_set(attrs: &HashSet<Attribute>, ctx: &CharacterClasses) -> Option<HashSet<char>> {
         if attrs.contains(&Attribute::Any) {
-            return Regexp::Any.quantified(quantifier);
+            return None;
         }
         let mut characters: HashSet<char> = HashSet::default();
         for attr in attrs {
@@ -132,12 +189,64 @@ impl Regexp {
                         characters.extend(chars);
                     }
                 }
-                Attribute::Boundary => (),   // TODO
-                Attribute::ByOrder(_) => (), // TODO
+                Attribute::Boundary => (), // TODO
+                Attribute::ByOrder(n) => {
+                    if let Some(chars) = ctx.get(&CharacterClass::Ordinal(*n)) {
+                        characters.extend(chars);
+                    }
+                }
                 Attribute::Any => unreachable!("handled above"),
             }
         }
-        Regexp::CharacterClass(characters).quantified(quantifier)
+        Some(characters)
+    }
+
+    fn forward_negation(
+        characters: Option<HashSet<char>>,
+        quantifier: &Option<Quantifier>,
+    ) -> Self {
+        let single = match characters {
+            Some(characters) => Regexp::CharacterClass(characters),
+            None => Regexp::Any,
+        }
+        .negate();
+        match quantifier {
+            None => single,
+            Some(Quantifier::Number(n)) => Regexp::RepeatExactly(*n, Box::new(single)),
+            Some(Quantifier::Range(min, max)) => {
+                Regexp::RepeatAtLeastAtMost(*min, *max, Box::new(single))
+            }
+            Some(Quantifier::OneOrMore) => Regexp::OneOrMore(Box::new(single)),
+        }
+    }
+
+    /// A negated attribute test in back-translation: liblouis's `back_passDoTest` inverts
+    /// the test's outcome, so it holds when fewer than the minimum count of characters
+    /// match, and it consumes only those that did
+    fn backward_negation(
+        characters: Option<HashSet<char>>,
+        quantifier: &Option<Quantifier>,
+    ) -> Self {
+        let min = match quantifier {
+            Some(Quantifier::Number(n)) | Some(Quantifier::Range(n, _)) => *n,
+            None | Some(Quantifier::OneOrMore) => 1,
+        };
+        let (single, not_ahead) = match characters {
+            Some(characters) => (
+                Regexp::CharacterClass(characters.clone()),
+                Regexp::NotCharacterClassAhead(characters),
+            ),
+            None => (Regexp::Any, Regexp::EndAnchor),
+        };
+        (0..min)
+            .map(|k| {
+                Regexp::Concat(
+                    Box::new(Regexp::RepeatExactly(k, Box::new(single.clone()))),
+                    Box::new(not_ahead.clone()),
+                )
+            })
+            .reduce(|a, b| Regexp::Either(Box::new(a), Box::new(b)))
+            .unwrap_or(Regexp::Never)
     }
 }
 
@@ -161,6 +270,9 @@ impl TranslationTarget {
             ActionInstruction::Assignment { .. }
             | ActionInstruction::Increment { .. }
             | ActionInstruction::Decrement { .. } => Ok(TranslationTarget::Literal("".to_string())),
+            ActionInstruction::GroupStart { .. } | ActionInstruction::GroupEnd { .. } => {
+                Ok(TranslationTarget::Literal("".to_string()))
+            }
         }
     }
 }
@@ -202,14 +314,28 @@ impl Effects {
 
 #[derive(Debug)]
 pub struct ContextPatternsBuilder {
-    regexps: Vec<CompiledRegexp>,
+    regexps: Vec<Pattern>,
+    direction: Direction,
+}
+
+/// A compiled context pattern, with the number of characters its test first steps back
+/// over
+#[derive(Debug)]
+struct Pattern {
+    lookback: usize,
+    regexp: CompiledRegexp,
 }
 
 impl ContextPatternsBuilder {
     pub fn new() -> Self {
         Self {
             regexps: Vec::new(),
+            direction: Direction::Forward,
         }
+    }
+
+    pub fn for_direction(self, direction: Direction) -> Self {
+        Self { direction, ..self }
     }
 
     /// Create a translation based on `test`, `action`, `origin` and `swap_classes`
@@ -218,9 +344,18 @@ impl ContextPatternsBuilder {
         action: &Action,
         origin: &AnchoredRule,
         stage: TranslationStage,
-        swap_classes: &SwapClasses,
+        ctx: &TableContext,
     ) -> Result<UnresolvedTranslation, TranslationError> {
-        let targets = TranslationTargets::from_instructions(&action.actions(), swap_classes)?;
+        let mut targets =
+            TranslationTargets::from_instructions(&action.actions(), ctx.swap_classes())?;
+        // liblouis' `context` copies the characters it keeps as their dots, other passes as they are
+        if stage == TranslationStage::Main {
+            for target in targets.iter_mut() {
+                if *target == TranslationTarget::Capture {
+                    *target = TranslationTarget::Characters(ctx.character_dots().clone());
+                }
+            }
+        }
         let effects = Effects::from_instructions(&action.actions());
         Ok(UnresolvedTranslation::new(
             &targets,
@@ -239,9 +374,12 @@ impl ContextPatternsBuilder {
         stage: TranslationStage,
         ctx: &TableContext,
     ) -> Result<(), TranslationError> {
-        let translation =
-            Translation::Unresolved(self.translation(action, origin, stage, ctx.swap_classes())?);
+        let translation = Translation::Unresolved(self.translation(action, origin, stage, ctx)?);
         let test = test.clone().add_implicit_replace();
+        let lookback = match test.tests().first() {
+            Some(TestInstruction::Lookback { len }) => usize::from(*len),
+            _ => 0,
+        };
         // for the multipass stages where we translate from braille to braille the character classes
         // need to be the dots_classes
         let character_classes = match stage {
@@ -252,32 +390,61 @@ impl ContextPatternsBuilder {
             // a display table is a plain character mapping, it has no context rules
             TranslationStage::Display => unreachable!(),
         };
-        let regexp = Regexp::from_test(&test, action.consumes_whole_match(), character_classes)
-            .compile_with_payload(translation);
-        self.regexps.push(regexp);
+        let regexp = Regexp::from_test_in(
+            &test,
+            action.consumes_whole_match(),
+            character_classes,
+            self.direction,
+        )
+        .compile_with_payload(translation);
+        self.regexps.push(Pattern { lookback, regexp });
         Ok(())
     }
 
     pub fn build(self) -> ContextPatterns {
         ContextPatterns {
             regexps: self.regexps,
+            direction: self.direction,
         }
     }
 }
 
 #[derive(Debug)]
 pub struct ContextPatterns {
-    regexps: Vec<CompiledRegexp>,
+    regexps: Vec<Pattern>,
+    direction: Direction,
 }
 
 impl ContextPatterns {
-    /// `at_start` tells whether `input` begins at position 0 of the whole string being
-    /// translated — needed to honor liblouis' `` ` `` ("beginning of input") test anchor,
-    /// which can appear anywhere in a compiled pattern (see [`Regexp::StartAnchor`]).
-    pub fn find(&self, input: &str, env: &Environment, at_start: bool) -> Vec<ResolvedTranslation> {
+    /// The translations of the patterns that match at `input`, `before` being the text
+    /// that precedes it. A test that starts with liblouis's `_N` is matched from `N`
+    /// characters back, and replaces nothing before `input`.
+    pub fn find(&self, before: &str, input: &str, env: &Environment) -> Vec<ResolvedTranslation> {
+        let before_len = before.chars().count();
         self.regexps
             .iter()
-            .flat_map(|r| r.find_anchored(input, env, at_start))
+            .flat_map(|p| {
+                let n = p.lookback;
+                if n == 0 {
+                    return p.regexp.find_anchored(input, env, before.is_empty());
+                }
+                if n > before_len {
+                    return None;
+                }
+                let (start, _) = before.char_indices().nth(before_len - n)?;
+                let shifted = format!("{}{}", &before[start..], input);
+                let t = p.regexp.find_anchored(&shifted, env, before_len == n)?;
+                if t.offset() >= n {
+                    Some(t.decrement_offset(n))
+                } else if self.direction == Direction::Backward {
+                    // liblouis's back_passDoTest lets the replacement start before the
+                    // match, and the cells before the match come out a second time
+                    let length = (t.offset() + t.length()).checked_sub(n)?;
+                    (length > 0).then(|| t.with_offset(0).with_length(length))
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 }
@@ -356,6 +523,37 @@ mod tests {
             ResolvedTranslation::new("", "", 1, stage, None).with_length(1)
         );
         assert_eq!(re.find("", &env), None);
+    }
+
+    /// liblouis takes as many characters as a quantified attribute test allows and never
+    /// gives any back to the tests after it
+    #[test]
+    fn quantified_attribute_is_possessive() {
+        let env = Environment::new();
+        let ctx = context(CharacterClass::Digit, &['1', '2', '3']);
+        let re =
+            Regexp::from_test(&test::Parser::new("$d.$d").tests().unwrap(), true, &ctx).compile();
+        assert!(!re.is_match("123", &env));
+        let re =
+            Regexp::from_test(&test::Parser::new("$d1-2$d").tests().unwrap(), true, &ctx).compile();
+        assert!(!re.is_match("12", &env));
+        assert!(re.is_match("123", &env));
+    }
+
+    /// In back-translation a negated attribute test only inverts the outcome, so it
+    /// consumes nothing when the character doesn't match
+    #[test]
+    fn negated_attribute_backward_is_zero_width() {
+        let env = Environment::new();
+        let mut ctx = context(CharacterClass::Digit, &['1']);
+        ctx.insert(CharacterClass::Letter, 'a');
+        let tests = test::Parser::new("!$d$l").tests().unwrap();
+        let backward = Regexp::from_test_in(&tests, true, &ctx, Direction::Backward).compile();
+        assert!(backward.is_match("a", &env));
+        assert!(!backward.is_match("1a", &env));
+        let forward = Regexp::from_test_in(&tests, true, &ctx, Direction::Forward).compile();
+        assert!(!forward.is_match("a", &env));
+        assert!(forward.is_match("aa", &env));
     }
 
     #[test]
@@ -666,6 +864,11 @@ mod tests {
         AnchoredRule::new(rule, None, 0)
     }
 
+    fn compiled(lines: &[&str]) -> TableContext {
+        let rules: Vec<AnchoredRule> = lines.iter().map(|line| origin(line)).collect();
+        TableContext::compile(&rules).unwrap()
+    }
+
     #[test]
     fn context_simple() {
         let env = Environment::new();
@@ -680,8 +883,8 @@ mod tests {
         let translation =
             ResolvedTranslation::new("abc", "A_B_C", 3, TranslationStage::Main, origin.clone());
         let patterns = builder.build();
-        assert_eq!(patterns.find("abc", &env, true), [translation]);
-        assert_eq!(patterns.find("def", &env, true), []);
+        assert_eq!(patterns.find("", "abc", &env), [translation]);
+        assert_eq!(patterns.find("", "def", &env), []);
     }
 
     #[test]
@@ -691,15 +894,17 @@ mod tests {
         let action = action::Parser::new(r#""<"*">""#).actions().unwrap();
         let origin = origin(r#"context "abc" "<"*">""#);
         let stage = TranslationStage::Main;
+        let ctx = compiled(&["letter a 1", "letter b 12", "letter c 14"]);
         let mut builder = ContextPatternsBuilder::new();
         builder
-            .insert(&tests, &action, &origin, stage, &TableContext::default())
+            .insert(&tests, &action, &origin, stage, &ctx)
             .unwrap();
+        // `*` in a `context` rule puts the dots of the kept characters
         let translation =
-            ResolvedTranslation::new("abc", "<abc>", 3, TranslationStage::Main, origin.clone());
+            ResolvedTranslation::new("abc", "<⠁⠃⠉>", 3, TranslationStage::Main, origin.clone());
         let patterns = builder.build();
-        assert_eq!(patterns.find("abc", &env, true), [translation]);
-        assert!(patterns.find("def", &env, true).is_empty());
+        assert_eq!(patterns.find("", "abc", &env), [translation]);
+        assert!(patterns.find("", "def", &env).is_empty());
     }
 
     #[test]
@@ -717,9 +922,9 @@ mod tests {
             ResolvedTranslation::new("a", "X", 1, TranslationStage::Main, origin.clone());
         let patterns = builder.build();
         // matches when `input` truly starts at position 0 of the whole string being translated
-        assert_eq!(patterns.find("a", &env, true), [translation]);
+        assert_eq!(patterns.find("", "a", &env), [translation]);
         // does not match when we are mid-string, even though the substring looks identical
-        assert!(patterns.find("a", &env, false).is_empty());
+        assert!(patterns.find("x", "a", &env).is_empty());
     }
 
     #[test]
@@ -737,9 +942,9 @@ mod tests {
             ResolvedTranslation::new("a", "X", 1, TranslationStage::Main, origin.clone());
         let patterns = builder.build();
         // matches when "a" is exactly the whole remaining input
-        assert_eq!(patterns.find("a", &env, true), [translation]);
+        assert_eq!(patterns.find("", "a", &env), [translation]);
         // does not match when there is trailing input after "a"
-        assert!(patterns.find("ab", &env, true).is_empty());
+        assert!(patterns.find("", "ab", &env).is_empty());
     }
 
     #[test]
@@ -761,8 +966,8 @@ mod tests {
         let translation =
             ResolvedTranslation::new("a", "X", 1, TranslationStage::Main, origin.clone());
         let patterns = builder.build();
-        assert_eq!(patterns.find("a", &env, true), [translation]);
-        assert!(patterns.find("a", &env, false).is_empty());
+        assert_eq!(patterns.find("", "a", &env), [translation]);
+        assert!(patterns.find("x", "a", &env).is_empty());
     }
 
     #[test]
@@ -780,18 +985,33 @@ mod tests {
             ResolvedTranslation::new("a", "X", 1, TranslationStage::Main, origin.clone());
         let patterns = builder.build();
         // "not at the beginning" -- opposite of `context_at_beginning_anchor`
-        assert!(patterns.find("a", &env, true).is_empty());
-        assert_eq!(patterns.find("a", &env, false), [translation]);
+        assert!(patterns.find("", "a", &env).is_empty());
+        assert_eq!(patterns.find("x", "a", &env), [translation]);
     }
 
     #[test]
-    fn context_lookback_before_bracket_is_ignored_not_consumed() {
-        // liblouis' `_1$d[...]` rewinds 1, checks the preceding char is a digit, then advances
-        // back to the bracket. We drop the `_1` (see the comment at
-        // `TestInstruction::Lookback`'s match arm) and just check `$d` in place instead. This
-        // still requires a digit immediately before the bracket — discovered when the cursor
-        // sits at that digit, held via `offset()`/`delayed_translations` until it catches up —
-        // and the reported length only ever covers the bracket itself, never the digit.
+    fn context_copy_trailing_lookback_not_consumed() {
+        let env = Environment::new();
+        let tests = test::Parser::new(r#""a"["b"]!"c"_"#).tests().unwrap();
+        let action = action::Parser::new("*").actions().unwrap();
+        let origin = origin(r#"context "a"["b"]!"c"_ *"#);
+        let stage = TranslationStage::Main;
+        let ctx = compiled(&["letter b 12"]);
+        let mut builder = ContextPatternsBuilder::new();
+        builder
+            .insert(&tests, &action, &origin, stage, &ctx)
+            .unwrap();
+        let patterns = builder.build();
+        // "a" and "b" are consumed, "d" only checked
+        let translation =
+            ResolvedTranslation::new("b", "⠃", 3, stage, origin.clone()).with_length(2);
+        assert_eq!(patterns.find("", "abd", &env), [translation]);
+        assert!(patterns.find("", "abc", &env).is_empty());
+    }
+
+    #[test]
+    fn context_lookback_checks_the_preceding_text() {
+        // liblouis' `_1$d[...]` rewinds 1 and checks that the preceding character is a digit
         let env = Environment::new();
         let tests = test::Parser::new(r#"_1$d["b"]"#).tests().unwrap();
         let action = action::Parser::new(r#""X""#).actions().unwrap();
@@ -807,16 +1027,37 @@ mod tests {
             .insert(&tests, &action, &origin, stage, &ctx)
             .unwrap();
         let patterns = builder.build();
-        // "a" is a digit here, so the rule fires on "b" once found starting at "a"; the digit
-        // itself is not part of the reported match: `length()` is 1 (just "b", derived from
-        // `input`/capture below), even though `weight()` — used only to rank competing
-        // candidates, per the established convention in `context_capture_advanced` above —
-        // reflects the whole 2-char span that was actually checked ("a" + "b")
-        let translation =
-            ResolvedTranslation::new("b", "X", 2, stage, origin.clone()).with_offset(1);
-        assert_eq!(patterns.find("ab", &env, true), [translation]);
-        // does not fire when the preceding character isn't a digit
-        assert!(patterns.find("bb", &env, true).is_empty());
+        // "a" is a digit here, so the rule fires on "b" after it; `weight()` reflects the
+        // whole span that was checked ("a" + "b")
+        let translation = ResolvedTranslation::new("b", "X", 2, stage, origin.clone());
+        assert_eq!(patterns.find("a", "b", &env), [translation]);
+        // does not fire when the preceding character isn't a digit, or there is none
+        assert!(patterns.find("b", "b", &env).is_empty());
+        assert!(patterns.find("", "ab", &env).is_empty());
+    }
+
+    #[test]
+    fn backward_lookback_may_replace_before_the_match() {
+        // liblouis's back_passDoTest has no check that the replacement starts at or after
+        // the match, so the cell stepped back over comes out a second time
+        let env = Environment::new();
+        let tests = test::Parser::new(r#"_1["ab"]"#).tests().unwrap();
+        let action = action::Parser::new(r#""X""#).actions().unwrap();
+        let origin = origin(r#"pass2 _1["ab"] "X""#);
+        let mut builder = ContextPatternsBuilder::new().for_direction(Direction::Backward);
+        builder
+            .insert(
+                &tests,
+                &action,
+                &origin,
+                TranslationStage::Post1,
+                &TableContext::default(),
+            )
+            .unwrap();
+        let patterns = builder.build();
+        let found = patterns.find("a", "b", &env);
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].offset(), found[0].length()), (0, 1));
     }
 
     #[test]
@@ -845,9 +1086,9 @@ mod tests {
         // matches, and only consumes "b" (`length()` 1), when followed by a non-digit; `weight()`
         // is 2, reflecting the whole "b"+"z" span that was checked
         let translation = ResolvedTranslation::new("b", "X", 2, stage, origin.clone());
-        assert_eq!(patterns.find("bz", &env, true), [translation]);
+        assert_eq!(patterns.find("", "bz", &env), [translation]);
         // does not fire when followed by a digit
-        assert!(patterns.find("b1", &env, true).is_empty());
+        assert!(patterns.find("", "b1", &env).is_empty());
     }
 
     #[test]
@@ -861,16 +1102,17 @@ mod tests {
         let action = action::Parser::new("*").actions().unwrap();
         let origin = origin(r#"context `["-"]~ *"#);
         let stage = TranslationStage::Main;
+        let ctx = compiled(&["punctuation - 36"]);
         let mut builder = ContextPatternsBuilder::new();
         builder
-            .insert(&tests, &action, &origin, stage, &TableContext::default())
+            .insert(&tests, &action, &origin, stage, &ctx)
             .unwrap();
         let translation =
-            ResolvedTranslation::new("-", "-", 1, TranslationStage::Main, origin.clone());
+            ResolvedTranslation::new("-", "⠤", 1, TranslationStage::Main, origin.clone());
         let patterns = builder.build();
-        assert_eq!(patterns.find("-", &env, true), [translation]);
-        assert!(patterns.find("-0", &env, true).is_empty());
-        assert!(patterns.find("-", &env, false).is_empty());
+        assert_eq!(patterns.find("", "-", &env), [translation]);
+        assert!(patterns.find("", "-0", &env).is_empty());
+        assert!(patterns.find("x", "-", &env).is_empty());
     }
 
     #[test]
@@ -894,8 +1136,8 @@ mod tests {
             ResolvedTranslation::new("⠐", "⠐⠥", 3, TranslationStage::Post1, origin.clone())
 	    .with_length(3);
         let patterns = builder.build();
-        assert_eq!(patterns.find("⠕⠐⠽", &env, true), [translation]);
-        assert!(patterns.find("⠕", &env, true).is_empty());
+        assert_eq!(patterns.find("", "⠕⠐⠽", &env), [translation]);
+        assert!(patterns.find("", "⠕", &env).is_empty());
     }
 
     #[test]
@@ -903,11 +1145,13 @@ mod tests {
         let env = Environment::new();
         let tests = test::Parser::new(r#"$p3["abc"]$p3"#).tests().unwrap();
         let action = action::Parser::new(r#""<"*">""#).actions().unwrap();
-        let context = TableContext::new(
-            CharacterClasses::new(&[(CharacterClass::Punctuation, &['{', '}'])]),
-            CharacterClasses::default(),
-            SwapClasses::default(),
-        );
+        let context = compiled(&[
+            "punctuation { 246",
+            "punctuation } 12456",
+            "letter a 1",
+            "letter b 12",
+            "letter c 14",
+        ]);
         let origin = origin(r#"context $p3"abc"$p3 "<"*">""#);
         let stage = TranslationStage::Main;
         let mut builder = ContextPatternsBuilder::new();
@@ -916,11 +1160,11 @@ mod tests {
             .unwrap();
         let translation =
             // `"<"*">"` copies the bracket and advances to `endMatch`, eating both `$p3`s
-            ResolvedTranslation::new("abc", "<abc>", 9, TranslationStage::Main, origin.clone())
+            ResolvedTranslation::new("abc", "<⠁⠃⠉>", 9, TranslationStage::Main, origin.clone())
                 .with_length(9);
         let patterns = builder.build();
-        assert_eq!(patterns.find("{{{abc}}}", &env, true), [translation]);
-        assert!(patterns.find("def", &env, true).is_empty());
+        assert_eq!(patterns.find("", "{{{abc}}}", &env), [translation]);
+        assert!(patterns.find("", "def", &env).is_empty());
     }
 
     #[test]
@@ -944,7 +1188,7 @@ mod tests {
                 .with_offset(3)
                 .with_length(3);
         let patterns = builder.build();
-        assert_eq!(patterns.find("{{{abc}}}", &env, true), [translation]);
-        assert!(patterns.find("def", &env, true).is_empty());
+        assert_eq!(patterns.find("", "{{{abc}}}", &env), [translation]);
+        assert!(patterns.find("", "def", &env).is_empty());
     }
 }

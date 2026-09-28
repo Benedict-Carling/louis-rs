@@ -17,11 +17,22 @@ impl Swapper {
         ))
     }
 
-    /// Swap the characters in the `input` according to the mapping defined in this Swapper
+    /// Whether the mapping covers `c`
+    pub fn contains(&self, c: char) -> bool {
+        self.0.contains_key(&c)
+    }
+
+    /// What `c` is swapped for
+    pub fn replacement(&self, c: char) -> Option<&str> {
+        self.0.get(&c).map(String::as_str)
+    }
+
+    /// Swap the characters in the `input` according to the mapping defined in this Swapper.
+    /// Like liblouis' `swapReplace`, characters the mapping doesn't cover are dropped.
     pub fn swap(&self, input: &str) -> String {
         input
             .chars()
-            .map(|c| self.0.get(&c).cloned().unwrap_or(c.to_string()))
+            .filter_map(|c| self.0.get(&c).cloned())
             .collect()
     }
 }
@@ -56,13 +67,14 @@ mod tests {
         let swapper = Swapper::new(&[('a', "⠁"), ('b', "⠉"), ('c', "⠙⠇")]);
 
         assert_eq!(swapper.swap("abc"), "⠁⠉⠙⠇");
-        assert_eq!(swapper.swap("xyz"), "xyz"); // unmapped chars unchanged
+        assert_eq!(swapper.swap("xyz"), ""); // unmapped chars dropped
+        assert_eq!(swapper.swap("a b"), "⠁⠉");
     }
 
     #[test]
     fn swapper_empty() {
         let swapper = Swapper::default();
-        assert_eq!(swapper.swap("hello"), "hello");
+        assert_eq!(swapper.swap("hello"), "");
     }
 
     #[test]

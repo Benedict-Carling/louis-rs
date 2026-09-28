@@ -13,107 +13,177 @@
 //!
 //! The indicator types are:
 //! * [`computer_braille::Indicator`]: wraps computer-braille spans with begcomp/endcomp
-//! * [`emphasis::Indicator`]: detects emphasis runs and emits letter/word/phrase indicators
+//! * [`emphasis::Emphases`]: marks emphasis and capitals the way liblouis does, and
+//!   inserts their indicators as the translation loop reaches each position
 //! * [`numeric::Indicator`]: detects digit sequences and emits number-sign indicators
-//! * [`uppercase::Indicator`]: detects uppercase runs and emits capitalisation indicators
-//! * [`mode::Indicator`]: detects character class runs and emits mode indicators
 //! * [`lettersign::Indicator`]: detects contractions that require a letter sign
 //! * [`nocontract::Indicator`]: detects contractions that require a no-contract sign
 
 use crate::emphasis::EmphasisSpan;
 use crate::translator::ResolvedTranslation;
 
-mod class_indicator;
 pub mod computer_braille;
 pub mod emphasis;
 pub mod lettersign;
-pub mod mode;
 pub mod nocontract;
 pub mod numeric;
-pub mod uppercase;
-
-/// Finds maximal spans within `chars[start..end)` where `predicate` holds.
-///
-/// Used by indicators that need to segment a range into alternating "matching" and
-/// "non-matching" runs — e.g. [`uppercase::Indicator`] splitting text into
-/// letter/capsmodechar words, or [`emphasis::Indicator`] splitting an active span into
-/// words separated by whitespace (or `emphmodechars`).
-fn find_spans(
-    chars: &[char],
-    start: usize,
-    end: usize,
-    predicate: impl Fn(char) -> bool,
-) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut pos = start;
-    while pos < end {
-        while pos < end && !predicate(chars[pos]) {
-            pos += 1;
-        }
-        if pos >= end {
-            break;
-        }
-        let span_start = pos;
-        while pos < end && predicate(chars[pos]) {
-            pos += 1;
-        }
-        spans.push((span_start, pos));
-    }
-    spans
-}
 
 #[derive(Debug, Clone)]
 pub enum Indicator {
     ComputerBraille(computer_braille::Indicator),
-    Emphasis(emphasis::Indicator),
     LetterSign(lettersign::Indicator),
-    Mode(mode::Indicator),
     NoContract(nocontract::Indicator),
     Numeric(numeric::Indicator),
-    Uppercase(uppercase::Indicator),
 }
 
 #[derive(Debug, Clone)]
-pub struct Indicators(Vec<Indicator>);
+pub struct Indicators {
+    indicators: Vec<Indicator>,
+    emphases: Option<emphasis::Emphases>,
+}
 
 /// The result of pre-computing indications for a given input.
 ///
 /// Holds per-position braille translations to emit, indexed by
 /// character position (with one extra slot at index `n` for translations that
 /// must appear after all input characters, e.g. `endemph` at end of string).
-pub struct PrecomputedIndications(Vec<Vec<ResolvedTranslation>>);
+pub struct PrecomputedIndications<'a> {
+    /// The translations before the emphasis ones, between the emphasis and the capital
+    /// start ones, and after the capital start ones
+    translations: Vec<[Vec<ResolvedTranslation>; 3]>,
+    marks: Option<emphasis::Marks<'a>>,
+    /// liblouis's `insertEmphasesFrom`
+    from: usize,
+    /// A numeric indicator stepped as the translation loop visits positions
+    live_numeric: Option<&'a numeric::Indicator>,
+    in_numeric: bool,
+    chars: Vec<char>,
+    /// The positions in computer braille, where liblouis puts no other indicator
+    computer_braille: Vec<bool>,
+}
 
-impl PrecomputedIndications {
-    pub fn translations_at(&self, pos: usize) -> Vec<ResolvedTranslation> {
-        self.0.get(pos).cloned().unwrap_or_default()
+impl PrecomputedIndications<'_> {
+    /// Whether `pos` is computer braille, where liblouis inserts no indicators but
+    /// computer braille's own
+    fn in_computer_braille(&self, pos: usize) -> bool {
+        self.computer_braille.get(pos).copied().unwrap_or(false)
+    }
+
+    /// The start indicators of the modes and capitals at `pos`, modes first
+    fn mode_begin_at(&self, pos: usize) -> Vec<ResolvedTranslation> {
+        if self.in_computer_braille(pos) {
+            return Vec::new();
+        }
+        self.marks
+            .as_ref()
+            .map(|m| m.caps_begin_at(pos))
+            .unwrap_or_default()
+    }
+
+    /// The indications at `pos`. Call it each time the translation loop visits a
+    /// position, in order; `revisit` when it stays at the position it visited last, where
+    /// liblouis inserts only the mode and capital start indicators again.
+    ///
+    /// Like liblouis's `insertEmphasesAt`, each position since the last visit first
+    /// gets its capital and mode ends and its emphasis, and those before `pos` their
+    /// mode and capital starts too.
+    pub fn translations_at(&mut self, pos: usize, revisit: bool) -> Vec<ResolvedTranslation> {
+        let caps = self.mode_begin_at(pos);
+        if revisit {
+            return caps;
+        }
+        let mut reached = Vec::new();
+        for at in self.from..=pos.min(self.chars.len()) {
+            if let Some(m) = &self.marks
+                && !self.in_computer_braille(at)
+            {
+                reached.extend(m.caps_end_at(at));
+                reached.extend(m.emphasis_at(at));
+            }
+            if at < pos {
+                reached.extend(self.mode_begin_at(at));
+            }
+        }
+        self.from = pos + 1;
+        let numeric = if self.in_computer_braille(pos) {
+            self.in_numeric = false;
+            None
+        } else {
+            self.live_numeric
+                .and_then(|n| n.at(&mut self.in_numeric, &self.chars, pos))
+        };
+        let empty = Default::default();
+        let [lead, mid, tail] = self.translations.get(pos).unwrap_or(&empty);
+        lead.iter()
+            .cloned()
+            .chain(reached)
+            .chain(mid.iter().cloned())
+            .chain(caps)
+            .chain(numeric)
+            .chain(tail.iter().cloned())
+            .collect()
+    }
+
+    /// Whether an emphasis or capital mark falls on `pos`
+    pub fn marked_at(&self, pos: usize) -> bool {
+        self.marks.as_ref().is_some_and(|m| m.marked_at(pos))
+    }
+
+    /// Whether an emphasis or capital mark falls inside `pos..pos + len`
+    pub fn changes_within(&self, pos: usize, len: usize) -> bool {
+        self.marks
+            .as_ref()
+            .is_some_and(|m| m.changes_within(pos, len))
     }
 }
 
 impl Indicators {
-    pub fn new(indicators: Vec<Indicator>) -> Indicators {
-        Indicators(indicators)
+    pub fn new(indicators: Vec<Indicator>, emphases: Option<emphasis::Emphases>) -> Indicators {
+        Indicators {
+            indicators,
+            emphases,
+        }
     }
 
-    pub fn precompute(&self, input: &str, spans: &[EmphasisSpan]) -> PrecomputedIndications {
-        let n = input.chars().count();
-        let mut indications: Vec<Vec<ResolvedTranslation>> = vec![vec![]; n + 1];
+    pub fn precompute(&self, input: &str, spans: &[EmphasisSpan]) -> PrecomputedIndications<'_> {
+        let chars: Vec<char> = input.chars().collect();
+        let mut computer_braille = vec![false; chars.len() + 1];
+        for span in spans.iter().filter(|s| s.class == "computer_braille") {
+            for pos in span.range.start..span.range.end.min(chars.len()) {
+                computer_braille[pos] = true;
+            }
+        }
+        let mut translations = vec![<[Vec<ResolvedTranslation>; 3]>::default(); chars.len() + 1];
+        let mut live_numeric = None;
 
-        for indicator in &self.0 {
-            let pairs: Vec<(usize, ResolvedTranslation)> = match indicator {
-                Indicator::ComputerBraille(i) => i.precompute(input, spans),
-                Indicator::Emphasis(i) => i.precompute(input, spans),
-                Indicator::Numeric(i) => i.precompute(input),
-                Indicator::Uppercase(i) => i.precompute(input),
-                Indicator::Mode(i) => i.precompute(input),
-                Indicator::LetterSign(i) => i.precompute(input),
-                Indicator::NoContract(i) => i.precompute(input),
+        for indicator in &self.indicators {
+            let (bucket, pairs) = match indicator {
+                Indicator::ComputerBraille(i) => (0, i.precompute(input, spans)),
+                Indicator::Numeric(i) if i.is_live() => {
+                    live_numeric = Some(i);
+                    continue;
+                }
+                Indicator::Numeric(i) => (2, i.precompute(input)),
+                Indicator::LetterSign(i) => (1, i.precompute(input)),
+                Indicator::NoContract(i) => (1, i.precompute(input)),
             };
             for (pos, t) in pairs {
-                indications[pos].push(t);
+                if computer_braille[pos] && !matches!(indicator, Indicator::ComputerBraille(_)) {
+                    continue;
+                }
+                translations[pos][bucket].push(t);
             }
         }
 
-        PrecomputedIndications(indications)
+        PrecomputedIndications {
+            translations,
+            marks: self.emphases.as_ref().map(|e| e.mark(&chars, spans)),
+            from: 0,
+            live_numeric,
+            in_numeric: false,
+            chars,
+            computer_braille,
+        }
     }
 }
 
@@ -121,7 +191,7 @@ impl Indicators {
 mod tests {
     use super::*;
     use crate::{
-        parser::{AnchoredRule, RuleParser},
+        parser::{AnchoredRule, CharacterClass, CharacterClasses, RuleParser},
         translator::table::TableContext,
     };
     use std::collections::HashSet;
@@ -131,39 +201,32 @@ mod tests {
     }
 
     #[test]
-    fn find_spans_returns_maximal_matching_runs() {
-        let chars: Vec<char> = "  ab cd  e".chars().collect();
-        assert_eq!(
-            find_spans(&chars, 0, chars.len(), |c| c != ' '),
-            vec![(2, 4), (5, 7), (9, 10)]
-        );
-    }
-
-    #[test]
-    fn find_spans_respects_the_given_range() {
-        let chars: Vec<char> = "aabbaabb".chars().collect();
-        assert_eq!(find_spans(&chars, 2, 6, |c| c == 'b'), vec![(2, 4)]);
-    }
-
-    #[test]
     fn precompute_combines_indicators() {
         let mut num_builder = numeric::IndicatorBuilder::new();
-        num_builder.numeric_characters(HashSet::from(['1', '2', '3']));
+        num_builder
+            .runs()
+            .numeric_characters(HashSet::from(['1', '2', '3']));
         num_builder.numsign("⠼", &rule("numsign 3456"));
         let numeric = Indicator::Numeric(num_builder.build().unwrap());
 
-        let mut cap_builder = uppercase::IndicatorBuilder::new();
+        let mut cap_builder = emphasis::IndicatorBuilder::new();
         cap_builder.capsletter("⠠", &rule("capsletter 6"));
-        cap_builder.uppercase_characters(HashSet::from(['A', 'B', 'C']));
-        cap_builder.letter_characters(HashSet::from(['a', 'b', 'c', 'A', 'B', 'C']));
-        let uppercase = Indicator::Uppercase(cap_builder.build(&TableContext::default()).unwrap());
+        let ctx = TableContext::new(
+            CharacterClasses::new(&[
+                (CharacterClass::Uppercase, &['A', 'B', 'C']),
+                (CharacterClass::Letter, &['a', 'b', 'c', 'A', 'B', 'C']),
+            ]),
+            CharacterClasses::default(),
+            Default::default(),
+        );
+        let emphases = cap_builder.build(&ctx);
 
-        let indicators = Indicators::new(vec![numeric, uppercase]);
-        let indications = indicators.precompute("A1", &[]);
+        let indicators = Indicators::new(vec![numeric], emphases);
+        let mut indications = indicators.precompute("A1", &[]);
 
-        let outputs_at = |pos| {
+        let mut outputs_at = |pos| {
             indications
-                .translations_at(pos)
+                .translations_at(pos, false)
                 .into_iter()
                 .map(|t| t.output().to_string())
                 .collect::<Vec<_>>()

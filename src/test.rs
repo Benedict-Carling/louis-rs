@@ -1,6 +1,9 @@
 //! A test runner for tests defined in [liblouis](https://liblouis.io) YAML test files
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use enumset::EnumSet;
 use rayon::prelude::*;
@@ -9,10 +12,12 @@ use search_path::SearchPath;
 
 use crate::{
     emphasis::EmphasisSpan,
+    hyphenation::HyphenationTable,
     metadata,
-    parser::{self, Direction, TableError},
+    parser::{self, AnchoredRule, Direction, Rule, TableError},
     translator::{
-        self, DisplayTable, PositionMap, TranslationModes, TranslationOptions, TranslationPipeline,
+        self, CharToDots, DisplayTable, ImpliedDisplay, PositionMap, TranslationModes,
+        TranslationOptions, TranslationPipeline,
     },
 };
 
@@ -28,6 +33,8 @@ pub enum TestError {
     NoTableForQuery(String),
     #[error("The query {0} matches more than one table: {1:?}")]
     AmbiguousTableQuery(String, Vec<PathBuf>),
+    #[error("The table has no hyphenation dictionary")]
+    NoHyphenationTable,
 }
 
 impl From<Vec<TableError>> for TestError {
@@ -58,6 +65,12 @@ pub enum FailureReason {
         direction: Direction,
     },
     Position(PositionMismatch),
+    /// The text matched, but a back-translation reported the wrong emphasis
+    Typeform {
+        input: String,
+        expected: Vec<EmphasisSpan>,
+        actual: Vec<EmphasisSpan>,
+    },
 }
 
 #[derive(PartialEq, Debug)]
@@ -85,7 +98,10 @@ impl TestResult {
         matches!(self, TestResult::Success)
     }
     pub fn is_translation_failure(&self) -> bool {
-        matches!(self, TestResult::Failure(FailureReason::Translation { .. }))
+        matches!(
+            self,
+            TestResult::Failure(FailureReason::Translation { .. } | FailureReason::Typeform { .. })
+        )
     }
     pub fn is_position_failure(&self) -> bool {
         matches!(self, TestResult::Failure(FailureReason::Position(_)))
@@ -139,6 +155,8 @@ pub enum PositionDiff {
 /// A group of [`Tests`](Test) that share the same braille table(s), display table and test mode.
 #[derive(Debug)]
 pub struct TestMatrix<'a> {
+    /// Where the tables are looked up
+    search_path: &'a SearchPath,
     /// The display table used for the translation tests
     display: &'a Option<Display>,
     /// The braille table(s) used for the translation tests
@@ -151,12 +169,14 @@ pub struct TestMatrix<'a> {
 
 impl<'a> TestMatrix<'a> {
     pub fn new(
+        search_path: &'a SearchPath,
         display: &'a Option<Display>,
         tables: &'a Vec<Table>,
         mode: &'a TestMode,
         tests: &'a Vec<Test>,
     ) -> Self {
         TestMatrix {
+            search_path,
             display,
             tables,
             mode,
@@ -165,17 +185,17 @@ impl<'a> TestMatrix<'a> {
     }
 
     fn display_table(&self, direction: Direction) -> Result<DisplayTable, TestError> {
-        let search_path = SearchPath::new_or("LOUIS_TABLE_PATH", ".");
+        let search_path = self.search_path;
         let display_rules = match self.display {
-            Some(Display::Simple(path)) => parser::table_expanded_in(path.as_path(), &search_path)?,
+            Some(Display::Simple(path)) => parser::table_expanded_in(path.as_path(), search_path)?,
             Some(Display::Inline(text)) => {
                 let rules = parser::table(text, None)?;
-                parser::expand_includes(rules, &search_path, &[])?
+                parser::expand_includes(rules, search_path, &[])?
             }
             Some(Display::List(paths)) => {
                 let mut rules = Vec::new();
                 for path in paths {
-                    rules.extend(parser::table_expanded_in(path, &search_path)?);
+                    rules.extend(parser::table_expanded_in(path, search_path)?);
                 }
                 rules
             }
@@ -184,24 +204,20 @@ impl<'a> TestMatrix<'a> {
         Ok(DisplayTable::compile(&display_rules, direction))
     }
 
-    fn translation_table(
-        &self,
-        table: &Table,
-        direction: Direction,
-    ) -> Result<TranslationPipeline, TestError> {
-        let search_path = SearchPath::new_or("LOUIS_TABLE_PATH", ".");
-        let rules = match table {
-            Table::Simple(path) => parser::table_expanded_in(path.as_path(), &search_path)?,
+    fn rules(&self, table: &Table) -> Result<Vec<AnchoredRule>, TestError> {
+        let search_path = self.search_path;
+        Ok(match table {
+            Table::Simple(path) => parser::table_expanded_in(path.as_path(), search_path)?,
             Table::List(paths) => {
                 let mut rules = Vec::new();
                 for path in paths {
-                    rules.extend(parser::table_expanded_in(path, &search_path)?);
+                    rules.extend(parser::table_expanded_in(path, search_path)?);
                 }
                 rules
             }
             Table::Inline(text) => {
                 let rules = parser::table(text, None)?;
-                parser::expand_includes(rules, &search_path, &[])?
+                parser::expand_includes(rules, search_path, &[])?
             }
             Table::Query(query) => {
                 let index =
@@ -211,7 +227,7 @@ impl<'a> TestMatrix<'a> {
                     index.find(query.clone()).into_iter().cloned().collect();
                 match matches.as_slice() {
                     [] => return Err(TestError::NoTableForQuery(query.to_string())),
-                    [path] => parser::table_expanded_in(path, &search_path)?,
+                    [path] => parser::table_expanded_in(path, search_path)?,
                     several => {
                         return Err(TestError::AmbiguousTableQuery(
                             query.to_string(),
@@ -220,11 +236,24 @@ impl<'a> TestMatrix<'a> {
                     }
                 }
             }
-        };
-        // the display table is a pipeline stage on the braille side, so the pipeline
-        // applies it in the right place for `direction` and it composes into the positions
-        Ok(TranslationPipeline::compile(&rules, direction)?
-            .with_display(self.display_table(direction)?))
+        })
+    }
+
+    /// The pipeline for `table`, and when no `display:` is given the table read as its own
+    /// display table, as liblouis's checker does.
+    fn translation_table(
+        &self,
+        table: &Table,
+        direction: Direction,
+    ) -> Result<(TranslationPipeline, Option<ImpliedDisplay>), TestError> {
+        let rules = self.rules(table)?;
+        let pipeline = TranslationPipeline::compile(&rules, direction)?;
+        Ok(match self.display {
+            // the display table is a pipeline stage on the braille side, so the pipeline
+            // applies it in the right place for `direction` and it composes into the positions
+            Some(_) => (pipeline.with_display(self.display_table(direction)?), None),
+            None => (pipeline, Some(ImpliedDisplay::compile(&rules))),
+        })
     }
 
     pub fn check(&self) -> Result<Vec<TestResult>, TestError> {
@@ -232,11 +261,11 @@ impl<'a> TestMatrix<'a> {
         match self.mode {
             TestMode::Forward => {
                 for table in self.tables {
-                    let table = self.translation_table(table, Direction::Forward)?;
+                    let (table, display) = self.translation_table(table, Direction::Forward)?;
                     results.extend(
                         self.tests
                             .par_iter()
-                            .map(|test| test.check(&table, Direction::Forward))
+                            .map(|test| test.check(&table, display.as_ref(), Direction::Forward))
                             .collect::<Vec<_>>(),
                     );
                 }
@@ -245,11 +274,14 @@ impl<'a> TestMatrix<'a> {
                 // ignore the backward test if LOUIS_TEST_FOWARD_ONLY is defined
                 if option_env!("LOUIS_TEST_FORWARD_ONLY").is_none() {
                     for table in self.tables {
-                        let table = self.translation_table(table, Direction::Backward)?;
+                        let (table, display) =
+                            self.translation_table(table, Direction::Backward)?;
                         results.extend(
                             self.tests
                                 .par_iter()
-                                .map(|test| test.check(&table, Direction::Backward))
+                                .map(|test| {
+                                    test.check(&table, display.as_ref(), Direction::Backward)
+                                })
                                 .collect::<Vec<_>>(),
                         );
                     }
@@ -257,11 +289,11 @@ impl<'a> TestMatrix<'a> {
             }
             TestMode::BothDirections => {
                 for table in self.tables {
-                    let table = self.translation_table(table, Direction::Forward)?;
+                    let (table, display) = self.translation_table(table, Direction::Forward)?;
                     results.extend(
                         self.tests
                             .par_iter()
-                            .map(|test| test.check(&table, Direction::Forward))
+                            .map(|test| test.check(&table, display.as_ref(), Direction::Forward))
                             .collect::<Vec<_>>(),
                     );
                 }
@@ -271,20 +303,163 @@ impl<'a> TestMatrix<'a> {
                     let reversed: Vec<Test> =
                         self.tests.iter().cloned().map(|t| t.reverse()).collect();
                     for table in self.tables {
-                        let table = self.translation_table(table, Direction::Backward)?;
+                        let (table, display) =
+                            self.translation_table(table, Direction::Backward)?;
                         results.extend(
                             reversed
                                 .par_iter()
-                                .map(|test| test.check(&table, Direction::Backward))
+                                .map(|test| {
+                                    test.check(&table, display.as_ref(), Direction::Backward)
+                                })
                                 .collect::<Vec<_>>(),
                         );
                     }
                 }
             }
-            _ => (), // FIXME: not yet implemented
+            TestMode::Display => {
+                for table in self.tables {
+                    let table = CharToDots::compile(&self.rules(table)?);
+                    results.extend(self.tests.iter().map(|test| test.check_display(&table)));
+                }
+            }
+            TestMode::Hyphenate | TestMode::HyphenateBraille => {
+                let braille = matches!(self.mode, TestMode::HyphenateBraille);
+                for table in self.tables {
+                    let rules = self.rules(table)?;
+                    let back = if braille {
+                        Some(self.translation_table(table, Direction::Backward)?)
+                    } else {
+                        None
+                    };
+                    let hyphenator = Hyphenator::compile(&rules)?;
+                    results.extend(self.tests.iter().map(|test| {
+                        let hyphens = match &back {
+                            Some((pipeline, display)) => hyphenator.hyphenate_braille(
+                                &test.input,
+                                pipeline,
+                                display.as_ref(),
+                            ),
+                            None => Some(hyphenator.hyphenate(&test.input)),
+                        };
+                        let shown = hyphens.map_or_else(String::new, |hyphens| {
+                            show_hyphens(&test.input, &hyphens)
+                        });
+                        test.verdict(shown, Direction::Forward, None)
+                    }));
+                }
+            }
         }
         Ok(results)
     }
+}
+
+/// liblouis's `lou_hyphenate`: where the letters of each word may be broken, `1` with a
+/// hyphen and `2` without one, as after a hyphen joining two words, `0` elsewhere
+struct Hyphenator {
+    dictionary: HyphenationTable,
+    letters: HashSet<char>,
+    hyphens: HashSet<char>,
+}
+
+impl Hyphenator {
+    fn compile(rules: &[AnchoredRule]) -> Result<Self, TestError> {
+        let dictionary = rules
+            .iter()
+            .rev()
+            .find_map(|rule| match &rule.rule {
+                Rule::IncludeHyphenation { table } => Some(table.clone()),
+                _ => None,
+            })
+            .ok_or(TestError::NoHyphenationTable)?;
+        let letters = translator::letters(rules)?;
+        let hyphens = rules
+            .iter()
+            .filter_map(|rule| match &rule.rule {
+                Rule::Hyphen { character, .. } => Some(*character),
+                _ => None,
+            })
+            .collect();
+        Ok(Self {
+            dictionary,
+            letters,
+            hyphens,
+        })
+    }
+
+    fn hyphenate(&self, text: &str) -> Vec<u8> {
+        let chars: Vec<char> = text.chars().collect();
+        let is_letter = |pos: usize| self.letters.contains(&chars[pos]);
+        let mut hyphens = vec![b'0'; chars.len()];
+        let mut start = 0;
+        while start < chars.len() {
+            if !is_letter(start) {
+                start += 1;
+                continue;
+            }
+            let end = (start + 1..chars.len())
+                .find(|&pos| !is_letter(pos))
+                .unwrap_or(chars.len());
+            let word: Vec<char> = chars[start..end]
+                .iter()
+                .map(|c| c.to_lowercase().next().unwrap_or(*c))
+                .collect();
+            let scores = self.dictionary.hyphens(&word);
+            for (k, score) in scores.iter().enumerate().skip(1) {
+                hyphens[start + k] = if score % 2 == 1 { b'1' } else { b'0' };
+            }
+            if start >= 2 && self.hyphens.contains(&chars[start - 1]) && is_letter(start - 2) {
+                hyphens[start] = b'2';
+            }
+            start = end + 1;
+        }
+        hyphens
+    }
+
+    /// Hyphenate the text `braille` back-translates to, and put the breaks back on the cells
+    fn hyphenate_braille(
+        &self,
+        braille: &str,
+        pipeline: &TranslationPipeline,
+        display: Option<&ImpliedDisplay>,
+    ) -> Option<Vec<u8>> {
+        let cells = match display {
+            Some(display) => display.read(braille),
+            None => braille.to_string(),
+        };
+        let (text, positions) =
+            pipeline.translate_with_positions(&cells, &TranslationOptions::default());
+        let text_hyphens = self.hyphenate(&text);
+        let mut hyphens = vec![b'0'; braille.chars().count()];
+        let mut previous = None;
+        for (k, &cell) in positions.input_positions().iter().enumerate() {
+            if cell >= hyphens.len() {
+                break;
+            }
+            if previous.is_none_or(|previous| cell > previous) {
+                hyphens[cell] = text_hyphens[k];
+                previous = Some(cell);
+            }
+        }
+        Some(hyphens)
+    }
+}
+
+/// The word with `-` where it breaks with a hyphen and `|` where it breaks without one, as
+/// liblouis's checker shows it
+fn show_hyphens(word: &str, hyphens: &[u8]) -> String {
+    if hyphens.first().is_some_and(|&h| h != b'0') {
+        return String::new();
+    }
+    let mut shown = String::new();
+    for (c, &h) in word.chars().zip(hyphens) {
+        match h {
+            b'2' => shown.push('|'),
+            b'1' => shown.push('-'),
+            _ => {}
+        }
+        shown.push(c);
+    }
+    shown
 }
 
 /// A braille table to be used in a [`Test`].
@@ -337,6 +512,21 @@ impl ExpectedFailure {
     }
 }
 
+/// Whether `a` and `b` emphasize each of the first `len` characters with the same classes
+fn same_emphasis(a: &[EmphasisSpan], b: &[EmphasisSpan], len: usize) -> bool {
+    fn classes(spans: &[EmphasisSpan], pos: usize) -> Vec<&str> {
+        let mut classes: Vec<&str> = spans
+            .iter()
+            .filter(|s| s.range.contains(&pos))
+            .map(|s| s.class.as_str())
+            .collect();
+        classes.sort();
+        classes.dedup();
+        classes
+    }
+    (0..len).all(|pos| classes(a, pos) == classes(b, pos))
+}
+
 /// A test to verify a braille translation.
 #[derive(Debug, Clone)]
 pub struct Test {
@@ -347,7 +537,8 @@ pub struct Test {
     /// Is the test expected to fail?
     xfail: ExpectedFailure,
     emphasis: Vec<EmphasisSpan>,
-    expected_emphasis: Vec<EmphasisSpan>,
+    /// The emphasis a back-translation is expected to report, if the test checks it
+    expected_emphasis: Option<Vec<EmphasisSpan>>,
     input_pos: Vec<usize>,
     output_pos: Vec<usize>,
     cursor_pos: Option<CursorPosition>,
@@ -357,30 +548,79 @@ pub struct Test {
 }
 
 impl Test {
-    fn check(&self, table: &TranslationPipeline, direction: Direction) -> TestResult {
+    /// Check the test against `table`. An implied `display` maps the braille outside the
+    /// pipeline, one character per cell, so the positions are unaffected.
+    fn check(
+        &self,
+        table: &TranslationPipeline,
+        display: Option<&ImpliedDisplay>,
+        direction: Direction,
+    ) -> TestResult {
         let mut options = TranslationOptions::default()
             .with_mode(self.modes.clone())
             .with_emphasis(self.emphasis.clone());
+        if self.expected_emphasis.is_some() && direction == Direction::Backward {
+            options = options.with_emphasis_output();
+        }
         if let Some(CursorPosition::Single(cursor) | CursorPosition::Tuple(cursor, _)) =
             self.cursor_pos
         {
             options = options.with_cursor_pos(cursor);
         }
-        let (translated, positions) = table.translate_with_positions(&self.input, &options);
-        let matched = translated == self.expected;
-        if matched {
-            if self.xfail.is_failure(direction) {
-                TestResult::UnexpectedSuccess {
-                    input: self.input.to_string(),
-                    direction,
-                }
-            } else {
-                match self.position_mismatch(&positions, direction) {
-                    None => TestResult::Success,
-                    Some(mismatch) => TestResult::Failure(FailureReason::Position(mismatch)),
-                }
+        let input = match (display, direction) {
+            (Some(display), Direction::Backward) => display.read(&self.input),
+            _ => self.input.clone(),
+        };
+        if let Some(max_output) = self.max_output_length {
+            let (translated, consumed) = table.translate_limited(&input, &options, max_output);
+            let translated = match (display, direction) {
+                (Some(display), Direction::Forward) => match display.show(&translated) {
+                    Some(shown) => shown,
+                    None => return self.failed(translated, direction),
+                },
+                _ => translated,
+            };
+            if self
+                .real_input_length
+                .is_some_and(|length| length != consumed)
+            {
+                return self.failed(format!("{translated} (input used: {consumed})"), direction);
             }
-        } else if self.xfail.is_failure(direction) {
+            return self.verdict(translated, direction, None);
+        }
+        let (translated, positions, emphasis) = table.translate_with_emphasis(&input, &options);
+        let translated = match (display, direction) {
+            (Some(display), Direction::Forward) => match display.show(&translated) {
+                Some(shown) => shown,
+                None => return self.failed(translated, direction),
+            },
+            _ => translated,
+        };
+        let position_mismatch = self.position_mismatch(&positions, direction);
+        let result = self.verdict(translated, direction, position_mismatch);
+        match (result, &self.expected_emphasis, emphasis) {
+            (TestResult::Success, Some(expected), Some(actual))
+                if !same_emphasis(expected, &actual, self.expected.chars().count()) =>
+            {
+                TestResult::Failure(FailureReason::Typeform {
+                    input: self.input.clone(),
+                    expected: expected.clone(),
+                    actual,
+                })
+            }
+            (result, _, _) => result,
+        }
+    }
+
+    /// Check the test in `display` mode: map each character of `input` to the cell the
+    /// table shows it as, the way liblouis's `lou_charToDots` does.
+    fn check_display(&self, table: &CharToDots) -> TestResult {
+        self.verdict(table.dots(&self.input), Direction::Forward, None)
+    }
+
+    /// A translation that did not produce `expected`, or that liblouis would abort.
+    fn failed(&self, translated: String, direction: Direction) -> TestResult {
+        if self.xfail.is_failure(direction) {
             TestResult::ExpectedFailure {
                 input: self.input.to_string(),
                 expected: self.expected.to_string(),
@@ -394,6 +634,29 @@ impl Test {
                 actual: translated,
                 direction,
             })
+        }
+    }
+
+    fn verdict(
+        &self,
+        translated: String,
+        direction: Direction,
+        position_mismatch: Option<PositionMismatch>,
+    ) -> TestResult {
+        if translated == self.expected {
+            if self.xfail.is_failure(direction) {
+                TestResult::UnexpectedSuccess {
+                    input: self.input.to_string(),
+                    direction,
+                }
+            } else {
+                match position_mismatch {
+                    None => TestResult::Success,
+                    Some(mismatch) => TestResult::Failure(FailureReason::Position(mismatch)),
+                }
+            }
+        } else {
+            self.failed(translated, direction)
         }
     }
 
@@ -437,7 +700,7 @@ impl Test {
         expected: String,
         xfail: ExpectedFailure,
         emphasis: Vec<EmphasisSpan>,
-        expected_emphasis: Vec<EmphasisSpan>,
+        expected_emphasis: Option<Vec<EmphasisSpan>>,
         input_pos: Vec<usize>,
         output_pos: Vec<usize>,
         cursor_pos: Option<CursorPosition>,
@@ -510,7 +773,7 @@ mod tests {
             "⠁⠃".to_string(),
             ExpectedFailure::Simple(false),
             vec![],
-            vec![],
+            None,
             input_pos,
             output_pos,
             cursor_pos,

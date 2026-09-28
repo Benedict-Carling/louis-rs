@@ -1,10 +1,17 @@
 //! A parser for [liblouis](https://liblouis.io) YAML test files
 
-use std::{collections::HashMap, fs::File, iter::Peekable, num::ParseIntError, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs::File,
+    iter::Peekable,
+    num::ParseIntError,
+    path::{Path, PathBuf},
+};
 
 use crate::{parser, parser::EscapingContext, parser::unescape};
 
 use libyaml::{Encoding, Event, Parser, ParserIter, ScalarStyle};
+use search_path::SearchPath;
 
 use crate::emphasis::EmphasisSpan;
 use crate::parser::Direction;
@@ -60,6 +67,7 @@ pub enum ParseError {
 
 pub struct YAMLParser<'a> {
     events: Peekable<ParserIter<'a>>,
+    search_path: SearchPath,
 }
 
 impl YAMLParser<'_> {
@@ -67,7 +75,15 @@ impl YAMLParser<'_> {
         let parser = Parser::new(reader)?;
         Ok(Self {
             events: parser.into_iter().peekable(),
+            search_path: SearchPath::new_or("LOUIS_TABLE_PATH", "."),
         })
+    }
+
+    /// Look tables up in `dir` before the search path, as lou_checkyaml does by changing into the
+    /// YAML file's directory.
+    pub fn in_dir(mut self, dir: &Path) -> Self {
+        self.search_path.prepend(dir.to_path_buf());
+        self
     }
 
     fn scalar(&mut self) -> Result<String, ParseError> {
@@ -378,7 +394,7 @@ impl YAMLParser<'_> {
         }
         let mut xfail = ExpectedFailure::Simple(false);
         let mut emphasis: Vec<EmphasisSpan> = Vec::new();
-        let mut expected_emphasis: Vec<EmphasisSpan> = Vec::new();
+        let mut expected_emphasis: Option<Vec<EmphasisSpan>> = None;
         let mut input_pos: Vec<usize> = Vec::new();
         let mut output_pos: Vec<usize> = Vec::new();
         let mut cursor_pos = None;
@@ -397,7 +413,7 @@ impl YAMLParser<'_> {
                         emphasis = self.emphasis_spans_value()?;
                     }
                     "expected_typeform" => {
-                        expected_emphasis = self.emphasis_spans_value()?;
+                        expected_emphasis = Some(self.emphasis_spans_value()?);
                     }
                     "inputPos" => {
                         input_pos = self.pos_values()?;
@@ -526,6 +542,7 @@ impl YAMLParser<'_> {
                 "tests" => {
                     let tests = self.tests()?;
                     let suite = TestMatrix::new(
+                        &self.search_path,
                         &current_display_table,
                         &current_tables,
                         &test_mode,
@@ -537,6 +554,8 @@ impl YAMLParser<'_> {
                         Ok(test_results) => results.extend(test_results),
                         Err(error) => results.push(TestResult::Error(error.to_string())),
                     }
+                    // flags apply only to the tests that immediately follow them
+                    test_mode = TestMode::Forward;
                     previous_event_was_table = false;
                 }
                 _ => {
@@ -565,7 +584,9 @@ mod tests {
             .unwrap()
             .write_all(yaml.as_bytes())
             .unwrap();
-        let results = YAMLParser::new(File::open(&path).unwrap())?.yaml();
+        let results = YAMLParser::new(File::open(&path).unwrap())?
+            .in_dir(&std::env::temp_dir())
+            .yaml();
         let _ = std::fs::remove_file(&path);
         results
     }
@@ -581,7 +602,7 @@ mod tests {
         assert!(results[0].is_success());
     }
 
-    const AB_TABLE: &str = "table: |\n  letter a 1\n  letter b 12\n";
+    const AB_TABLE: &str = "table: |\n  display ⠁ 1\n  display ⠃ 12\n  letter a 1\n  letter b 12\n";
 
     #[test]
     fn matching_positions_are_not_reported() {
@@ -625,6 +646,29 @@ mod tests {
     }
 
     #[test]
+    fn the_word_at_the_cursor_is_computer_braille() {
+        let yaml = format!(
+            "{AB_TABLE}  space \\s 0\n  always ab 12-1\ntests:\n  - - ab ab\n    - ⠃⠁ ⠁⠃\n    - mode: [compbrlAtCursor]\n      cursorPos: [4, 4]\n      inputPos: [0, 0, 2, 3, 4]\n"
+        );
+        let results = run("compbrl_at_cursor", &yaml).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_success(), "{:?}", results[0]);
+    }
+
+    #[test]
+    fn hyphenate_mode_shows_the_breaks() {
+        let dic = format!("louis-rs-{}-hyphenate.dic", std::process::id());
+        std::fs::write(std::env::temp_dir().join(&dic), "UTF-8\na1b\n").unwrap();
+        let yaml = format!(
+            "table: |\n  include {dic}\n  letter a 1\n  letter b 12\n  hyphen - 36\nflags: {{testmode: hyphenate}}\ntests:\n  - [aabb, aa-bb]\n  - [ab-ab, a-b-|a-b]\n  - [bbaa, bbaa]\n"
+        );
+        let results = run("hyphenate_mode", &yaml).unwrap();
+        let _ = std::fs::remove_file(std::env::temp_dir().join(&dic));
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.is_success()), "{results:?}");
+    }
+
+    #[test]
     fn single_cursor_position_is_not_checked() {
         let yaml = format!("{AB_TABLE}tests:\n  - - ab\n    - ⠁⠃\n    - cursorPos: 1\n");
         let results = run("single_cursor", &yaml).unwrap();
@@ -640,8 +684,108 @@ mod tests {
 
     #[test]
     fn both_directions_swap_the_expected_positions() {
-        let yaml = "table: |\n  letter a 1\n  letter b 12\n  always ab 123\nflags: {testmode: bothDirections}\ntests:\n  - - ab\n    - ⠇\n    - inputPos: [0]\n      outputPos: [0, 0]\n";
+        let yaml = "table: |\n  display ⠇ 123\n  letter a 1\n  letter b 12\n  always ab 123\nflags: {testmode: bothDirections}\ntests:\n  - - ab\n    - ⠇\n    - inputPos: [0]\n      outputPos: [0, 0]\n";
         let results = run("both_directions", yaml).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.is_success()));
+    }
+
+    #[test]
+    fn expected_typeform_checks_the_emphasis_of_a_back_translation() {
+        let yaml = "table: |\n  display ⠁ 1\n  display ⠨ 46\n  letter a 1\n  emphclass italic\n  emphletter italic 46\nflags: {testmode: backward}\ntests:\n  - - ⠨⠁⠁\n    - aa\n    - expected_typeform: {italic: '+ '}\n  - - ⠨⠁⠁\n    - aa\n    - expected_typeform: {italic: '  '}\n  - - ⠨⠁⠁\n    - \\\\46/aa\n";
+        let results = run("expected_typeform", yaml).unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_success());
+        assert!(results[1].is_translation_failure());
+        assert!(results[2].is_success());
+    }
+
+    #[test]
+    fn tests_without_flags_run_forward() {
+        let yaml = "table: |\n  display ⠁ 1\n  letter a 1\nflags: {testmode: backward}\ntests:\n  - - a\n    - ⠁\ntable: |\n  display ⠁ 1\n  letter a 1\ntests:\n  - - a\n    - ⠁\n";
+        let results = run("tests_without_flags", yaml).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_translation_failure());
+        assert!(results[1].is_success());
+    }
+
+    #[test]
+    fn display_mode_maps_characters_to_dots() {
+        let yaml = "table: |\n  display _ 456\n  letter a 1\nflags: {testmode: display}\ntests:\n  - - a_b\n    - ⠁⠸⠀\n  - - a\n    - ⠃\n";
+        let results = run("display_mode", yaml).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_success());
+        assert_eq!(
+            results[1],
+            TestResult::Failure(FailureReason::Translation {
+                input: "a".to_string(),
+                expected: "⠃".to_string(),
+                actual: "⠁".to_string(),
+                direction: Direction::Forward,
+            })
+        );
+    }
+
+    #[test]
+    fn display_mode_runs_every_table() {
+        let yaml = "table: |\n  letter a 1\ntable: |\n  letter a 2\nflags: {testmode: display}\ntests:\n  - - a\n    - ⠁\n";
+        let results = run("display_mode_tables", yaml).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_success());
+        assert!(results[1].is_translation_failure());
+    }
+
+    #[test]
+    fn without_display_the_table_shows_its_own_braille() {
+        let yaml = "table: |\n  letter a 1\n  letter b 12\n  punctuation . 256\nflags: {testmode: bothDirections}\ntests:\n  - - ab.\n    - ab.\n";
+        let results = run("implied_display", yaml).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.is_success()));
+    }
+
+    #[test]
+    fn without_display_the_first_mapping_wins() {
+        let yaml = "table: |\n  display A 1\n  letter a 1\n  display B 12\ntests:\n  - - a\n    - A\ntable: |\n  letter a 1\n  display A 1\ntests:\n  - - a\n    - a\n";
+        let results = run("implied_display_first_wins", yaml).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.is_success()));
+    }
+
+    #[test]
+    fn without_display_a_cell_with_no_mapping_fails_the_translation() {
+        let yaml = "table: |\n  letter a 1\n  always b 2\ntests:\n  - - b\n    - ⠂\n  - - b\n    - ⠂\n    - xfail: true\n";
+        let results = run("implied_display_unmapped_cell", yaml).unwrap();
+        assert_eq!(
+            results,
+            [
+                TestResult::Failure(FailureReason::Translation {
+                    input: "b".to_string(),
+                    expected: "⠂".to_string(),
+                    actual: "⠂".to_string(),
+                    direction: Direction::Forward,
+                }),
+                TestResult::ExpectedFailure {
+                    input: "b".to_string(),
+                    expected: "⠂".to_string(),
+                    actual: "⠂".to_string(),
+                    direction: Direction::Forward,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn without_display_a_character_with_no_mapping_reads_as_a_blank_cell() {
+        let yaml = "table: |\n  letter a 1\n  space \\s 0\nflags: {testmode: backward}\ntests:\n  - - a?a\n    - a a\n";
+        let results = run("implied_display_unmapped_char", yaml).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_success());
+    }
+
+    #[test]
+    fn an_explicit_display_holds_for_later_blocks() {
+        let yaml = "display: |\n  display X 1\ntable: |\n  display A 1\n  letter a 1\ntests:\n  - - a\n    - X\ntable: |\n  letter a 1\ntests:\n  - - a\n    - X\n";
+        let results = run("explicit_display_persists", yaml).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.is_success()));
     }

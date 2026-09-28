@@ -5,7 +5,7 @@ use std::collections::HashMap;
 pub use options::{TranslationMode, TranslationModes, TranslationOptions};
 pub use pipeline::TranslationPipeline;
 pub use positions::PositionMap;
-pub use table::display::DisplayTable;
+pub use table::display::{CharToDots, DisplayTable, ImpliedDisplay};
 pub use translation::{ResolvedTranslation, TranslationStage};
 pub use trie::ClassConstraint;
 
@@ -14,15 +14,19 @@ use crate::{
     parser::{AnchoredRule, Braille, HasDirection, Rule},
 };
 
+mod back_emphasis;
+mod case;
 mod context_pattern;
 mod effect;
 mod indication;
 mod match_pattern;
 mod options;
+mod pass;
 mod pipeline;
 mod position_constraints;
 mod positions;
 mod regexp;
+mod sequence;
 mod swap;
 mod table;
 mod translation;
@@ -36,17 +40,30 @@ pub enum TranslationError {
     BaseCharacterNotDefined { base: char, derived: char },
     #[error("Swap class {0} not defined")]
     SwapClassNotDefined(String),
+    #[error("Grouping {0} not defined")]
+    GroupingNotDefined(String),
 }
 
-#[derive(Debug, Default, Clone)]
+/// The characters `rules` give the letter attribute
+pub fn letters(
+    rules: &[AnchoredRule],
+) -> Result<std::collections::HashSet<char>, TranslationError> {
+    let ctx = table::TableContext::compile(rules)?;
+    Ok(ctx
+        .character_classes()
+        .get(&crate::parser::CharacterClass::Letter)
+        .unwrap_or_default())
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct CharacterDefinition(HashMap<char, String>);
 
 impl CharacterDefinition {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(HashMap::new())
     }
 
-    fn insert(&mut self, from: char, to: &str) {
+    pub(crate) fn insert(&mut self, from: char, to: &str) {
         if cfg!(feature = "backwards_compatibility") {
             // first rule wins
             self.0.entry(from).or_insert(to.to_string());
@@ -60,7 +77,7 @@ impl CharacterDefinition {
         self.0.get(from)
     }
 
-    fn resolve_implicit_dots(&self, chars: &str) -> Result<String, TranslationError> {
+    pub(crate) fn resolve_implicit_dots(&self, chars: &str) -> Result<String, TranslationError> {
         chars
             .chars()
             .map(|c| {

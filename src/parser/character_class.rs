@@ -32,6 +32,8 @@ pub enum CharacterClass {
     Seqbeforechars,
     Seqafterchars,
     UserDefined(String),
+    /// The `n`th user-defined class of a table, which `$w`, `$x`, `$y` and `$z` test for
+    Ordinal(u8),
 }
 
 impl From<&str> for CharacterClass {
@@ -44,6 +46,8 @@ impl From<&str> for CharacterClass {
             "lowercase" => CharacterClass::Lowercase,
             "punctuation" => CharacterClass::Punctuation,
             "sign" => CharacterClass::Sign,
+            "math" => CharacterClass::Math,
+            "litdigit" => CharacterClass::Litdigit,
             "seqdelimiter" => CharacterClass::Seqdelimiter,
             "seqbeforechars" => CharacterClass::Seqbeforechars,
             "seqafterchars" => CharacterClass::Seqafterchars,
@@ -100,6 +104,15 @@ impl CharacterClasses {
 
     pub fn get(&self, class: &CharacterClass) -> Option<HashSet<char>> {
         self.0.get(class).cloned()
+    }
+
+    pub fn contains(&self, class: &CharacterClass, c: char) -> bool {
+        self.0.get(class).is_some_and(|chars| chars.contains(&c))
+    }
+
+    /// Every character in any of the classes.
+    pub fn members(&self) -> HashSet<char> {
+        self.0.values().flatten().copied().collect()
     }
 
     pub fn is_punctuation(&self, c: char) -> bool {

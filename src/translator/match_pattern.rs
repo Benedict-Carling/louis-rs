@@ -13,8 +13,8 @@ use crate::translator::{ResolvedTranslation, TranslationStage};
 /// -- see [`Pattern::Boundary`].
 fn boundary_anchor(side: Side) -> Regexp {
     match side {
-        Side::Pre => Regexp::StartAnchor,
-        Side::Post => Regexp::EndAnchor,
+        Side::Pre => Regexp::StartBoundary,
+        Side::Post => Regexp::EndBoundary,
     }
 }
 
@@ -37,7 +37,13 @@ impl Regexp {
             Pattern::Group(patterns) => {
                 Regexp::Group(Box::new(Regexp::from_patterns(patterns, ctx)))
             }
-            Pattern::Negate(pattern) => Regexp::from_pattern(pattern, ctx).negate(),
+            // liblouis negates only the attribute test: a character must still be there
+            Pattern::Negate(pattern) => match pattern.as_ref() {
+                Pattern::AttributesOrBoundary(hash_set, _) => {
+                    Regexp::from_attributes(hash_set, ctx).negate()
+                }
+                pattern => Regexp::from_pattern(pattern, ctx).negate(),
+            },
             Pattern::Optional(pattern) => {
                 Regexp::Optional(Box::new(Regexp::from_pattern(pattern, ctx)))
             }
@@ -123,12 +129,14 @@ impl Regexp {
 #[derive(Debug)]
 pub struct MatchPatternsBuilder {
     regexps: Vec<CompiledRegexp>,
+    with_pre: Vec<usize>,
 }
 
 impl MatchPatternsBuilder {
     pub fn new() -> Self {
         Self {
             regexps: Vec::new(),
+            with_pre: Vec::new(),
         }
     }
 
@@ -150,12 +158,16 @@ impl MatchPatternsBuilder {
         ));
         let regexp = Regexp::from_match_rule(pre, chars.to_string(), post, ctx)
             .compile_with_payload(translation);
+        if !pre.iter().all(|p| matches!(p, Pattern::Empty)) {
+            self.with_pre.push(self.regexps.len());
+        }
         self.regexps.push(regexp);
     }
 
     pub fn build(self) -> MatchPatterns {
         MatchPatterns {
             regexps: self.regexps,
+            with_pre: self.with_pre,
         }
     }
 }
@@ -163,6 +175,8 @@ impl MatchPatternsBuilder {
 #[derive(Debug)]
 pub struct MatchPatterns {
     regexps: Vec<CompiledRegexp>,
+    /// Indices into `regexps` of the rules with a `pre` pattern.
+    with_pre: Vec<usize>,
 }
 
 impl MatchPatterns {
@@ -172,6 +186,15 @@ impl MatchPatterns {
         self.regexps
             .iter()
             .flat_map(|r| r.find_anchored(input, &Environment::new(), at_start))
+            .collect()
+    }
+
+    /// Like [`find`](MatchPatterns::find) at a position that is not the start of the input,
+    /// but only for the rules whose `pre` pattern could have started here.
+    pub fn find_with_pre(&self, input: &str) -> Vec<ResolvedTranslation> {
+        self.with_pre
+            .iter()
+            .flat_map(|&i| self.regexps[i].find_anchored(input, &Environment::new(), false))
             .collect()
     }
 }
@@ -403,7 +426,8 @@ mod tests {
         let mut builder = MatchPatternsBuilder::new();
         builder.insert(&pre, "a", &post, "X", &rule, &ctx);
         let matcher = builder.build();
-        let translation = ResolvedTranslation::new("a", "X", 2, TranslationStage::Main, rule);
+        // the boundary weighs as much as the space it stands for
+        let translation = ResolvedTranslation::new("a", "X", 3, TranslationStage::Main, rule);
         // "a" is preceded by nothing only when it truly begins the whole input
         assert_eq!(matcher.find("ab", true), vec![translation]);
         assert!(matcher.find("ab", false).is_empty());
@@ -428,10 +452,28 @@ mod tests {
             ResolvedTranslation::new("x", "X", 3, TranslationStage::Main, rule.clone())
                 .with_offset(1);
         assert_eq!(matcher.find("Axy", false), vec![translation]);
-        // boundary branch: no preceding letter needed, at the true start of input
-        let translation = ResolvedTranslation::new("x", "X", 2, TranslationStage::Main, rule);
+        // boundary branch: no preceding letter needed, at the true start of input, weighing
+        // as much as the character branch
+        let translation = ResolvedTranslation::new("x", "X", 3, TranslationStage::Main, rule);
         assert_eq!(matcher.find("xy_", true), vec![translation]);
         // neither branch applies: not at the true start, and not preceded by an uppercase letter
         assert!(matcher.find("xy_", false).is_empty());
+    }
+
+    #[test]
+    fn end_of_input_weighs_like_a_boundary_character() {
+        // `%[_^]` after `chars`: a space, or the end of input. Both weigh the same, so the
+        // rule does not lose to a competitor just because the word ends the input.
+        let pre = PatternParser::new("-", Side::Pre).pattern().unwrap();
+        let post = PatternParser::new("%[_^]", Side::Post).pattern().unwrap();
+        let mut ctx = CharacterClasses::default();
+        ctx.insert(CharacterClass::Space, ' ');
+        let rule = fake_rule();
+        let mut builder = MatchPatternsBuilder::new();
+        builder.insert(&pre, "be", &post, "B", &rule, &ctx);
+        let matcher = builder.build();
+        let translation = ResolvedTranslation::new("be", "B", 3, TranslationStage::Main, rule);
+        assert_eq!(matcher.find("be ", false), vec![translation.clone()]);
+        assert_eq!(matcher.find("be", false), vec![translation]);
     }
 }

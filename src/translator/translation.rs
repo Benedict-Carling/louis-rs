@@ -1,6 +1,12 @@
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
 use crate::{
     parser::{AnchoredRule, Precedence, Rule},
-    translator::{effect::Effect, regexp::CharacterRange, swap::Swapper},
+    translator::{
+        CharacterDefinition, effect::Effect, regexp::CharacterRange, swap::Swapper,
+        table::primary::undefined_char_dots,
+    },
 };
 
 /// A translation can have multiple stages.
@@ -52,6 +58,38 @@ pub enum TranslationTarget {
     Capture,
     /// Translate to the result of a capture but also apply the mapping defined in the [`Swapper`]
     Swap(Swapper),
+    /// Translate to the dots of each captured character, as liblouis' `putCharacter` does
+    Characters(Arc<CharacterDots>),
+}
+
+/// The dots of a character: its definition, else the `undefined` dots, else its escape
+#[derive(Debug, PartialEq, Default)]
+pub struct CharacterDots {
+    definitions: CharacterDefinition,
+    undefined: Option<String>,
+}
+
+impl CharacterDots {
+    pub fn new(definitions: CharacterDefinition, undefined: Option<String>) -> Self {
+        Self {
+            definitions,
+            undefined,
+        }
+    }
+
+    pub fn definitions(&self) -> &CharacterDefinition {
+        &self.definitions
+    }
+
+    pub fn put(&self, input: &str) -> String {
+        input
+            .chars()
+            .map(|c| match (self.definitions.get(&c), &self.undefined) {
+                (Some(dots), _) | (None, Some(dots)) => dots.clone(),
+                (None, None) => undefined_char_dots(c, &self.definitions),
+            })
+            .collect()
+    }
 }
 
 impl std::fmt::Display for TranslationTarget {
@@ -72,6 +110,7 @@ impl TranslationTarget {
             TranslationTarget::Literal(_) => self,
             TranslationTarget::Capture => TranslationTarget::Literal(captured.to_string()),
             TranslationTarget::Swap(swapper) => TranslationTarget::Literal(swapper.swap(captured)),
+            TranslationTarget::Characters(dots) => TranslationTarget::Literal(dots.put(captured)),
         }
     }
 }
@@ -147,6 +186,7 @@ impl Resolve for UnresolvedTranslation {
             stage: self.stage,
             effects: self.effects,
             origin: self.origin,
+            parts: Vec::new(),
         }
     }
 }
@@ -210,6 +250,8 @@ pub struct ResolvedTranslation {
     effects: Vec<Effect>,
     /// Which translation rule was the cause for this translation
     origin: Option<AnchoredRule>,
+    /// The steps this translation is made of, where liblouis maps their positions separately
+    parts: Vec<ResolvedTranslation>,
 }
 
 /// A subset of translation for which [`Hash`] and [`Eq`] is implemented
@@ -219,6 +261,8 @@ pub struct TranslationSubset {
     output: String,
     length: usize,
     weight: usize,
+    /// Where the originating rule is defined, so that two rules translating alike stay apart.
+    source: Option<(Option<PathBuf>, usize)>,
 }
 
 impl From<&ResolvedTranslation> for TranslationSubset {
@@ -228,6 +272,10 @@ impl From<&ResolvedTranslation> for TranslationSubset {
             output: translation.output(),
             length: translation.length(),
             weight: translation.weight(),
+            source: translation
+                .origin
+                .as_ref()
+                .map(|rule| (rule.path().map(Path::to_path_buf), rule.line())),
         }
     }
 }
@@ -254,6 +302,7 @@ impl ResolvedTranslation {
             stage,
             effects: Vec::default(),
             origin: origin.into(),
+            parts: Vec::new(),
         }
     }
 
@@ -315,18 +364,27 @@ impl ResolvedTranslation {
         &self.effects
     }
 
-    /// Set the `input` of a translation.
-    pub fn with_input(self, input: &str) -> Self {
-        Self {
-            input: input.to_string(),
-            length: input.chars().count(),
-            ..self
-        }
-    }
-
     /// Set the `weight` of a translation.
     pub fn with_weight(self, weight: usize) -> Self {
         Self { weight, ..self }
+    }
+
+    pub fn with_effects(self, effects: Vec<Effect>) -> Self {
+        Self { effects, ..self }
+    }
+
+    /// This translation as the steps of `parts`, which make up the same input and output
+    pub fn with_parts(self, parts: Vec<ResolvedTranslation>) -> Self {
+        Self { parts, ..self }
+    }
+
+    /// The steps this translation is made of: its parts, or else itself
+    pub fn into_steps(self) -> Vec<ResolvedTranslation> {
+        if self.parts.is_empty() {
+            vec![self]
+        } else {
+            self.parts
+        }
     }
 
     /// Set the `length` of a translation.
@@ -343,6 +401,10 @@ impl ResolvedTranslation {
     }
 
     /// Set the `offset` of a translation.
+    pub fn with_precedence(self, precedence: Precedence) -> Self {
+        Self { precedence, ..self }
+    }
+
     pub fn with_offset(self, offset: usize) -> Self {
         Self { offset, ..self }
     }
@@ -360,6 +422,23 @@ impl ResolvedTranslation {
 mod tests {
     use super::*;
     use crate::translator::swap::Swapper;
+
+    #[test]
+    fn subset_tells_rules_apart() {
+        let rule = crate::parser::RuleParser::new("always a 1").rule().unwrap();
+        let first = AnchoredRule::new(rule.clone(), None, 1);
+        let second = AnchoredRule::new(rule, None, 2);
+        let translation =
+            |origin| ResolvedTranslation::new("", "x", 1, TranslationStage::Main, origin);
+        assert_eq!(
+            TranslationSubset::from(&translation(first.clone())),
+            TranslationSubset::from(&translation(first.clone()))
+        );
+        assert_ne!(
+            TranslationSubset::from(&translation(first)),
+            TranslationSubset::from(&translation(second))
+        );
+    }
 
     #[test]
     fn resolve_literal() {
@@ -381,6 +460,26 @@ mod tests {
 
         let resolved = TranslationTarget::Swap(swapper).resolve("abc");
         assert_eq!(resolved, TranslationTarget::Literal("ABC".to_string()));
+    }
+
+    #[test]
+    fn resolve_characters() {
+        let mut definitions = CharacterDefinition::new();
+        definitions.insert('a', "⠁");
+        let dots = |undefined: Option<&str>| {
+            TranslationTarget::Characters(Arc::new(CharacterDots::new(
+                definitions.clone(),
+                undefined.map(str::to_string),
+            )))
+        };
+        assert_eq!(
+            dots(Some("⠿")).resolve("ab"),
+            TranslationTarget::Literal("⠁⠿".to_string())
+        );
+        assert_eq!(
+            dots(None).resolve("a"),
+            TranslationTarget::Literal("⠁".to_string())
+        );
     }
 
     #[test]
@@ -450,7 +549,7 @@ mod tests {
         let result = translation.resolve("xyz", 0..8, 0);
 
         assert_eq!(result.input(), "xyz");
-        assert_eq!(result.output(), "<XYz>");
+        assert_eq!(result.output(), "<XY>");
     }
 
     #[test]

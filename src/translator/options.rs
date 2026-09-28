@@ -34,6 +34,10 @@ impl TranslationModes {
     pub fn insert(&mut self, value: TranslationMode) -> bool {
         self.0.insert(value)
     }
+
+    pub fn contains(&self, value: TranslationMode) -> bool {
+        self.0.contains(value)
+    }
 }
 
 /// Per-call options for a translation.
@@ -43,6 +47,9 @@ pub struct TranslationOptions {
     /// Per-character emphasis annotations (which emphasis classes are active where).
     emphasis: Vec<EmphasisSpan>,
     cursor_pos: Option<usize>,
+    /// Whether to report the emphasis of a back-translation, which is when liblouis
+    /// recognizes the emphasis indicators that only say how the text was emphasized
+    emphasis_output: bool,
 }
 
 impl TranslationOptions {
@@ -61,6 +68,11 @@ impl TranslationOptions {
         self
     }
 
+    pub fn with_emphasis_output(mut self) -> Self {
+        self.emphasis_output = true;
+        self
+    }
+
     pub fn mode(&self) -> &TranslationModes {
         &self.mode
     }
@@ -71,6 +83,10 @@ impl TranslationOptions {
 
     pub fn cursor_pos(&self) -> Option<usize> {
         self.cursor_pos
+    }
+
+    pub fn emphasis_output(&self) -> bool {
+        self.emphasis_output
     }
 }
 

@@ -14,10 +14,10 @@
 //! indicator](crate::translator::indication::lettersign::Indicator). In liblouis they do not seem
 //! to have exactly the same behaviour. Find a way to merge them.
 
-use crate::parser::CharacterClass;
 use crate::translator::TranslationStage;
+use crate::translator::case::CaseClasses;
+use crate::translator::sequence::{Sequences, whole_word_boundaries};
 use crate::translator::table::TableContext;
-use crate::translator::trie::Transition;
 use crate::{
     parser::{AnchoredRule, Direction, Precedence},
     translator::{ResolvedTranslation, trie::Trie},
@@ -43,7 +43,7 @@ impl IndicatorBuilder {
     }
 
     /// Build an [`Indicator`]
-    pub fn build(self, ctx: &TableContext) -> Option<Indicator> {
+    pub fn build(self, ctx: &TableContext, sequences: Option<Sequences>) -> Option<Indicator> {
         let has_contractions = !self.contractions.is_empty();
         match self.nocontractsign {
             Some((nocontractsign, origin)) if has_contractions => {
@@ -54,14 +54,16 @@ impl IndicatorBuilder {
                     TranslationStage::Main,
                     origin.clone(),
                 );
-                let mut trie = Trie::new().with_context(ctx.character_classes().clone());
-                let word_boundary = vec![CharacterClass::Space, CharacterClass::Punctuation];
+                let mut trie = Trie::new()
+                    .with_context(ctx.character_classes().clone())
+                    .with_case_folding(ctx.case_folding().clone());
+                let (start, end) = whole_word_boundaries(sequences.as_ref());
                 for (contraction, _origin) in self.contractions {
                     trie.insert(
                         &contraction,
                         &nocontractsign,
-                        Some(Transition::Start(word_boundary.clone())),
-                        Some(Transition::End(word_boundary.clone())),
+                        Some(start.clone()),
+                        end.clone(),
                         Direction::Forward,
                         Precedence::Default,
                         vec![],
@@ -71,7 +73,9 @@ impl IndicatorBuilder {
                 }
                 Some(Indicator {
                     contractions: trie,
+                    sequences,
                     start_translation,
+                    case: CaseClasses::from_context(ctx),
                 })
             }
             Some(_) => {
@@ -98,7 +102,9 @@ impl IndicatorBuilder {
 #[derive(Debug, Clone)]
 pub struct Indicator {
     contractions: Trie,
+    sequences: Option<Sequences>,
     start_translation: ResolvedTranslation,
+    case: CaseClasses,
 }
 
 impl Indicator {
@@ -107,9 +113,10 @@ impl Indicator {
         let mut translations: Vec<(usize, ResolvedTranslation)> = Vec::new();
         let mut prev: Option<char> = None;
         let mut char_pos = 0;
+        let chars: Vec<char> = input.chars().collect();
 
         for (byte_pos, c) in input.char_indices() {
-            if self.next(&input[byte_pos..], prev).is_some() {
+            if self.contraction_at(&input[byte_pos..], prev, &chars, char_pos) {
                 translations.push((char_pos, self.start_translation.clone()));
             }
             prev = Some(c);
@@ -119,14 +126,17 @@ impl Indicator {
         translations
     }
 
-    pub fn next(&self, s: &str, prev: Option<char>) -> Option<ResolvedTranslation> {
-        let translations = self.contractions.find_translations(s, prev);
-        if !translations.is_empty() {
-            let translation = translations.first().unwrap();
-            Some(translation.clone().with_input("").with_weight(1))
-        } else {
-            None
-        }
+    fn contraction_at(&self, s: &str, prev: Option<char>, chars: &[char], pos: usize) -> bool {
+        self.contractions
+            .find_translations(s, prev)
+            .iter()
+            .any(|t| {
+                self.case.valid_match(chars, pos, t.length())
+                    && self
+                        .sequences
+                        .as_ref()
+                        .is_none_or(|seq| seq.in_sequence(chars, pos, t.length()))
+            })
     }
 }
 
@@ -161,27 +171,15 @@ mod tests {
         builder.contraction("ab", &rule("contraction ab"));
         builder.contraction("cd", &rule("contraction cd"));
         let ctx = make_ctx(&['a', 'b', 'c', 'd']);
-        let indicator = builder.build(&ctx).unwrap();
-        assert_eq!(indicator.next("aa", None), None);
+        let indicator = builder.build(&ctx, None).unwrap();
+        assert!(indicator.precompute("aa").is_empty());
         assert_eq!(
-            indicator.next("ab", None),
-            Some(ResolvedTranslation::new(
-                "",
-                "⡀",
-                1,
-                TranslationStage::Main,
-                rule("nocontractsign 7")
-            ))
+            pairs(&indicator.precompute("ab")),
+            vec![(0, "⡀".to_string())]
         );
         assert_eq!(
-            indicator.next("cd", None),
-            Some(ResolvedTranslation::new(
-                "",
-                "⡀",
-                1,
-                TranslationStage::Main,
-                rule("nocontractsign 7")
-            ))
+            pairs(&indicator.precompute("cd")),
+            vec![(0, "⡀".to_string())]
         );
     }
 
@@ -192,7 +190,7 @@ mod tests {
         builder.contraction("ab", &rule("contraction ab"));
         builder.contraction("cd", &rule("contraction cd"));
         let ctx = make_ctx(&['a', 'b', 'c', 'd']);
-        let indicator = builder.build(&ctx).unwrap();
+        let indicator = builder.build(&ctx, None).unwrap();
 
         assert_eq!(pairs(&indicator.precompute("aa")), vec![]);
         assert_eq!(

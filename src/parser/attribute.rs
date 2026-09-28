@@ -27,7 +27,8 @@ impl std::fmt::Display for ContextAttribute {
                 CharacterClass::UserDefined(name) => write!(f, "{}", name),
                 CharacterClass::Seqdelimiter
                 | CharacterClass::Seqbeforechars
-                | CharacterClass::Seqafterchars => unreachable!(),
+                | CharacterClass::Seqafterchars
+                | CharacterClass::Ordinal(_) => unreachable!(),
             },
             Attribute::ByOrder(order) => match order {
                 1 => write!(f, "w"),

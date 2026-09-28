@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased] - ReleaseDate
 
 ### Fixed
+- `check` now runs YAML tests with `testmode: display`. They used to be
+  skipped silently and report nothing; each table's characters are now mapped
+  to dots the way liblouis's `lou_charToDots` does, from its `display` rules,
+  single-cell character definitions and `grouping` pairs.
 - An undefined character is now escaped with the correct braille for the hex
   digit `9`. The fallback used when a table defines no mapping of its own gave
   `9` the dots of `3`, so any `\xNNNN` escape containing a `9` was printed

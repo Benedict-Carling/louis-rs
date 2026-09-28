@@ -1,13 +1,13 @@
 //! Store and find simple translation rules using a prefix tree ([Trie](https://en.wikipedia.org/wiki/Trie))
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::{
     parser::{AnchoredRule, CharacterClass, CharacterClasses, Direction, Precedence},
     translator::TranslationStage,
 };
 
-use super::ResolvedTranslation;
+use super::{ResolvedTranslation, Rule};
 
 /// The union of one or more character classes, pre-resolved to their actual member
 /// characters.
@@ -81,9 +81,36 @@ pub enum ClassConstraint {
     End(CharacterClass),
 }
 
+/// Character definitions count as one opcode: a cell or character has one definition.
+fn same_opcode(rule: Option<&Rule>, origin: &AnchoredRule) -> bool {
+    let is_definition = |rule: &Rule| {
+        matches!(
+            rule,
+            Rule::Space { .. }
+                | Rule::Digit { .. }
+                | Rule::Litdigit { .. }
+                | Rule::Punctuation { .. }
+                | Rule::Math { .. }
+                | Rule::Sign { .. }
+                | Rule::Letter { .. }
+                | Rule::Uppercase { .. }
+                | Rule::Lowercase { .. }
+                | Rule::Grouping { .. }
+                | Rule::Base { .. }
+        )
+    };
+    rule.is_some_and(|rule| {
+        std::mem::discriminant(rule) == std::mem::discriminant(&origin.rule)
+            || (is_definition(rule) && is_definition(&origin.rule))
+    })
+}
+
 #[derive(Default, Debug, Clone)]
 struct TrieNode {
-    translation: Option<ResolvedTranslation>,
+    /// Rules of equal precedence and different opcodes ending here. They only differ in how
+    /// the translation loop filters them (e.g. `prepunc` and `postpunc`); the one that wins
+    /// when more than one survives is last in the list.
+    translations: Vec<ResolvedTranslation>,
     // `BTreeMap` rather than `HashMap`: iteration order needs to be deterministic between runs
     // for candidates that tie on `ResolvedTranslation::rank` in `find_translations_from_node`
     // (see the ADR "Rule selection does not depend on table order"). A tie is an ill-formed
@@ -93,22 +120,13 @@ struct TrieNode {
     // to hash every member of its `ResolvedClasses` (whose own layout is chosen for the same
     // comparison -- see `ResolvedClasses::chars`).
     transitions: BTreeMap<ResolvedTransition, TrieNode>,
+    /// Every translation inserted at this node, in a [`Trie::keep_all`] trie.
+    alternatives: Vec<ResolvedTranslation>,
 }
 
 impl TrieNode {
-    fn char_transition(&self, c: char, case_sensitive: bool) -> Option<&TrieNode> {
-        if case_sensitive {
-            self.transitions.get(&ResolvedTransition::Character(c))
-        } else if c.to_lowercase().count() != 1 {
-            // FIXME: we ignore characters that do not map to a single
-            // character lowercase character
-            None
-        } else {
-            // case insensitive character transition
-            let lowercase = c.to_lowercase().next().unwrap();
-            self.transitions
-                .get(&ResolvedTransition::Character(lowercase))
-        }
+    fn char_transition(&self, c: char) -> Option<&TrieNode> {
+        self.transitions.get(&ResolvedTransition::Character(c))
     }
 }
 
@@ -123,6 +141,12 @@ pub struct Trie {
     /// being lowercased first. Needed for `comp6`, where `comp6 a 1` and `comp6 A 17`
     /// are independent rules.
     case_sensitive: bool,
+    /// liblouis's `toLowercase`: the capitals a `base uppercase` rule derives, mapped to
+    /// their base. Rule and input characters are compared through it.
+    case_folding: HashMap<char, char>,
+    /// When true, every translation is kept instead of one per path, and boundary checks
+    /// are left to the caller.
+    keep_all: bool,
 }
 
 impl Trie {
@@ -131,11 +155,37 @@ impl Trie {
             root: TrieNode::default(),
             ctx: CharacterClasses::default(),
             case_sensitive: false,
+            case_folding: HashMap::new(),
+            keep_all: false,
+        }
+    }
+
+    /// Keep every rule inserted along a path, ignoring its `Transition`s and
+    /// `ClassConstraint`s, so the caller can select among them itself.
+    pub fn keep_all(self) -> Self {
+        Trie {
+            keep_all: true,
+            ..self
         }
     }
 
     pub fn with_context(self, ctx: CharacterClasses) -> Self {
         Trie { ctx, ..self }
+    }
+
+    pub fn with_case_folding(self, case_folding: HashMap<char, char>) -> Self {
+        Trie {
+            case_folding,
+            ..self
+        }
+    }
+
+    fn fold(&self, c: char) -> char {
+        if self.case_sensitive {
+            c
+        } else {
+            self.case_folding.get(&c).copied().unwrap_or(c)
+        }
     }
 
     pub fn case_sensitive(self) -> Self {
@@ -205,22 +255,66 @@ impl Trie {
             "Cannot insert empty `from` string (or `to` string in case of backward translation) - this causes infinite loops when translating"
         );
 
+        // liblouis files a rule under its first two characters as written but looks it up
+        // by the input's lowercased ones, so a capital there makes the rule unreachable
+        let folded: Vec<char> = from
+            .chars()
+            .enumerate()
+            .map(|(i, c)| if i < 2 { c } else { self.fold(c) })
+            .collect();
+        if self.keep_all {
+            let mut node = &mut self.root;
+            for &c in &folded {
+                node = node
+                    .transitions
+                    .entry(ResolvedTransition::Character(c))
+                    .or_default();
+            }
+            if !node
+                .alternatives
+                .iter()
+                .any(|t| t.rule() == Some(&origin.rule))
+            {
+                let length = from.chars().count();
+                node.alternatives.push(ResolvedTranslation::new(
+                    from,
+                    to,
+                    length,
+                    stage,
+                    origin.clone(),
+                ));
+            }
+            return;
+        }
+
         let before = before.map(|t| self.resolve_transition(t));
         let after = after.map(|t| self.resolve_transition(t));
 
         let mut current_node = &mut self.root;
         let mut length = from.chars().count();
 
+        // liblouis ors the classes of a rule's `after` constraints, and of its `before` ones
+        let (start_classes, end_classes): (Vec<_>, Vec<_>) = class_constraints
+            .iter()
+            .partition(|constraint| matches!(constraint, ClassConstraint::Start(_)));
+        let classes = |constraints: Vec<&ClassConstraint>| -> Vec<CharacterClass> {
+            constraints
+                .into_iter()
+                .map(|constraint| match constraint {
+                    ClassConstraint::Start(class) | ClassConstraint::End(class) => class.clone(),
+                })
+                .collect()
+        };
+        let (start_classes, end_classes) = (classes(start_classes), classes(end_classes));
+
         // StartClass constraints are lookbehind checks on `prev` — inserted before char transitions
-        for constraint in &class_constraints {
-            if let ClassConstraint::Start(class) = constraint {
-                length += 1;
-                let resolved = ResolvedClasses::resolve(&self.ctx, &[class.clone()]);
-                current_node = current_node
-                    .transitions
-                    .entry(ResolvedTransition::Start(resolved))
-                    .or_default();
-            }
+        if !start_classes.is_empty() {
+            length += 1;
+            let resolved = ResolvedClasses::resolve(&self.ctx, &start_classes);
+            current_node = current_node
+                .transitions
+                .entry(ResolvedTransition::Start(resolved))
+                .or_default();
         }
 
         if let Some(t) = before {
@@ -228,7 +322,7 @@ impl Trie {
             current_node = current_node.transitions.entry(t).or_default();
         }
 
-        for c in from.chars() {
+        for &c in &folded {
             current_node = current_node
                 .transitions
                 .entry(ResolvedTransition::Character(c))
@@ -241,48 +335,41 @@ impl Trie {
         }
 
         // EndClass constraints are lookahead checks on the next char — inserted after char transitions
-        for constraint in &class_constraints {
-            if let ClassConstraint::End(class) = constraint {
-                length += 1;
-                let resolved = ResolvedClasses::resolve(&self.ctx, &[class.clone()]);
-                current_node = current_node
-                    .transitions
-                    .entry(ResolvedTransition::End(resolved))
-                    .or_default();
-            }
+        if !end_classes.is_empty() {
+            length += 1;
+            let resolved = ResolvedClasses::resolve(&self.ctx, &end_classes);
+            current_node = current_node
+                .transitions
+                .entry(ResolvedTransition::End(resolved))
+                .or_default();
         }
 
-        if let Some(translation) = &current_node.translation {
-            // this node already contains a translation
-            if precedence > translation.precedence() {
-                current_node.translation = Some(ResolvedTranslation::new(
-                    from,
-                    to,
-                    length,
-                    stage,
-                    origin.clone(),
-                ));
-            } else if cfg!(feature = "backwards_compatibility") {
-                // first rule wins, so nothing to insert
-            } else {
-                // last rule wins
-                current_node.translation = Some(ResolvedTranslation::new(
-                    from,
-                    to,
-                    length,
-                    stage,
-                    origin.clone(),
-                ));
+        let translation = ResolvedTranslation::new(from, to, length, stage, origin.clone())
+            .with_precedence(precedence.clone());
+        let existing = current_node.translations.first().map(|t| t.precedence());
+        let translations = &mut current_node.translations;
+        // backward translation keeps a single rule per node
+        let same = |t: &ResolvedTranslation| {
+            direction == Direction::Backward || same_opcode(t.rule(), origin)
+        };
+        match existing {
+            Some(existing) if precedence > existing => *translations = vec![translation],
+            Some(existing) if precedence < existing => {}
+            _ if cfg!(feature = "backwards_compatibility") => {
+                // first rule wins: of the same opcode, and of a tie in the translation loop,
+                // which picks the last of equally ranked candidates
+                if !translations.iter().any(same) {
+                    translations.insert(0, translation);
+                }
             }
-        } else {
-            current_node.translation = Some(ResolvedTranslation::new(
-                from,
-                to,
-                length,
-                stage,
-                origin.clone(),
-            ));
+            _ => {
+                // last rule wins
+                translations.retain(|t| !same(t));
+                translations.push(translation);
+            }
         }
+        // liblouis tries an `always` rule after the other rules of its length
+        translations.sort_by_key(|t| !matches!(t.rule(), Some(Rule::Always { .. })));
     }
 
     fn find_translations_from_node(
@@ -294,15 +381,13 @@ impl Trie {
         let mut matching_rules = Vec::new();
         let mut chars = input.chars();
 
-        // if this node has a translation add it to the list of matching rules
-        if let Some(ref translation) = node.translation {
-            let translation = translation.clone();
-            matching_rules.push(translation)
-        }
+        // if this node has translations add them to the list of matching rules
+        matching_rules.extend(node.translations.iter().cloned());
+        matching_rules.extend(node.alternatives.iter().cloned());
         let c = chars.next();
         if let Some(c) = c {
             let bytes = c.len_utf8();
-            if let Some(node) = node.char_transition(c, self.case_sensitive) {
+            if let Some(node) = node.char_transition(self.fold(c)) {
                 matching_rules.extend(self.find_translations_from_node(
                     &input[bytes..],
                     Some(c),
@@ -335,6 +420,17 @@ impl Trie {
         matching_rules
     }
 
+    /// The translations kept for every single character path, in a [`Trie::keep_all`] trie.
+    pub fn single_char_alternatives(&self) -> impl Iterator<Item = (char, &[ResolvedTranslation])> {
+        self.root
+            .transitions
+            .iter()
+            .filter_map(|(transition, node)| match transition {
+                ResolvedTransition::Character(c) => Some((*c, node.alternatives.as_slice())),
+                _ => None,
+            })
+    }
+
     pub fn find_translations(&self, input: &str, prev: Option<char>) -> Vec<ResolvedTranslation> {
         self.find_translations_from_node(input, prev, &self.root)
     }
@@ -353,12 +449,98 @@ mod tests {
     }
 
     #[test]
+    fn rules_of_different_opcodes_share_a_node() {
+        let mut trie = Trie::new();
+        let prepunc = AnchoredRule::new(RuleParser::new("prepunc \" 236").rule().unwrap(), None, 0);
+        let postpunc =
+            AnchoredRule::new(RuleParser::new("postpunc \" 356").rule().unwrap(), None, 0);
+        for (rule, dots) in [(&prepunc, "⠦"), (&postpunc, "⠴")] {
+            trie.insert(
+                "\"",
+                dots,
+                None,
+                None,
+                Direction::Forward,
+                Precedence::Default,
+                vec![],
+                TranslationStage::Main,
+                rule,
+            );
+        }
+        let outputs: Vec<String> = trie
+            .find_translations("\"", None)
+            .iter()
+            .map(|t| t.output())
+            .collect();
+        assert_eq!(outputs.len(), 2);
+        assert!(outputs.contains(&"⠦".to_string()) && outputs.contains(&"⠴".to_string()));
+    }
+
+    #[test]
+    fn an_always_rule_is_tried_after_the_others_of_its_length() {
+        let mut trie = Trie::new();
+        let nocont = AnchoredRule::new(RuleParser::new("nocont www").rule().unwrap(), None, 0);
+        let always = AnchoredRule::new(
+            RuleParser::new("always www 2456-2456-2456").rule().unwrap(),
+            None,
+            1,
+        );
+        for (rule, dots) in [(&nocont, ""), (&always, "⠺⠺⠺")] {
+            trie.insert(
+                "www",
+                dots,
+                None,
+                None,
+                Direction::Forward,
+                Precedence::Translation,
+                vec![],
+                TranslationStage::Main,
+                rule,
+            );
+        }
+        let rules: Vec<bool> = trie
+            .find_translations("www", None)
+            .iter()
+            .map(|t| matches!(t.rule(), Some(Rule::Always { .. })))
+            .collect();
+        assert_eq!(rules, vec![true, false]);
+    }
+
+    #[test]
     fn empty_trie() {
         let trie = Trie::new();
         assert_eq!(
             trie.find_translations("foo", None),
             Vec::<ResolvedTranslation>::new()
         );
+    }
+
+    #[test]
+    fn keep_all_keeps_every_rule_for_a_path() {
+        let mut trie = Trie::new().keep_all();
+        let letter = AnchoredRule::new(RuleParser::new("letter b 12").rule().unwrap(), None, 0);
+        let word = AnchoredRule::new(RuleParser::new("word but 12").rule().unwrap(), None, 0);
+        for (rule, to) in [(&letter, "b"), (&word, "but")] {
+            trie.insert(
+                "⠃",
+                to,
+                Some(Transition::Start(vec![CharacterClass::Space])),
+                None,
+                Direction::Forward,
+                Precedence::Default,
+                vec![],
+                TranslationStage::Main,
+                rule,
+            );
+        }
+        let outputs: Vec<String> = trie
+            .find_translations("⠃", Some('x'))
+            .iter()
+            .map(|t| t.output())
+            .collect();
+        assert_eq!(outputs, ["b", "but"]);
+        let single: Vec<char> = trie.single_char_alternatives().map(|(c, _)| c).collect();
+        assert_eq!(single, ['⠃']);
     }
 
     #[test]
@@ -690,7 +872,7 @@ mod tests {
 
     #[test]
     fn find_translations_case_insensitive() {
-        let mut trie = Trie::new();
+        let mut trie = Trie::new().with_case_folding(HashMap::from([('F', 'f'), ('O', 'o')]));
         let rule = fake_rule();
         let foo = ResolvedTranslation::new("foo", "FOO", 3, TranslationStage::Main, rule.clone());
         trie.insert(
@@ -708,6 +890,29 @@ mod tests {
         assert_eq!(trie.find_translations("Foo", None), vec![foo.clone()]);
         assert_eq!(trie.find_translations("FOO", None), vec![foo.clone()]);
         assert_eq!(trie.find_translations("foO", None), vec![foo.clone()]);
+    }
+
+    #[test]
+    fn capitals_fold_only_through_the_case_folding() {
+        let mut trie = Trie::new().with_case_folding(HashMap::from([('O', 'o')]));
+        let rule = fake_rule();
+        for from in ["Goo", "Oox"] {
+            trie.insert(
+                from,
+                "X",
+                None,
+                None,
+                Direction::Forward,
+                Precedence::Default,
+                vec![],
+                TranslationStage::Main,
+                &rule,
+            );
+        }
+        assert_eq!(trie.find_translations("GOO", None).len(), 1);
+        assert!(trie.find_translations("goo", None).is_empty());
+        // a capital among the first two characters of a rule is never looked up
+        assert!(trie.find_translations("Oox", None).is_empty());
     }
 
     #[test]

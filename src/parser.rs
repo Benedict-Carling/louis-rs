@@ -8,7 +8,7 @@ use std::{
     iter::Peekable,
     num::ParseIntError,
     path::{Path, PathBuf},
-    str::{Chars, SplitAsciiWhitespace},
+    str::SplitAsciiWhitespace,
 };
 
 use enumset::enum_set;
@@ -76,7 +76,7 @@ impl Constraints {
         Constraints(self.0.difference(other.0))
     }
 
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Constraints(EnumSet::empty())
     }
 
@@ -887,6 +887,8 @@ impl std::fmt::Display for Rule {
                 write!(f, "largesign {} {}", chars, dots)
             }
             Rule::Word { chars, dots, .. } => write!(f, "word {} {}", chars, dots),
+            Rule::Joinword { chars, dots, .. } => write!(f, "joinword {} {}", chars, dots),
+            Rule::Lowword { chars, dots, .. } => write!(f, "lowword {} {}", chars, dots),
             Rule::Contraction { chars } => write!(f, "contraction {}", chars),
             Rule::Begword { chars, dots, .. } => write!(f, "begword {} {}", chars, dots),
             Rule::Begmidword { chars, dots, .. } => write!(f, "begmidword {} {}", chars, dots),
@@ -901,6 +903,11 @@ impl std::fmt::Display for Rule {
                 write!(f, "midnum {} {}", chars, dots)
             }
             Rule::Endnum { chars, dots, .. } => write!(f, "endnum {} {}", chars, dots),
+            Rule::Joinnum { chars, dots, .. } => write!(f, "joinnum {} {}", chars, dots),
+            Rule::Replace { chars, replacement } => match replacement {
+                Some(replacement) => write!(f, "replace {} {}", chars, replacement),
+                None => write!(f, "replace {}", chars),
+            },
             Rule::Modeletter { name, dots, .. } => write!(f, "modeletter {} {}", name, dots),
             Rule::Capsletter { dots, .. } => write!(f, "capsletter {}", dots),
             Rule::Begmodeword { name, dots, .. } => write!(f, "begmodeword {} {}", name, dots),
@@ -945,7 +952,11 @@ impl std::fmt::Display for Rule {
             Rule::Display {
                 character, dots, ..
             } => write!(f, "display {} {}", character, dots),
-            _ => todo!(),
+            Rule::Joinword { chars, dots, .. } => write!(f, "joinword {} {}", chars, dots),
+            Rule::Joinnum { chars, dots, .. } => write!(f, "joinnum {} {}", chars, dots),
+            Rule::Lowword { chars, dots, .. } => write!(f, "lowword {} {}", chars, dots),
+            Rule::Repeated { chars, dots, .. } => write!(f, "repeated {} {}", chars, dots),
+            _ => write!(f, "{:?}", self),
         }
     }
 }
@@ -1063,7 +1074,7 @@ impl HasNocross for Rule {
 }
 
 /// Defines precedence levels for [`Rules`](Rule).
-#[derive(Debug, Default, Clone, PartialEq, PartialOrd)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Precedence {
     #[default]
     Default,
@@ -1100,7 +1111,9 @@ impl HasPrecedence for Rule {
             | Rule::Begnum { .. }
             | Rule::Midnum { .. }
             | Rule::Endnum { .. }
-            | Rule::Always { .. } => Precedence::Translation,
+            | Rule::Always { .. }
+            | Rule::Nocont { .. }
+            | Rule::Replace { .. } => Precedence::Translation,
             Rule::Capsletter { .. }
             | Rule::Begcapsword { .. }
             | Rule::Endcapsword { .. }
@@ -1138,7 +1151,10 @@ pub enum EscapingContext {
     MatchPattern,
 }
 
-fn unescape_unicode(chars: &mut Chars, len: u8) -> Result<char, ParseError> {
+pub(crate) fn unescape_unicode<I: Iterator<Item = char> + Clone>(
+    chars: &mut I,
+    len: u8,
+) -> Result<char, ParseError> {
     let mut s = String::new();
 
     for _ in 0..len {
@@ -1538,8 +1554,20 @@ impl<'a> RuleParser<'a> {
         unescape(s, EscapingContext::Default)
     }
 
-    fn maybe_chars(&mut self) -> Option<String> {
-        self.tokens.next().map(|s| s.to_string())
+    /// The optional replacement of a `replace` rule. A token starting with `#` is a comment,
+    /// and `\#` escapes a literal `#`.
+    fn replacement(&mut self) -> Result<Option<String>, ParseError> {
+        match self.tokens.next() {
+            None => Ok(None),
+            Some(s) if s.starts_with('#') => Ok(None),
+            Some(s) => unescape(
+                s.strip_prefix('\\')
+                    .filter(|s| s.starts_with('#'))
+                    .unwrap_or(s),
+                EscapingContext::Default,
+            )
+            .map(Some),
+        }
     }
 
     fn filename(&mut self) -> Result<String, ParseError> {
@@ -1678,10 +1706,25 @@ impl<'a> RuleParser<'a> {
             })?
     }
 
+    #[allow(dead_code)] // used by the binary and the tests
     pub fn rule(&mut self) -> Result<Rule, ParseError> {
+        self.rule_or_blank()?
+            .ok_or(ParseError::OpcodeExpected { found: None })
+    }
+
+    /// Like [`Self::rule`], but a line holding only prefixes such as `nofor` or `after x`
+    /// reads as a blank line, as liblouis's compiler finds no opcode token after them.
+    pub fn rule_or_blank(&mut self) -> Result<Option<Rule>, ParseError> {
         let constraints = self.constraints();
         let classes = self.with_classes().unwrap_or_default().unwrap_or_default();
         let matches = self.with_matches();
+        if self
+            .tokens
+            .peek()
+            .is_none_or(|token| token.starts_with('#') || token.starts_with('<'))
+        {
+            return Ok(None);
+        }
         let opcode = self.opcode()?;
         let rule = match opcode {
             Opcode::Include => {
@@ -2169,7 +2212,7 @@ impl<'a> RuleParser<'a> {
                 fail_if_invalid_constraints(Constraints::empty(), constraints, opcode)?;
                 Rule::Replace {
                     chars: self.chars()?,
-                    replacement: self.maybe_chars(),
+                    replacement: self.replacement()?,
                 }
             }
             Opcode::Always => Rule::Always {
@@ -2439,7 +2482,7 @@ impl<'a> RuleParser<'a> {
                 }
             }
         };
-        Ok(rule)
+        Ok(Some(rule))
     }
 }
 
@@ -2502,6 +2545,14 @@ impl AnchoredRule {
     pub fn new(rule: Rule, path: Option<PathBuf>, line: usize) -> Self {
         Self { rule, path, line }
     }
+
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    pub fn line(&self) -> usize {
+        self.line
+    }
 }
 
 impl HasDirection for AnchoredRule {
@@ -2538,20 +2589,23 @@ pub fn table(table: &str, path: Option<PathBuf>) -> Result<Vec<AnchoredRule>, Ve
         .enumerate()
         // drop comments and empty lines
         .filter(|(_, line)| !line.trim().starts_with('#') && !line.trim().is_empty())
-        .map(|(line_no, line)| {
+        .filter_map(|(line_no, line)| {
             // parse the line
             RuleParser::new(line)
-                .rule()
-                .map(|rule| AnchoredRule {
-                    rule,
-                    path: path.clone(),
-                    line: line_no + 1,
+                .rule_or_blank()
+                .map(|rule| {
+                    rule.map(|rule| AnchoredRule {
+                        rule,
+                        path: path.clone(),
+                        line: line_no + 1,
+                    })
                 })
                 .map_err(|e| TableError::ParseError {
                     path: path.clone(),
                     line: line_no + 1,
                     error: e,
                 })
+                .transpose()
         })
         .partition(Result::is_ok);
     let rules: Vec<_> = rules.into_iter().map(Result::unwrap).collect();
@@ -2633,13 +2687,13 @@ fn expand_include(
                 let resolved = search_path
                     .find_file(path)
                     .ok_or(vec![TableError::HyphenationTableNotFound(path.into())])?;
-                let source = read_to_string(&resolved).map_err(|error| {
+                let source = std::fs::read(&resolved).map_err(|error| {
                     vec![TableError::HyphenationTableNotReadable {
                         path: resolved.clone(),
                         error,
                     }]
                 })?;
-                let table = HyphenationTable::parse(&source).map_err(|error| {
+                let table = HyphenationTable::parse_bytes(&source).map_err(|error| {
                     vec![TableError::HyphenationTableNotParseable {
                         path: resolved,
                         error,
@@ -2731,6 +2785,27 @@ mod tests {
         assert!(RuleParser::new("nofor nocross").nofor());
         assert!(!RuleParser::new("nocross nofor").nofor());
         assert!(!RuleParser::new("").nofor());
+    }
+
+    #[test]
+    fn replace() {
+        let replacement = |source| match RuleParser::new(source).rule().unwrap() {
+            Rule::Replace { replacement, .. } => replacement,
+            rule => panic!("not a replace rule: {rule:?}"),
+        };
+        assert_eq!(replacement("replace \\x2060"), None);
+        assert_eq!(replacement("replace \\x2060 #WORD JOINER"), None);
+        assert_eq!(replacement("replace \\x2026 ..."), Some("...".to_string()));
+        assert_eq!(replacement("replace x \\#"), Some("#".to_string()));
+        assert_eq!(replacement("replace x \\x0041"), Some("A".to_string()));
+    }
+
+    #[test]
+    fn display_joinnum_and_replace() {
+        let show = |source| RuleParser::new(source).rule().unwrap().to_string();
+        assert_eq!(show("joinnum § 346"), "joinnum § ⠬");
+        assert_eq!(show("replace \\x2026 ..."), "replace … ...");
+        assert_eq!(show("replace x"), "replace x");
     }
 
     #[test]
@@ -3025,6 +3100,21 @@ mod tests {
         assert_eq!(
             Err(ParseError::DotsTupleExpected),
             RuleParser::new("grouping brackets () 123").rule()
+        );
+    }
+
+    #[test]
+    fn prefixes_without_an_opcode_are_a_blank_line() {
+        let rules = table(
+            "attribute x x\nafter x\nnofor # comment\nletter a 1\n",
+            None,
+        )
+        .unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[1].line(), 4);
+        assert_eq!(
+            RuleParser::new("nofor").rule(),
+            Err(ParseError::OpcodeExpected { found: None })
         );
     }
 

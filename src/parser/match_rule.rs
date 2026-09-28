@@ -157,6 +157,7 @@ impl<'a> PatternParser<'a> {
             Some('l') => Ok(Attribute::Class(CharacterClass::Lowercase)),
             Some('.') => Ok(Attribute::Class(CharacterClass::Punctuation)),
             Some('$') => Ok(Attribute::Class(CharacterClass::Sign)),
+            Some('m') => Ok(Attribute::Class(CharacterClass::Math)),
             Some('~') => Ok(Attribute::Class(CharacterClass::Seqdelimiter)),
             Some('<') => Ok(Attribute::Class(CharacterClass::Seqbeforechars)),
             Some('>') => Ok(Attribute::Class(CharacterClass::Seqafterchars)),
@@ -390,6 +391,12 @@ mod tests {
             PatternParser::new("%a", Side::Pre).attributes(),
             Ok(Pattern::Attributes(HashSet::from([Attribute::Class(
                 CharacterClass::Letter
+            ),])))
+        );
+        assert_eq!(
+            PatternParser::new("%m", Side::Pre).attributes(),
+            Ok(Pattern::Attributes(HashSet::from([Attribute::Class(
+                CharacterClass::Math
             ),])))
         );
     }

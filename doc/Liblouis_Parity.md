@@ -47,7 +47,9 @@ reversed for back-translation.
 
 **Contractions and the word-family opcodes** — `word`, `begword`, `midword`,
 `endword`, `midendword`, `prfword`, `sufword`, `partword`, `begmidword`, with their
-`before`/`after` class constraints.
+`before`/`after` class constraints (several of either kind are alternatives, as liblouis
+ors them). A contraction's letter sign goes in only where the contraction is the rule
+chosen.
 
 **`match` and `context` rules** via a purpose-built regexp VM (`src/translator/regexp.rs`)
 that compiles patterns at table load time and matches in linear time.
@@ -57,8 +59,15 @@ three tiers — `capsletter`, `begcapsword`/`endcapsword`, and caps passages via
 `begcaps`/`endcaps` or `begcapsphrase`/`endcapsphrase`/`lencapsphrase` — plus letter
 sign, `nocontract`, and the generic `begmode`/`endmode` family.
 
-**Emphasis.** `begemph`/`endemph` and the word/symbol tiers. liblouis's own
-`new_emph.yaml` and `en-us-emphasis_harness.yaml` pass at 100%.
+**Emphasis.** Capitals, the other modes and the typeform classes share liblouis's model
+(`src/translator/indication/emphasis.rs`): `markEmphases` resolves begin/end/word/symbol
+marks per class (sections, words, passages, resets, letters), and the translation loop
+inserts them in `insertEmphasesAt`'s order, including those at positions a rule spans
+and the capital start indicator again when a zero-width rule leaves the position
+unchanged. `correct` carries the typeforms over to its output. Back-translation reads
+the emphasis indicators and reports the emphasis in `TranslationResult::emphasis` when
+`TranslationOptions::with_emphasis_output` asks for it, as liblouis fills a typeform
+buffer. `repword` and `rependword` are translated.
 
 **Computer braille** as a full pipeline feature — `comp6`, `compbrl`,
 `begcomp`/`endcomp`, and a scanner that derives computer-braille spans from
@@ -75,13 +84,17 @@ mutate `LOUIS_TABLE_PATH`.
 
 **Hyphenation, natively.** liblouis `.dic` pattern files are parsed directly
 (`src/hyphenation.rs`) — no external crate, no build or conversion step. Resolved
-through the same search path as any other table.
+through the same search path as any other table. `nocross` rules follow liblouis's
+`syllableBreak`/`hyphenateWord`, including its pattern automaton and lack of
+`LEFTHYPHENMIN`/`RIGHTHYPHENMIN`.
 
 **Position mapping.** `inputPos`, `outputPos` and `cursorPos`, composed across every
 pipeline stage in both directions. One known mismatch remains in the whole suite.
 
 **Display tables** as a pipeline stage, renders last when translating to braille and
-first when back-translating. `--display` on `translate` and `trace`.
+first when back-translating. `--display` on `translate` and `trace`. The YAML harness,
+like liblouis's checker, reads a block's translation table as its display table when
+the file names none.
 
 **Table metadata queries** — find tables by language, contraction grade and the rest.
 
@@ -96,15 +109,11 @@ Honest list, no dates attached:
 - **No C ABI and no bindings.** Rust consumers only, for now. PyO3 bindings are
   proposed in [#1](https://github.com/liblouis/louis-rs/issues/1) /
   [PR #12](https://github.com/liblouis/louis-rs/pull/12).
-- **Two screen-reader modes are missing**: `partialTrans`
-  ([#19](https://github.com/liblouis/louis-rs/issues/19)) and
-  `compbrlAtCursor`/`compbrlLeftCursor`
-  ([#20](https://github.com/liblouis/louis-rs/issues/20)). The option flags are
-  accepted; nothing reads them yet.
-- **Back-translation returns text but not typeform.** `TranslationResult::emphasis`
-  is never populated, and nothing reports whether a back-translation result could
-  still change if more cells arrive
-  ([#29](https://github.com/liblouis/louis-rs/issues/29)).
+- **A screen-reader mode is missing**: `partialTrans`
+  ([#19](https://github.com/liblouis/louis-rs/issues/19)). The option flag is
+  accepted; nothing reads it yet.
+- **Nothing reports whether a back-translation result could still change** if more
+  cells arrive ([#29](https://github.com/liblouis/louis-rs/issues/29)).
 - **No Unicode normalization.** NFC was implemented and reverted — it fixed tables
   with precomposed-character rules and broke tables with standalone
   combining-character rules (IPA, Hebrew, Yiddish). NFD is the proposed path.
@@ -124,82 +133,57 @@ a few hundred either way on the million-assertion files.
 
 | Area                                                | Failing | Root cause                                                                                                                                                                       | Size |
 |-----------------------------------------------------|--------:|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------|
-| `en-ueb-g2-dictionary_harness`, `afr-za-g2` forward |  ≈4 500 | Match-rule candidate selection. See ADR about "Match-rule candidate selection" and ADR Rule selection does not depend on table order. | L    |
-| `afr-za-g2` backward                                |  ≈2 500 | Afrikaans's lower-sign contractions share dot patterns with punctuation, and backward boundary checks classify a cell by its dots.                                               | M    |
-| `ml`, `pa`, `hi`, `ta`, `fa`, `th`, `bn`            |  ≈2 600 | Complex scripts: conjunct and reph forms, and stacked combining marks firing an indicator each instead of once per grapheme cluster.                                             | L    |
-| `da-dk-g28-dictionary_harness`                      |  ≈1 200 | Backward: `letsign` (⠰) is also the second cell of two-cell contractions. Consuming the indicator and suppressing the word rules in its scope does not settle this one — the ambiguity is which reading the cell has in the first place. | M    |
-| `en-ueb-computer-code`                              |  ≈1 700 | Three bugs: letter sign fires only on the first occurrence in a run; wrong word sign before hyphen or closing bracket; leading indicator dropped at the very start of the input. But the file's own header says many of its expectations are wrong and it needs review ([#590](https://github.com/liblouis/liblouis/issues/590)), so establish which are before chasing them. | M    |
-| `hu-hu-g1_dictionary_special_consonants`            |  ≈1 100 | `nocross` asks "can this hyphenate anywhere?" instead of liblouis's positional `syllableBreak()`.                                                                                | L    |
-| `sw-ke-dictionary`, `sw-ke`                         |    ≈850 | Backward lookup splices in unrelated dictionary words ("wote" → "wizaraote"); single-letter words pick up a spurious letter sign.                                                | M    |
+| `afr-za-g2` forward                                 |      13 | Definition-order tie (table bug): `match [Ss] en ING\|ing\|[Uu] 15-1345` (afr-za-g2.ctb:146) against `match !%3 en !%3 26` (:274), equal weight, for every `senu…` word. | —    |
+| `ml`, `ta`, `hi`, `pa`, `th`                        |      78 | Definition-order ties (table bugs): a `word` rule against an equally long `postpunc`/`prepunc`/`always` for the same punctuation (en-in-g1, en-us-g1, pu-in-g1), and `begmidword` against `endword` for the same conjunct in `malayalam.cti`. The "one indicator per grapheme cluster" theory did not hold: the causes were context `*` copying, lookbacks, `$w`–`$z`, context rule ranking, `decpoint`, `repeated`, `nocont` and undefined-character escapes. | —    |
+| `da-dk_1993`, `da-dk-6dot`, `spaces`             |      16 | Definition-order ties (table bugs): `context $w["-"]$w` against `context $sw["-"]$sw` in the Danish tables (e.g. `da-dk-g16_1993.ctb:257`/`:258`), and `correct "\x200b"` in both `en-ueb-chardefs.uti:33` and `spaces.uti:58`. | —    |
+| `sw-ke-dictionary`, `sw-ke`                         |      37 | Not yet surveyed; the backward lookup that spliced in unrelated dictionary words went with the back-translation rule selection.                                                                    | M    |
 | `en-g3`, `en-ueb`                                   |    ≈600 | A literal hyphen breaks per-segment contraction in compounds — "do-it-yourself" gives `do-x-y\|rself`, not `d-x-yrf`.                                                            | M    |
-| `rw-rw-g1`, `numericmode`                           |    ≈500 | Letters used as pseudo-digits still get a capital sign. Related: `endmode`/`endmodeword` don't fire across a `base` character chain.                                             | M    |
-| `de-g0-detailed-specs`, `de-g1-…`                   |    ≈280 | `capsletter` vs. `begcapsword` tier selection. Needs `uppercase.rs` and `emphasis.rs` unified into one tier model — a blanket engine fix was tried and disproven.                | L    |
+| `mixed-case`                                        |       5 | liblouis fails the same five tests with the same output.                                                                                                                         | —    |
 | all other files                                     |  ≈2 500 | Roughly 100 files, each contributing well under 350.                                                                                                                             | —    |
 
 Two cross-cutting items have no single file behind them:
 
-- **Backward direction, generally.** The boundary predicates (`word_start` and
-  friends) only work forward, and caps passages and emphasis have no backward path at
-  all.
+- **Backward direction, generally.** Rule selection follows liblouis's
+  `back_selectRule` (`src/translator/table/backward.rs`): the side before a rule is the
+  last character of the text produced so far, classified by the text classes; the side
+  after is the next cell's attributes or `isEndWord`'s scan; rules are tried in
+  liblouis's order; and `itsANumber` and `noContractMode` are state set by the rules
+  applied, as are capitalization's `nextUpper`/`allUpper`/`allUpperPhrase` and the emphasis
+  of the text. *(M)*
+- **Engine debt.** `correct`, `pass2`–`pass4` and forward `context` rules run on a port
+  of liblouis's pass engine (`src/translator/pass.rs`): tests are programs run left to
+  right without backtracking, rules are tried by their leading literal characters.
+  Where liblouis then falls back on definition order, the rule that moves on further,
+  then the one that looked at more input, then at more conditions, wins; exact ties are
+  table bugs (see the ADR). Backward `context` rules with a leading literal still go
+  through the pattern engine, where regexp negation of concatenation and alternation is
+  wrong (`!(e1e2)` ≠ `(!e1!e2)`) and grouping never matches; `omit` and `;` ignore a
+  grouping, and the `syllable` opcode's cross-boundary restriction is unimplemented. *(M)*
 
-  Underneath that sits one specific divergence worth fixing properly, because it has
-  now been patched three times for three different opcode families. We evaluate *both*
-  sides of a backward boundary check against the braille input, using a class table
-  (`dots_classes`) populated from character definitions plus whichever contraction
-  opcodes have been added to it so far — so whenever a check meets a family nobody
-  added yet, it sees no letter and the rule silently never fires. liblouis is
-  asymmetric instead (`lou_backTranslateString.c`):
-
-  - the **before** side reads the last character of the *output produced so far* and
-    classifies it with the text classes (`back_setBefore`, `isBegWord` — "look at what
-    has already been translated")
-  - the **after** side reads the next *braille cell* and classifies it with the dots
-    classes, but when that cell isn't a letter by attribute it walks the rules attached
-    to the cell and treats any multi-character contraction as word-continuation
-    (`isEndWord`, excluding `begword`/`midword` per liblouis#360)
-
-  So liblouis never needs contraction dots in its letter class; our class-table
-  patching is an approximation of that rule walk. Matching the real structure removes
-  the whole recurring bug family. *(L)*
-- **Engine debt.** Regexp negation of concatenation and alternation is wrong
-  (`!(e1e2)` ≠ `(!e1!e2)`); `Attribute::ByOrder` and `Any` are no-ops in
-  `match_pattern.rs` and all three are no-ops in `context_pattern.rs`; the
-  `syllable` opcode's cross-boundary restriction is unimplemented. *(M)*
-
-## Forty-two blocks that never run
+## Four blocks that never run
 
 A YAML file is a sequence of blocks, each with its own table. A block whose table
 won't load is reported on stderr and skipped, and the rest of the file still runs.
-Forty-two blocks across twelve files are skipped this way, so those tests report
-neither passes nor failures — the one genuine unknown in this document, and the
-cheapest work in it.
+Tables are looked up in the YAML file's directory first, as `lou_checkyaml` changes
+into it, and a metadata query takes the table `lou_findTable` scores best. Four blocks
+are still skipped:
 
-| Reason                                    | Blocks | What it needs                                                                                                                                                                                           | Size |
-|-------------------------------------------|-------:|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------|
-| `multipass-vs-match_common.uti` not found |     25 | The include sits next to the YAML file rather than on `LOUIS_TABLE_PATH`. One missing fixture takes out every block of `multipass-vs-match.yaml`. | S    |
-| Parser gaps                               |      6 | An `InvalidAction` and an `EmptyTest` in each of `multipass-forward.yaml` and `multipass-backward.yaml`, plus an `OpcodeExpected` and a surrogate-pair escape.                                          | S    |
-| Ambiguous metadata queries                |      7 | `language=grc,region=en` matches two tables and `system=cmn-traditional` three. `lou_findTable` scores its candidates and always lands on one; we intersect and insist on exactly one.                  | M    |
-| Hyphenation dictionaries                  |      2 | `hyph_en_US.dic` rejected for its ISO-8859-1 encoding; `hyphenation.dic` not found.                                                                                                                     | S    |
-| `macro.utb` not found                     |      1 | Deliberate non-goal.                                                                                                                                                                                    | —    |
-| A query matching no table at all          |      1 | `language=grc,region=es` finds nothing on the search path. Possibly a bug in the spec rather than in us.                                                                                                | S    |
+| Reason                          | Blocks | What it needs                                                                                                                                                                  | Size |
+|---------------------------------|-------:|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------|
+| A tied metadata query           |      3 | `language=grc,region=en` scores `grc-international-en.utb` and `grc-international-en-composed.utb` equally; `lou_findTable` takes whichever the directory lists first.  | —    |
+| `macro` opcode                  |      1 | Deliberate non-goal; the reference build cannot compile `macro.utb` either.                                                                                                    | —    |
 
-Ten files report zero tests. Seven because every one of their blocks is skipped for
-a reason above: `multipass-vs-match.yaml`, `macro.yaml`, `grc-international-es.yaml`,
-`ja-kantenji.yaml`, `face-with-tears-of-joy.yaml`, `hyphenation.yaml` and
-`hyphenation_nocross_harness.yaml`.
+The `hyphenate` and `hyphenateBraille` test modes run as `lou_hyphenate` does. Five of
+`hu-hu-g1-hyph_harness.yaml`'s tests fail with the output liblouis gives too: its
+checker prints hyphenation mismatches without counting them.
 
-The other three are a separate problem: the `hyphenate`, `hyphenateBraille` and
-`display` test modes fall through a catch-all arm in `src/test.rs` and silently report
-nothing at all, and `de-eurobrl6.yaml`, `hu-hu-g1-hyph_harness.yaml` and
-`no_8dot_harness.yaml` consist only of such tests. `issue-332.yaml` has its
-`hyphenate` block skipped the same way while its remaining 19 tests all fail. *(S)*
+The `display` test mode runs, and all 16 assertions of `de-eurobrl6.yaml` pass.
 
 ## Missing API surface
 
 | Capability                                                                                      | Status                                                                                                                                                    | Size   |
 |-------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------|--------|
 | `partialTrans` ([#19](https://github.com/liblouis/louis-rs/issues/19))                          | Flag accepted, nothing reads it. A screen reader sets it on every keystroke of contracted input; without it, word-final rules fire on an unfinished word. | M      |
-| `compbrlAtCursor` / `compbrlLeftCursor` ([#20](https://github.com/liblouis/louis-rs/issues/20)) | Flags accepted, nothing reads them. Computer-braille rendering already works, so this is cursor plumbing.                                                 | M      |
 | Back-translation finality ([#29](https://github.com/liblouis/louis-rs/issues/29))               | Nothing says whether more cells could change the characters already produced.                                                                             | M      |
 | Display tables for library callers                                                              | `TranslationPipeline::with_display` and `louis translate/trace --display` exist; `Translator` doesn't expose it yet.                                       | S      |
 | `hyphenate`, `charToDots`, `dotsToChar`, `getEmphClasses`                                       | Working internals, nothing exposed on `Translator`.                                                                                                       | S each |
@@ -209,22 +193,16 @@ nothing at all, and `de-eurobrl6.yaml`, `hu-hu-g1-hyph_harness.yaml` and
 
 Good entry points, roughly easiest first:
 
-1. **Wake up the 46 blocks that don't run.** Several independent small fixes,
-   listed above, and nobody knows what those tests will report. *(S each)*
-2. **The three parser gaps.** Small, concrete, and each has a failing file to check
-   against. *(S)*
-3. **Expose the four missing entry points.** Mechanical. *(S each)*
-4. **Survey a failure cluster.** Every row in the table above now names a cause, so
+1. **Expose the four missing entry points.** Mechanical. *(S each)*
+2. **Survey a failure cluster.** Every row in the table above now names a cause, so
    what's left is the ~2 500 failures spread across roughly 100 smaller files, and
    the residue of the two clusters already surveyed. Reading failure output rather
    than deep engine work — and each of the three clusters that got this treatment
    turned out to be one or two root causes rather than a long tail. *(M)*
 
-The two architectural items — match-rule candidate selection, and unifying the
-capitalization and emphasis tier models — each already have one failed attempt behind
-them, so they're poor first contributions but well documented in
-[Architecture_Decision_Records.org](Architecture_Decision_Records.org). Read the
-relevant ADR before starting; both record an approach that was tested and disproven.
+Match-rule candidate selection has one failed attempt behind it, so it's a poor first
+contribution but well documented in
+[Architecture_Decision_Records.org](Architecture_Decision_Records.org).
 
 ## Also open
 
@@ -232,8 +210,8 @@ relevant ADR before starting; both record an approach that was tested and dispro
   ([#27](https://github.com/liblouis/louis-rs/issues/27)) — ADR accepted, prototype
   parked
 - gzip+bincode table bundling ([PR #10](https://github.com/liblouis/louis-rs/pull/10))
-- Backward `capsletter`/`begcapsword` failures in `hu-hu-g1`
-  ([#4](https://github.com/liblouis/louis-rs/issues/4))
+- `hu-hu-g1` failures ([#4](https://github.com/liblouis/louis-rs/issues/4)): only the
+  duplicated-rule ties above remain
 - Translation performance — the regexp VM was 59% of translation time, and there is a
   measured 2.0–3.4× in hand plus a larger structural idea (compiling all of a stage's
   `match`/`context` patterns into one automaton) not yet attempted. Everything on the

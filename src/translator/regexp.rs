@@ -43,6 +43,8 @@ pub enum Regexp {
     Any,
     CharacterClass(HashSet<char>),
     NotCharacterClass(HashSet<char>),
+    /// Zero-width assertion that the next character, if any, is not in the set
+    NotCharacterClassAhead(HashSet<char>),
     RepeatExactly(u8, Box<Regexp>),
     RepeatAtLeast(u8, Box<Regexp>),
     RepeatAtLeastAtMost(u8, u8, Box<Regexp>),
@@ -84,6 +86,12 @@ pub enum Regexp {
     /// Zero-width assertion that matches unless the match is at the true beginning of the
     /// original string. The negation of [`StartAnchor`](Regexp::StartAnchor).
     NotStartAnchor,
+    /// Like [`StartAnchor`](Regexp::StartAnchor), but standing in for a boundary character:
+    /// liblouis treats the edges of the input like a space, so passing it weighs as much as
+    /// matching the character it replaces.
+    StartBoundary,
+    /// Like [`EndAnchor`](Regexp::EndAnchor), weighted as [`StartBoundary`](Regexp::StartBoundary).
+    EndBoundary,
     /// Never matches, regardless of input. The negation of [`Empty`](Regexp::Empty).
     Never,
 }
@@ -115,6 +123,7 @@ impl Regexp {
             Regexp::CharacterClass(class) => Regexp::NotCharacterClass(class),
             // unreachable: the parser rejects double negation before it reaches here
             Regexp::NotCharacterClass(_) => unreachable!(),
+            Regexp::NotCharacterClassAhead(_) => unreachable!(),
             Regexp::RepeatExactly(n, regexp) => Regexp::RepeatExactly(n, Box::new(regexp.negate())),
             Regexp::RepeatAtLeast(n, regexp) => Regexp::RepeatAtLeast(n, Box::new(regexp.negate())),
             Regexp::RepeatAtLeastAtMost(n, m, regexp) => {
@@ -139,6 +148,8 @@ impl Regexp {
             Regexp::NotEndAnchor => Regexp::EndAnchor,
             Regexp::StartAnchor => Regexp::NotStartAnchor,
             Regexp::NotStartAnchor => Regexp::StartAnchor,
+            Regexp::StartBoundary => Regexp::NotStartAnchor,
+            Regexp::EndBoundary => Regexp::NotEndAnchor,
         }
     }
 
@@ -201,6 +212,10 @@ impl Regexp {
             Regexp::NotCharacterClass(characters) => {
                 character_classes.push(characters.into());
                 instructions.push(Instruction::NotClass(character_classes.len() - 1));
+            }
+            Regexp::NotCharacterClassAhead(characters) => {
+                character_classes.push(characters.into());
+                instructions.push(Instruction::AssertNotClass(character_classes.len() - 1));
             }
             Regexp::RepeatExactly(n, regexp) => {
                 for _ in 0..*n {
@@ -268,6 +283,8 @@ impl Regexp {
             Regexp::NotEndAnchor => instructions.push(Instruction::AssertMoreInput),
             Regexp::StartAnchor => instructions.push(Instruction::AssertStart),
             Regexp::NotStartAnchor => instructions.push(Instruction::AssertNotStart),
+            Regexp::StartBoundary => instructions.push(Instruction::AssertStartBoundary),
+            Regexp::EndBoundary => instructions.push(Instruction::AssertEndBoundary),
             Regexp::Never => instructions.push(Instruction::Fail),
         }
     }
@@ -321,6 +338,12 @@ pub enum Instruction {
     AssertStart,
     /// Zero-width assertion: succeeds unless at the true beginning of the original string
     AssertNotStart,
+    /// [`AssertStart`](Instruction::AssertStart) that adds one to the match's weight
+    AssertStartBoundary,
+    /// [`AssertEnd`](Instruction::AssertEnd) that adds one to the match's weight
+    AssertEndBoundary,
+    /// Zero-width assertion: succeeds unless the next character is in the set of chars
+    AssertNotClass(CharacterClassIndex),
     /// Never matches, regardless of input
     Fail,
 }
@@ -348,6 +371,7 @@ struct Thread {
     pc: InstructionIndex,
     captured: CharacterRange,
     consumed: CharacterRange,
+    bonus: usize,
 }
 
 /// A bitset over instruction indices, used to track which `pc`s have already been added
@@ -418,7 +442,9 @@ impl CompiledRegexp {
         // position counted in chars (the consumed span is reported in chars)
         sp: usize,
         cp: usize,
-        input_len: usize,
+        // weight earned by zero-width boundary assertions (see `Regexp::StartBoundary`)
+        bonus: usize,
+        input: &str,
         at_start: bool,
         env: &Environment,
     ) {
@@ -428,7 +454,7 @@ impl CompiledRegexp {
         list.seen.insert(pc);
         match self.instructions[pc] {
             Instruction::Jump(target) => self.add_thread(
-                list, target, captured, consumed, sp, cp, input_len, at_start, env,
+                list, target, captured, consumed, sp, cp, bonus, input, at_start, env,
             ),
             Instruction::Split(a, b) => {
                 self.add_thread(
@@ -438,12 +464,13 @@ impl CompiledRegexp {
                     consumed.clone(),
                     sp,
                     cp,
-                    input_len,
+                    bonus,
+                    input,
                     at_start,
                     env,
                 );
                 self.add_thread(
-                    list, b, captured, consumed, sp, cp, input_len, at_start, env,
+                    list, b, captured, consumed, sp, cp, bonus, input, at_start, env,
                 );
             }
             Instruction::CaptureStart => self.add_thread(
@@ -455,7 +482,8 @@ impl CompiledRegexp {
                 consumed,
                 sp,
                 cp,
-                input_len,
+                bonus,
+                input,
                 at_start,
                 env,
             ),
@@ -466,7 +494,8 @@ impl CompiledRegexp {
                 consumed,
                 sp,
                 cp,
-                input_len,
+                bonus,
+                input,
                 at_start,
                 env,
             ),
@@ -479,7 +508,8 @@ impl CompiledRegexp {
                 cp..cp,
                 sp,
                 cp,
-                input_len,
+                bonus,
+                input,
                 at_start,
                 env,
             ),
@@ -490,12 +520,13 @@ impl CompiledRegexp {
                 consumed.start..cp,
                 sp,
                 cp,
-                input_len,
+                bonus,
+                input,
                 at_start,
                 env,
             ),
             Instruction::VariableEqual(var, expected) => {
-                if env.get(var) == Some(&expected) {
+                if env.get(var).copied().unwrap_or(0) == expected {
                     self.add_thread(
                         list,
                         pc + 1,
@@ -503,14 +534,15 @@ impl CompiledRegexp {
                         consumed,
                         sp,
                         cp,
-                        input_len,
+                        bonus,
+                        input,
                         at_start,
                         env,
                     );
                 }
             }
             Instruction::NotVariableEqual(var, expected) => {
-                if env.get(var).is_some_and(|&actual| actual != expected) {
+                if env.get(var).copied().unwrap_or(0) != expected {
                     self.add_thread(
                         list,
                         pc + 1,
@@ -518,14 +550,15 @@ impl CompiledRegexp {
                         consumed,
                         sp,
                         cp,
-                        input_len,
+                        bonus,
+                        input,
                         at_start,
                         env,
                     );
                 }
             }
             Instruction::AssertEnd => {
-                if sp == input_len {
+                if sp == input.len() {
                     self.add_thread(
                         list,
                         pc + 1,
@@ -533,14 +566,15 @@ impl CompiledRegexp {
                         consumed,
                         sp,
                         cp,
-                        input_len,
+                        bonus,
+                        input,
                         at_start,
                         env,
                     );
                 }
             }
             Instruction::AssertMoreInput => {
-                if sp != input_len {
+                if sp != input.len() {
                     self.add_thread(
                         list,
                         pc + 1,
@@ -548,7 +582,8 @@ impl CompiledRegexp {
                         consumed,
                         sp,
                         cp,
-                        input_len,
+                        bonus,
+                        input,
                         at_start,
                         env,
                     );
@@ -563,7 +598,8 @@ impl CompiledRegexp {
                         consumed,
                         sp,
                         cp,
-                        input_len,
+                        bonus,
+                        input,
                         at_start,
                         env,
                     );
@@ -578,7 +614,60 @@ impl CompiledRegexp {
                         consumed,
                         sp,
                         cp,
-                        input_len,
+                        bonus,
+                        input,
+                        at_start,
+                        env,
+                    );
+                }
+            }
+            Instruction::AssertStartBoundary => {
+                if at_start && sp == 0 {
+                    self.add_thread(
+                        list,
+                        pc + 1,
+                        captured,
+                        consumed,
+                        sp,
+                        cp,
+                        bonus + 1,
+                        input,
+                        at_start,
+                        env,
+                    );
+                }
+            }
+            Instruction::AssertEndBoundary => {
+                if sp == input.len() {
+                    self.add_thread(
+                        list,
+                        pc + 1,
+                        captured,
+                        consumed,
+                        sp,
+                        cp,
+                        bonus + 1,
+                        input,
+                        at_start,
+                        env,
+                    );
+                }
+            }
+            Instruction::AssertNotClass(class) => {
+                if !input[sp..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| self.character_classes[class].contains(c))
+                {
+                    self.add_thread(
+                        list,
+                        pc + 1,
+                        captured,
+                        consumed,
+                        sp,
+                        cp,
+                        bonus,
+                        input,
                         at_start,
                         env,
                     );
@@ -590,6 +679,7 @@ impl CompiledRegexp {
                 pc,
                 captured,
                 consumed,
+                bonus,
             }),
         }
     }
@@ -629,7 +719,7 @@ impl CompiledRegexp {
         let mut matched: Option<(CharacterRange, CharacterRange, usize, TranslationIndex)> = None;
 
         current.start_step();
-        self.add_thread(current, 0, 0..0, 0..0, sp, 0, input.len(), at_start, env);
+        self.add_thread(current, 0, 0..0, 0..0, sp, 0, 0, input, at_start, env);
 
         while !current.threads.is_empty() {
             let next_char = input[sp..].chars().next();
@@ -640,7 +730,7 @@ impl CompiledRegexp {
                         matched = Some((
                             thread.captured.clone(),
                             thread.consumed.clone(),
-                            length,
+                            length + thread.bonus,
                             index,
                         ));
                         // every remaining thread in this step is lower priority than the one
@@ -656,7 +746,8 @@ impl CompiledRegexp {
                                 thread.consumed.clone(),
                                 sp + expected.len_utf8(),
                                 length + 1,
-                                input.len(),
+                                thread.bonus,
+                                input,
                                 at_start,
                                 env,
                             );
@@ -673,7 +764,8 @@ impl CompiledRegexp {
                                 thread.consumed.clone(),
                                 sp + actual.len_utf8(),
                                 length + 1,
-                                input.len(),
+                                thread.bonus,
+                                input,
                                 at_start,
                                 env,
                             );
@@ -690,7 +782,8 @@ impl CompiledRegexp {
                                 thread.consumed.clone(),
                                 sp + actual.len_utf8(),
                                 length + 1,
-                                input.len(),
+                                thread.bonus,
+                                input,
                                 at_start,
                                 env,
                             );
@@ -707,7 +800,8 @@ impl CompiledRegexp {
                                 thread.consumed.clone(),
                                 sp + actual.len_utf8(),
                                 length + 1,
-                                input.len(),
+                                thread.bonus,
+                                input,
                                 at_start,
                                 env,
                             );
@@ -724,7 +818,8 @@ impl CompiledRegexp {
                                 thread.consumed.clone(),
                                 sp + actual.len_utf8(),
                                 length + 1,
-                                input.len(),
+                                thread.bonus,
+                                input,
                                 at_start,
                                 env,
                             );
@@ -739,7 +834,8 @@ impl CompiledRegexp {
                                 thread.consumed.clone(),
                                 sp + actual.len_utf8(),
                                 length + 1,
-                                input.len(),
+                                thread.bonus,
+                                input,
                                 at_start,
                                 env,
                             );
