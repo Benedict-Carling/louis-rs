@@ -243,4 +243,19 @@ mod tests {
                 .unwrap();
         assert_eq!(transform.translate("⠁⠂⠂"), "⠁⠈⠂");
     }
+
+    #[test]
+    fn one_rule_per_position() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("digit 5 15"),
+            parse_rule("correct [\"a\"]$d \"x\""),
+            parse_rule("correct $l[]$d \"y\""),
+        ];
+        let ctx = TableContext::compile(&rules).unwrap();
+        let transform =
+            MultipassTable::compile(&rules, Direction::Forward, TranslationStage::Pre, &ctx)
+                .unwrap();
+        assert_eq!(transform.translate("a5"), "x5");
+    }
 }

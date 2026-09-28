@@ -66,7 +66,9 @@ impl IndicatorBuilder {
             ResolvedTranslation::new("", &lettersign, 1, TranslationStage::Main, origin.clone());
 
         let cc = ctx.character_classes();
-        let mut trie = Trie::new().with_context(cc.clone());
+        let mut trie = Trie::new()
+            .with_context(cc.clone())
+            .with_case_folding(ctx.case_folding().clone());
         let (start, end) = whole_word_boundaries(sequences.as_ref());
         for (contraction, _origin) in self.contractions {
             trie.insert(

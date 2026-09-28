@@ -77,38 +77,6 @@ fn with_grouping_characters(rules: &[AnchoredRule]) -> Vec<AnchoredRule> {
     expanded
 }
 
-/// The emphasis of the text a stage put out: liblouis gives every character the typeform of
-/// the input character its step started at
-fn remap_emphasis(spans: &[EmphasisSpan], steps: &[ResolvedTranslation]) -> Vec<EmphasisSpan> {
-    if spans.is_empty() {
-        return Vec::new();
-    }
-    let mut sources = Vec::new();
-    let mut input_offset = 0;
-    for step in steps {
-        sources.extend(std::iter::repeat_n(
-            input_offset,
-            step.output().chars().count(),
-        ));
-        input_offset += step.input().chars().count();
-    }
-    let mut remapped: Vec<EmphasisSpan> = Vec::new();
-    for span in spans {
-        for (k, source) in sources.iter().enumerate() {
-            if !span.range.contains(source) {
-                continue;
-            }
-            match remapped.last_mut() {
-                Some(last) if last.class == span.class && last.range.end == k => {
-                    last.range.end = k + 1
-                }
-                _ => remapped.push(EmphasisSpan::new(span.class.clone(), k..k + 1)),
-            }
-        }
-    }
-    remapped
-}
-
 #[derive(Debug)]
 pub struct TranslationPipeline {
     steps: Vec<Transformation>,
@@ -242,8 +210,7 @@ impl TranslationPipeline {
         for step in &self.steps {
             let translations = step.trace(&input, &options);
             if matches!(step, Transformation::Pre(_)) {
-                let emphasis = remap_emphasis(options.emphasis(), &translations);
-                options = options.with_emphasis(emphasis);
+                options = map_emphasis(options, &translations);
             }
             input = translations.iter().map(|t| t.output()).collect();
             result.push(translations);
@@ -263,10 +230,9 @@ impl TranslationPipeline {
         let mut result = input.to_string();
         let mut options = options.clone();
         for step in &self.steps {
-            if matches!(step, Transformation::Pre(_)) {
+            if matches!(step, Transformation::Pre(_)) && !options.emphasis().is_empty() {
                 let translations = step.trace(&result, &options);
-                let emphasis = remap_emphasis(options.emphasis(), &translations);
-                options = options.with_emphasis(emphasis);
+                options = map_emphasis(options, &translations);
                 result = translations.iter().map(|t| t.output()).collect();
             } else {
                 result = step.translate_with_options(&result, &options);
@@ -396,6 +362,41 @@ impl TranslationPipeline {
     }
 }
 
+/// Carries the emphasis of the input over to the output of `correct`, as liblouis's
+/// `makeCorrections` does with the typeforms: each output character takes those of the
+/// input character it came from.
+fn map_emphasis(
+    options: TranslationOptions,
+    translations: &[ResolvedTranslation],
+) -> TranslationOptions {
+    if options.emphasis().is_empty() {
+        return options;
+    }
+    let input_len: usize = translations.iter().map(|t| t.length()).sum();
+    let mut origins = Vec::new();
+    let mut pos = 0;
+    for t in translations {
+        let origin = pos.min(input_len.saturating_sub(1));
+        origins.extend(std::iter::repeat_n(origin, t.output().chars().count()));
+        pos += t.length();
+    }
+    let mut spans: Vec<EmphasisSpan> = Vec::new();
+    for span in options.emphasis() {
+        let mut start = None;
+        for (k, origin) in origins.iter().chain([&usize::MAX]).enumerate() {
+            match (span.range.contains(origin), start) {
+                (true, None) => start = Some(k),
+                (false, Some(s)) => {
+                    spans.push(EmphasisSpan::new(span.class.clone(), s..k));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+    }
+    options.with_emphasis(spans)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,6 +421,21 @@ mod tests {
         assert_eq!(pipeline.translate("foobar"), "⠇⠸");
         assert_eq!(pipeline.translate("  "), "⠀⠀");
         assert_eq!(pipeline.translate("🐂"), "⠄⡳⠽⠂⠋⠲⠴⠆⠄");
+    }
+
+    #[test]
+    fn correct_carries_emphasis_over() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("emphclass italic"),
+            parse_rule("emphletter italic 46"),
+            parse_rule("noback correct \"aa\" \"a\""),
+        ];
+        let pipeline = TranslationPipeline::compile(&rules, Direction::Forward).unwrap();
+        let options =
+            TranslationOptions::default().with_emphasis(vec![EmphasisSpan::new("italic", 2..3)]);
+        assert_eq!(pipeline.translate_with_options("aab", &options), "⠁⠨⠃");
     }
 
     #[test]
@@ -451,23 +467,6 @@ mod tests {
         // `*@136` copies the accent out of the bracket and consumes the whole match,
         // so the @135 and @13456 cells around it are replaced, not kept
         assert_eq!(pipeline.translate("oύ"), "⠐⠥");
-    }
-
-    #[test]
-    fn emphasis_follows_the_corrected_text() {
-        let steps = [
-            ResolvedTranslation::new("foo", "foobar", 3, TranslationStage::Pre, None),
-            ResolvedTranslation::new(" ", " ", 1, TranslationStage::Pre, None),
-            ResolvedTranslation::new("b", "b", 1, TranslationStage::Pre, None),
-        ];
-        assert_eq!(
-            remap_emphasis(&[EmphasisSpan::new("italic", 3..5)], &steps),
-            [EmphasisSpan::new("italic", 6..8)]
-        );
-        assert_eq!(
-            remap_emphasis(&[EmphasisSpan::new("bold", 0..1)], &steps),
-            [EmphasisSpan::new("bold", 0..6)]
-        );
     }
 
     #[test]
