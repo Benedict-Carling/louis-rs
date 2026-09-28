@@ -358,6 +358,8 @@ impl Trie {
                 translations.push(translation);
             }
         }
+        // liblouis tries an `always` rule after the other rules of its length
+        translations.sort_by_key(|t| !matches!(t.rule(), Some(Rule::Always { .. })));
     }
 
     fn find_translations_from_node(
@@ -462,6 +464,36 @@ mod tests {
             .collect();
         assert_eq!(outputs.len(), 2);
         assert!(outputs.contains(&"⠦".to_string()) && outputs.contains(&"⠴".to_string()));
+    }
+
+    #[test]
+    fn an_always_rule_is_tried_after_the_others_of_its_length() {
+        let mut trie = Trie::new();
+        let nocont = AnchoredRule::new(RuleParser::new("nocont www").rule().unwrap(), None, 0);
+        let always = AnchoredRule::new(
+            RuleParser::new("always www 2456-2456-2456").rule().unwrap(),
+            None,
+            1,
+        );
+        for (rule, dots) in [(&nocont, ""), (&always, "⠺⠺⠺")] {
+            trie.insert(
+                "www",
+                dots,
+                None,
+                None,
+                Direction::Forward,
+                Precedence::Translation,
+                vec![],
+                TranslationStage::Main,
+                rule,
+            );
+        }
+        let rules: Vec<bool> = trie
+            .find_translations("www", None)
+            .iter()
+            .map(|t| matches!(t.rule(), Some(Rule::Always { .. })))
+            .collect();
+        assert_eq!(rules, vec![true, false]);
     }
 
     #[test]
