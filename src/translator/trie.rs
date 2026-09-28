@@ -293,16 +293,28 @@ impl Trie {
         let mut current_node = &mut self.root;
         let mut length = from.chars().count();
 
+        // liblouis ors the classes of a rule's `after` constraints, and of its `before` ones
+        let (start_classes, end_classes): (Vec<_>, Vec<_>) = class_constraints
+            .iter()
+            .partition(|constraint| matches!(constraint, ClassConstraint::Start(_)));
+        let classes = |constraints: Vec<&ClassConstraint>| -> Vec<CharacterClass> {
+            constraints
+                .into_iter()
+                .map(|constraint| match constraint {
+                    ClassConstraint::Start(class) | ClassConstraint::End(class) => class.clone(),
+                })
+                .collect()
+        };
+        let (start_classes, end_classes) = (classes(start_classes), classes(end_classes));
+
         // StartClass constraints are lookbehind checks on `prev` — inserted before char transitions
-        for constraint in &class_constraints {
-            if let ClassConstraint::Start(class) = constraint {
-                length += 1;
-                let resolved = ResolvedClasses::resolve(&self.ctx, &[class.clone()]);
-                current_node = current_node
-                    .transitions
-                    .entry(ResolvedTransition::Start(resolved))
-                    .or_default();
-            }
+        if !start_classes.is_empty() {
+            length += 1;
+            let resolved = ResolvedClasses::resolve(&self.ctx, &start_classes);
+            current_node = current_node
+                .transitions
+                .entry(ResolvedTransition::Start(resolved))
+                .or_default();
         }
 
         if let Some(t) = before {
@@ -323,15 +335,13 @@ impl Trie {
         }
 
         // EndClass constraints are lookahead checks on the next char — inserted after char transitions
-        for constraint in &class_constraints {
-            if let ClassConstraint::End(class) = constraint {
-                length += 1;
-                let resolved = ResolvedClasses::resolve(&self.ctx, &[class.clone()]);
-                current_node = current_node
-                    .transitions
-                    .entry(ResolvedTransition::End(resolved))
-                    .or_default();
-            }
+        if !end_classes.is_empty() {
+            length += 1;
+            let resolved = ResolvedClasses::resolve(&self.ctx, &end_classes);
+            current_node = current_node
+                .transitions
+                .entry(ResolvedTransition::End(resolved))
+                .or_default();
         }
 
         let translation = ResolvedTranslation::new(from, to, length, stage, origin.clone())

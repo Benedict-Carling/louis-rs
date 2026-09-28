@@ -1810,6 +1810,7 @@ impl PrimaryTable {
         let mut chars = input.chars();
         let mut prev: Option<char> = None;
         let mut seen: HashSet<TranslationSubset> = HashSet::default();
+        let mut seen_at: usize = 0;
         let mut char_pos: usize = 0;
         // A zero-length candidate (e.g. a zero-width `context`/`match` action) re-enters
         // the loop at the same char_pos, where liblouis inserts the capital start
@@ -1954,6 +1955,11 @@ impl PrimaryTable {
                 }
             }
             context_due = true;
+            // what applied without moving on is only remembered at its own position
+            if seen_at != char_pos {
+                seen.clear();
+                seen_at = char_pos;
+            }
             let revisit = last_indications_pos == Some(char_pos);
             if !revisit {
                 indications_from = translations.len();
@@ -2116,6 +2122,11 @@ impl PrimaryTable {
 
             // drop translation candidates that we have applied already at this position in the
             // input
+            let contraction_rank = candidates
+                .iter()
+                .filter(|t| matches!(t.rule(), Some(Rule::Contraction { .. })))
+                .map(|t| t.rank())
+                .max();
             let unseen = candidates
                 .iter()
                 .filter(|t| !seen.contains(&TranslationSubset::from(*t)));
@@ -2259,11 +2270,33 @@ impl PrimaryTable {
                 seen.clear();
                 continue;
             }
+            let nocross_wins = nocross_candidate
+                .as_ref()
+                .is_some_and(|nocross| candidate.is_none_or(|t| nocross.rank() >= t.rank()));
+            // liblouis puts the letter sign before a contraction only if it is the rule chosen
+            // here, which it is not when another rule outranks it
+            if last_indications_pos == Some(char_pos) && indications_to == translations.len() {
+                let chosen_rank = if nocross_wins {
+                    nocross_candidate.as_ref().map(|t| t.rank())
+                } else {
+                    candidate.map(|t| t.rank())
+                };
+                let outranked = chosen_rank.is_some_and(|rank| {
+                    contraction_rank.is_some_and(|contraction| rank > contraction)
+                });
+                if outranked {
+                    let before = translations.len();
+                    let kept: Vec<_> = translations
+                        .drain(indications_from..)
+                        .filter(|t| !matches!(t.rule(), Some(Rule::Contraction { .. })))
+                        .collect();
+                    translations.extend(kept);
+                    indications_to -= before - translations.len();
+                }
+            }
             // A nocross rule wins if there is no plain candidate to beat (many, e.g.
             // liblouis' `nocross always en`, have no plain counterpart at all).
-            if let Some(nocross) = &nocross_candidate
-                && candidate.is_none_or(|t| nocross.rank() >= t.rank())
-            {
+            if nocross_wins && let Some(nocross) = &nocross_candidate {
                 let translation = nocross.clone();
                 let consumed = chars.as_str();
                 // move the iterator forward by the number of characters in the translation
@@ -2705,6 +2738,96 @@ mod tests {
     use search_path::SearchPath;
 
     use crate::parser::{RuleParser, expand_includes};
+
+    #[test]
+    fn after_classes_are_alternatives_backward() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase c 14"),
+            parse_rule("lowercase x 1346"),
+            parse_rule("sign # 3456"),
+            parse_rule("attribute ca a"),
+            parse_rule("attribute cb b"),
+            parse_rule("after ca after cb always x 3456"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table = PrimaryTable::compile(
+            &rules,
+            Direction::Backward,
+            TranslationStage::Main,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(table.translate("⠃⠼"), "bx");
+        assert_eq!(table.translate("⠉⠼"), "c#");
+    }
+
+    #[test]
+    fn zero_length_context_rule_applies_again_further_on() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("attribute foreign a"),
+            parse_rule("context []%foreign @5"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("aba"), "⠐⠁⠃⠐⠁");
+    }
+
+    #[test]
+    fn contraction_letsign_only_where_the_contraction_is_chosen() {
+        let rules = [
+            parse_rule("lowercase d 145"),
+            parse_rule("lowercase a 1"),
+            parse_rule("punctuation ' 3"),
+            parse_rule("space \\s 0"),
+            parse_rule("letsign 56"),
+            parse_rule("noletsignafter '"),
+            parse_rule("contraction d"),
+            parse_rule("word d'a 145-3-1"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("d'a d'"), "⠙⠄⠁⠀⠰⠙⠄");
+    }
+
+    #[test]
+    fn after_classes_are_alternatives() {
+        let rules = [
+            parse_rule("lowercase a 1"),
+            parse_rule("lowercase b 12"),
+            parse_rule("lowercase c 14"),
+            parse_rule("lowercase x 1346"),
+            parse_rule("attribute ca a"),
+            parse_rule("attribute cb b"),
+            parse_rule("after ca after cb always x 3456"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("axbxcx"), "⠁⠼⠃⠼⠉⠭");
+    }
+
+    #[test]
+    fn after_math_class() {
+        let rules = [
+            parse_rule("math + 235"),
+            parse_rule("lowercase b 12"),
+            parse_rule("after math always b 345"),
+        ];
+        let context = TableContext::compile(&rules).unwrap();
+        let table =
+            PrimaryTable::compile(&rules, Direction::Forward, TranslationStage::Main, &context)
+                .unwrap();
+        assert_eq!(table.translate("b+b"), "⠃⠖⠜");
+    }
 
     #[test]
     fn undefined_char_escape() {

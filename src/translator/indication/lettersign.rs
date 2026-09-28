@@ -70,7 +70,7 @@ impl IndicatorBuilder {
             .with_context(cc.clone())
             .with_case_folding(ctx.case_folding().clone());
         let (start, end) = whole_word_boundaries(sequences.as_ref());
-        for (contraction, _origin) in self.contractions {
+        for (contraction, contraction_origin) in self.contractions {
             trie.insert(
                 &contraction,
                 &lettersign,
@@ -80,7 +80,7 @@ impl IndicatorBuilder {
                 Precedence::Default,
                 vec![],
                 TranslationStage::Main,
-                &origin,
+                &contraction_origin,
             );
         }
 
@@ -190,36 +190,49 @@ impl Indicator {
         }
 
         // ── Contraction-based letsign ──────────────────────────────────────────
-        // Fires when a known contraction is found at a word boundary (grade 2 tables).
-        {
-            let mut prev: Option<char> = None;
-            let mut char_pos = 0;
-            for (byte_pos, c) in input.char_indices() {
-                if self.contraction_at(&input[byte_pos..], prev, &chars, char_pos) {
-                    fire.insert(char_pos);
-                }
-                prev = Some(c);
-                char_pos += 1;
-            }
-        }
-
+        // liblouis inserts it only if the contraction rule is the one chosen there, so it
+        // carries that rule for the translation loop to check
         let mut result: Vec<(usize, ResolvedTranslation)> = fire
-            .into_iter()
-            .map(|pos| (pos, self.start_translation.clone()))
+            .iter()
+            .map(|&pos| (pos, self.start_translation.clone()))
             .collect();
+        let mut prev: Option<char> = None;
+        for (char_pos, (byte_pos, c)) in input.char_indices().enumerate() {
+            if !fire.contains(&char_pos)
+                && let Some(origin) =
+                    self.contraction_at(&input[byte_pos..], prev, &chars, char_pos)
+            {
+                let translation = ResolvedTranslation::new(
+                    "",
+                    &self.start_translation.output(),
+                    1,
+                    TranslationStage::Main,
+                    origin,
+                );
+                result.push((char_pos, translation));
+            }
+            prev = Some(c);
+        }
         result.sort_by_key(|(pos, _)| *pos);
         result
     }
 
-    fn contraction_at(&self, s: &str, prev: Option<char>, chars: &[char], pos: usize) -> bool {
+    fn contraction_at(
+        &self,
+        s: &str,
+        prev: Option<char>,
+        chars: &[char],
+        pos: usize,
+    ) -> Option<AnchoredRule> {
         self.contractions
             .find_translations(s, prev)
-            .iter()
-            .any(|t| {
+            .into_iter()
+            .find(|t| {
                 self.sequences
                     .as_ref()
                     .is_none_or(|seq| seq.in_sequence(chars, pos, t.length()))
             })
+            .and_then(|t| t.origin())
     }
 }
 
